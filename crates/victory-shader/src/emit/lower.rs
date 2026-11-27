@@ -6480,9 +6480,16 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    // A cube the program samples or sizes, as `image_op` takes it.
+                    3 if un.starts_with("image_sample")
+                        || un.starts_with("image_gather")
+                        || un == "image_get_resinfo" =>
+                    {
+                        5
+                    }
                     4 => 6,
                     5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+                    _ => return Err("an image dimension (cube loads or MSAA)"),
                 };
                 ((kind | u, 0x409), Some(kind))
             }
@@ -6542,6 +6549,9 @@ impl<'a> Lower<'a> {
                     1 => (one, one),
                     2 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
+                    // shortcut: one cube's six faces (dword 4 the last face, as GFX10 counts a
+                    // cube's slices); a cube array's would be six per cube.
+                    5 => (field(self, 1), self.s.m.i32(6)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
@@ -6565,7 +6575,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 0, 10, 11, 12, 13][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
@@ -15537,6 +15547,39 @@ mod tests {
             0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
             0xBF89_FFF6, // s_cbranch_execnz L2
             0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn a_cube_descriptor_read_for_its_width_takes_the_cube_it_samples() {
+        // The width bits of the cube at table entry 0 (`v_alignbit_b32`, as the title's compute
+        // programs size a cube map) go to the buffer at dword 16; the same load samples it.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7E08_0302, // v_mov_b32 v4, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD54E_0008,
+            0x0278_1A0E, // v_alignbit_b32 v8, s14, s13, 30
+            0xF09C_0F18,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:4], s[12:19], s[8:11] dmask:0xf dim:CUBE
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
             0xE070_1000,
             0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
             S_ENDPGM,
