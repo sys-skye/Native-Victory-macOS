@@ -873,6 +873,50 @@ fn descriptor_dwords_read_as_data_say_which() {
     }
 }
 
+/// Where shaders reach title memory at its own addresses (`Options::zero_copy_memory`), the
+/// descriptor dwords the host view has no value for are read as the title wrote them, through
+/// the page table: the address and format dwords of a descriptor the program also uses, and a
+/// descriptor it reads only as numbers.
+#[test]
+fn descriptor_dwords_read_as_data_come_from_title_memory() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |read: u32, used: bool| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        if used {
+            code.extend([0xE030_1000, 0x8003_0100]); // buffer_load_dword v1, v0, s[12:15], 0 offen
+        } else {
+            code.push(0x7E02_0280); // v_mov_b32 v1, 0
+        }
+        code.extend([
+            read,        // v_mov_b32 v2, s<12 + n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let zero_copy = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    for read in [0x7E04_020C, 0x7E04_020D, 0x7E04_020F] {
+        for used in [true, false] {
+            let h = translate_with(&program(read, used), zero_copy)
+                .unwrap_or_else(|e| panic!("{read:#x} used {used}: {e}"));
+            assert!(h.memory, "{read:#x} used {used}: read through the page table");
+            assert!(!h.view_addresses, "{read:#x} used {used}: no view addresses");
+        }
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage

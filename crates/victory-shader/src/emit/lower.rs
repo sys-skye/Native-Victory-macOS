@@ -6223,13 +6223,8 @@ impl<'a> Lower<'a> {
         {
             return self.user_data_smem(inst, a);
         }
-        if let Some(a) = self
-            .scalar
-            .get(&site)
-            .copied()
-            .filter(|a| a.param == MEMORY)
-        {
-            return self.memory_smem(inst, a);
+        if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
+            return self.memory_smem(inst);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -6492,7 +6487,7 @@ impl<'a> Lower<'a> {
                     (11 | u, 0)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+                    return self.descriptor_from_memory(inst, "a constant buffer's descriptor read as data");
                 }
                 (props, None)
             }
@@ -6502,7 +6497,7 @@ impl<'a> Lower<'a> {
             Fields::Smem { .. } => {
                 let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
                 if used.kind == ResourceType::Cbv {
-                    return Err("a constant buffer's descriptor read as data");
+                    return self.descriptor_from_memory(inst, "a constant buffer's descriptor read as data");
                 }
                 let props = match used.stride {
                     0 | 1 => (11 | u, 0),
@@ -6567,10 +6562,17 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // The words the host view has no value for (addresses, formats), as the title wrote them
+        // (`view_addresses`): where shaders reach title memory at its own addresses.
+        let raw = if self.x.zero_copy_memory { self.memory_words(inst).ok() } else { None };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                None if let Some(raw) = &raw => {
+                    let x = raw[k as usize];
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
                 None => {
                     let why = match (image.is_some(), rel) {
                         (false, 0) => BUFFER_ADDRESS,
@@ -6587,6 +6589,15 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A descriptor load read as data that the host view cannot answer: all its dwords from
+    /// title memory where shaders reach it at its own addresses, else refused with `why`.
+    fn descriptor_from_memory(&mut self, inst: &Inst, why: Why) -> Result<(), Why> {
+        if self.x.zero_copy_memory && self.memory_smem(inst).is_ok() {
+            return Ok(());
+        }
+        Err(why)
     }
 
     /// `s_load_dword*` from the root signature's memory: user-data dwords.
@@ -6617,9 +6628,21 @@ impl<'a> Lower<'a> {
     }
 
     /// `s_load_dword*` from title memory at an address the program computes.
-    fn memory_smem(&mut self, inst: &Inst, _a: Address) -> Result<(), Why> {
+    fn memory_smem(&mut self, inst: &Inst) -> Result<(), Why> {
+        let Fields::Smem { data: Some(Operand::Scalar { code, .. }), .. } = inst.fields else {
+            return Err("a scalar load");
+        };
+        for (k, x) in self.memory_words(inst)?.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// The dwords a scalar load reads, read from title memory through the page table at the
+    /// address its base registers and offsets give.
+    fn memory_words(&mut self, inst: &Inst) -> Result<Vec<V>, Why> {
         let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
+            data: Some(Operand::Scalar { .. }),
             base: Operand::Scalar { code: base, .. },
             offset,
             soffset,
@@ -6649,13 +6672,13 @@ impl<'a> Lower<'a> {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
         let (h, off) = self.memory(lo, hi, 4 * count, false, None);
+        let mut words = Vec::with_capacity(count as usize);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
-            let x = self.raw_dword(h, at);
-            self.write(inst, Reg::S(code + k as u8), x, None);
+            words.push(self.raw_dword(h, at));
         }
-        Ok(())
+        Ok(words)
     }
 
     /// `(hi:lo) + x` with `x` zero-extended, or sign-extended when
@@ -7119,6 +7142,13 @@ impl<'a> Lower<'a> {
     // (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
+        // Where shaders reach title memory through the page table at the title's own addresses
+        // (`zero_copy_memory`), a descriptor read only as numbers is read as the title wrote it:
+        // descriptor tables and heaps are title memory, and their records are console descriptors,
+        // whose base addresses are title addresses and whose size fields are the title's own.
+        if self.x.zero_copy_memory && self.memory_smem(inst).is_ok() {
+            return Ok(());
+        }
         let a = *self
             .scalar
             .get(&site)
