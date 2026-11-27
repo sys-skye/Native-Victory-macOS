@@ -1070,6 +1070,23 @@ impl<'a> Tracer<'a> {
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
             || self.joined_on_taken_edges(hi) == Some(want)
+            || self.plus_carry(hi) == Some(want)
+    }
+
+    /// `x` for `s_add_u32 hi, x, src_scc` (either order): the high half plus the carry of the low
+    /// half's add, as `s_addc_u32 hi, x, 0` would make it.
+    fn plus_carry(&self, hi: Term) -> Option<Term> {
+        const SRC_SCC: u8 = 253;
+        let Term::Value(v) = hi else { return None };
+        let inst = self.def(v)?;
+        if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        match src[..] {
+            [Operand::Const(SRC_SCC), ref x] | [ref x, Operand::Const(SRC_SCC)] => self.term(inst, x),
+            _ => None,
+        }
     }
 
     /// What phi `t` holds in every lane that reads it: the one value its
