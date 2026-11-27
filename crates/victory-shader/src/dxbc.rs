@@ -181,4 +181,69 @@ mod tests {
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
     }
+
+    /// The header's digest and version fields are parsed, not just skipped.
+    #[test]
+    fn parses_the_header_fields() {
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        bytes[4..20].copy_from_slice(&[7u8; 16]);
+        bytes[0x14..0x16].copy_from_slice(&9u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&3u16.to_le_bytes());
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.digest, [7u8; 16]);
+        assert_eq!(c.version, (9, 3));
+        assert_eq!(c.parts.len(), 1);
+    }
+
+    /// Each header check refuses with its own message.
+    #[test]
+    fn rejects_implausible_headers() {
+        // A declared total below the header itself.
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        bytes[0x18..0x1C].copy_from_slice(&0x10u32.to_le_bytes());
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed("container size disagrees with data"))
+        ));
+        // More parts than the format allows.
+        let mut bytes = build(&[]);
+        bytes[0x1C..0x20].copy_from_slice(&257u32.to_le_bytes());
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed("implausible part count"))
+        ));
+        // A part whose data runs past the container.
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        bytes[0x28..0x2C].copy_from_slice(&0xFFFFu32.to_le_bytes());
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed("part data out of bounds"))
+        ));
+    }
+
+    /// Bytes past the declared total are not part of the container, and a
+    /// total larger than the data is refused.
+    #[test]
+    fn ignores_bytes_past_the_declared_total() {
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        let total = bytes.len();
+        bytes.extend_from_slice(&[0xAA; 64]);
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.parts.len(), 1);
+        assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
+        bytes[0x18..0x1C].copy_from_slice(&((total + 128) as u32).to_le_bytes());
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed("container size disagrees with data"))
+        ));
+    }
+
+    /// Two parts with the same fourcc both parse; `part` gives the first.
+    #[test]
+    fn the_first_part_with_a_fourcc_wins() {
+        let bytes = build(&[(FourCC::RTS0, &[1]), (FourCC::RTS0, &[2, 2])]);
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.parts.len(), 2);
+        assert_eq!(c.part(FourCC::RTS0).unwrap().data, &[1]);
+    }
 }

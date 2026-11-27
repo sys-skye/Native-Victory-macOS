@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Summarise a run log: fps, shader work, dropped work, GPU errors, how it ended.
+# Summarise a run log: fps, shader work, dropped work, audio, GPU errors, how it ended.
 # Usage: run-summary.sh [runs/<date>/victory.log]   (default: newest log under runs/)
 #        run-summary.sh --self-test
 set -u
@@ -29,7 +29,7 @@ function tomsec(v,   n) {
 }
 {
   ts = ""
-  if ($0 ~ /^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) { ts = $1; t = secs(ts); if (!t0) t0 = t; tlast = t; nlines++ }
+  if ($0 ~ /^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) { ts = $1; t = secs(ts); if (!tset) { t0 = t; tset = 1 } tlast = t; nlines++ }
   line = $0
   if (match(line, /frame=[0-9]+/)) {
     f = substr(line, RSTART + 6, RLENGTH - 6) + 0
@@ -51,11 +51,19 @@ function tomsec(v,   n) {
     }
     if (match(line, /frame=[0-9]+/)) bindf[substr(line, RSTART + 6, RLENGTH - 6) + 0]++
   }
+  if (line ~ /shaders prewarmed/) {
+    if (match(line, /n=[0-9]+/)) pre_n = substr(line, RSTART + 2, RLENGTH - 2) + 0
+    if (match(line, /dxil_mb=[0-9]+/)) pre_mb = substr(line, RSTART + 8, RLENGTH - 8) + 0
+    if (!pre_seen) { pre_seen = 1; pre_from = t - t0 }
+    pre_to = t - t0
+  }
   if (line ~ /title shader refused/) {
     sh = ""; rs = line
     if (match(line, /shader="[^"]*"/)) sh = substr(line, RSTART, RLENGTH)
     sub(/.*reason=/, "", rs); rs = norm(rs)
     if (!((rs SUBSEP sh) in seen)) { seen[rs SUBSEP sh] = 1; refc[rs]++ }
+    if (nref == 0) { reff = curframe; reft = t - t0 }
+    refl = curframe
     nref++
   }
   if (line ~ /command buffer failed/ || line ~ /out of memory/ || line ~ /OutOfMemory/) {
@@ -75,6 +83,18 @@ function tomsec(v,   n) {
     x = norm(x); drop[x]++
   }
   if (line ~ /unhandled exception/) { exc = line; excf = curframe; exct = lastt - t0 }
+  if (line ~ /no audio device: sound is mixed and dropped/) {
+    naud++
+    aerr = line; sub(/.*error=/, "", aerr)
+    # norm() without its long-hex rule (an interval expression that some
+    # awks read differently): an error name has no long hex runs in it.
+    gsub(/0x[0-9a-fA-F]+/, "H", aerr); gsub(/[0-9]+/, "N", aerr)
+    if (naud <= 6) aud[naud] = sprintf("output fell back to silence t=+%.1fs frame~%d (%s)", lastt - t0, curframe, aerr)
+  }
+  if (line ~ /spatial audio stream activated/) nspat++
+  if (line ~ /render client released frames in the last second/) nmix++
+  if (line ~ /audio DSP connected/) ndsp++
+  if (line ~ /audio DSP stream activated/) ndstream++
   if (line ~ /[Ww]atchdog|[Kk]illed|[Tt]erminated|timed out|time limit/ && line !~ /BacktraceBreakpad|GPU Timeout|dstorage|command buffer failed/) {
     if (++nend <= 3) endl[nend] = substr(line, 1, 160)
   }
@@ -110,6 +130,7 @@ END {
 
   print "-- shader work"
   printf "  first binds: %d\n", nbind
+  if (pre_seen) printf "  prewarm: %d shaders, %d MB of DXIL, from t=+%.1fs to t=+%.1fs\n", pre_n, pre_mb, pre_from, pre_to
   if (nstall) {
     printf "  stalls with timing: %d, total %.1f ms; slowest 10:\n", nstall, tot
     k = top(stall, nstall, 10, ix)
@@ -122,6 +143,7 @@ END {
   }
   nr = 0; for (r in refc) nr++
   printf "  refused shaders: %d lines, unique by reason:\n", nref
+  if (nref) printf "  at frame~%d..%d (first t=+%.1fs)\n", reff, refl, reft
   nr = 0; for (r in refc) { rc[++nr] = refc[r]; rk[nr] = r }
   k = top(rc, nr, 12, ix)
   for (i = 1; i <= k; i++) printf "    %5d  %s\n", rc[ix[i]], rk[ix[i]]
@@ -140,6 +162,16 @@ END {
     s = ""; for (kd in gk) s = s " " kd "=" gk[kd]; print " " s
     for (i = 1; i <= ngpu && i <= 12; i++) print "  " gl[i]
     if (ngpu > 12) printf "  ... %d more\n", ngpu - 12
+  }
+  print ""
+
+  print "-- audio"
+  if (!naud && !nspat && !nmix && !ndsp) print "  no audio lines"
+  else {
+    for (i = 1; i <= naud && i <= 6; i++) print "  " aud[i]
+    if (naud > 6) printf "  ... %d more\n", naud - 6
+    if (!naud) print "  the device kept playing (no fallback to silence)"
+    printf "  mixer seconds: %d, spatial stream activations: %d, DSP connects: %d, DSP streams: %d\n", nmix, nspat, ndsp, ndstream
   }
   print ""
 
@@ -168,10 +200,14 @@ self_test() {
 @ESC@[2m2026-01-01T00:00:00.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=64 recorded=1
 @ESC@[2m2026-01-01T00:00:02.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=128 recorded=1
 @ESC@[2m2026-01-01T00:00:03.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::pipeline: first bind pipeline=0x1 frame=100 stage="pixel" size=1 hash=abc took=12.5ms
+@ESC@[2m2026-01-01T00:00:03.050000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::pipeline: shaders prewarmed n=8192 pending=8 dxil_mb=31
 @ESC@[2m2026-01-01T00:00:03.100000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::native::shaders: title shader refused; its work is dropped shader="vertex aa pixel bb" reason=translation: code at 0x10: a thing
 @ESC@[2m2026-01-01T00:00:03.200000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=12 address=Some("0xdead")
 @ESC@[2m2026-01-01T00:00:03.300000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=16 address=Some("0xbeef")
 metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)" }
+@ESC@[2m2026-01-01T00:00:03.500000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::host_posix::coreaudio: no audio device: sound is mixed and dropped error=AudioQueueStart failed with OSStatus 2003329396
+@ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi::spatial: WASAPI: spatial audio stream activated static_mask=6
+@ESC@[2m2026-01-01T00:00:04.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi: WASAPI: render client released frames in the last second frames=48000
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile at 4.0s: 1 methods
 @ESC@[2m2026-01-01T00:00:04.000100Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile k!f0x1 calls 3 total 9.0 ms max 4.00 ms
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
@@ -182,6 +218,10 @@ LOG
   chk '32.0 fps'; chk '12.50 ms  frame=100 stage="pixel"'; chk '2 .*indirect execution dropped'
   chk 'Hang=1'; chk 'unhandled exception 0xc0000005 at image+0x1234'; chk 'last frame reached: 128'
   chk 'calls 3 total 9.0 ms'; chk '1  translation: code at H: a thing'
+  chk 'prewarm: 8192 shaders, 31 MB of DXIL, from t=+3.0s to t=+3.0s'
+  chk 'at frame~128..128 (first t=+3.1s)'
+  chk 'output fell back to silence t=+3.5s frame~128 (AudioQueueStart failed with OSStatus N)'
+  chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
   [ "$ok" = 1 ] && echo "self-test ok" || { printf '%s\n' "$out"; exit 1; }
 }
 

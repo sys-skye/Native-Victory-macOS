@@ -2428,8 +2428,12 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => Val::I32(self.user_dword(param, dword)),
-            // Its address, where root views are title memory.
-            RootType::Descriptor if self.root_memory => Val::I32(self.user_dword(param, dword)),
+            // Its address, where root views are title memory. Not the vertex buffer table of a
+            // guessed vertex program ([`graphics::VERTEX_TABLE`]): no root argument holds its
+            // address, and the vertex fetch is found by tracing loads through it.
+            RootType::Descriptor if self.root_memory && rp.slot != graphics::VERTEX_TABLE => {
+                Val::I32(self.user_dword(param, dword))
+            }
             _ => Val::Missing("a root descriptor"),
         }
     }

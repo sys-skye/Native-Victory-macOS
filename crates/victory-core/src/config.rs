@@ -238,4 +238,83 @@ mod tests {
         };
         assert!(cfg.data_subdir("x").is_err());
     }
+
+    /// With no environment variable, each value comes from the file, and
+    /// the dirs fall back to the default under the user's data root.
+    #[test]
+    fn file_values_are_used_and_dirs_default() {
+        let file = FilePaths {
+            game_dir: Some("game".into()),
+            cache_dir: Some("cache".into()),
+            data_dir: Some("data".into()),
+            fidelityfx_dir: Some("ffx".into()),
+            test_titles: vec!["t".into()],
+        };
+        let cfg = Config::resolve(file, None, |_| None).unwrap();
+        assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("game"));
+        assert_eq!(cfg.cache_dir, PathBuf::from("cache"));
+        assert_eq!(cfg.data_dir, PathBuf::from("data"));
+        assert_eq!(cfg.fidelityfx_dir.unwrap(), PathBuf::from("ffx"));
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("t")]);
+
+        let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert!(cfg.game_dir.is_none());
+        assert!(cfg.fidelityfx_dir.is_none());
+        assert!(cfg.test_titles.is_empty());
+        assert!(
+            cfg.cache_dir.ends_with(Path::new("victory").join("cache")),
+            "{:?}",
+            cfg.cache_dir
+        );
+        assert!(
+            cfg.data_dir.ends_with(Path::new("victory").join("data")),
+            "{:?}",
+            cfg.data_dir
+        );
+    }
+
+    /// An empty entry in `VICTORY_TEST_TITLES` is dropped, not kept as "".
+    #[test]
+    fn test_titles_env_drops_empty_entries() {
+        let value = std::env::join_paths(["first", "", "second"]).unwrap();
+        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        assert_eq!(
+            cfg.test_titles,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    /// The config file rejects unknown fields, at any level, and malformed
+    /// TOML fails to parse.
+    #[test]
+    fn unknown_fields_and_bad_toml_are_refused() {
+        assert!(toml::from_str::<FileConfig>("[paths]\ngame_dir = 'x'\nextra = 1").is_err());
+        assert!(toml::from_str::<FileConfig>("[other]\nx = 1").is_err());
+        assert!(toml::from_str::<FileConfig>("not toml at all = [").is_err());
+        // Every documented key parses.
+        let parsed: FileConfig = toml::from_str(
+            "[paths]\ngame_dir = 'g'\ncache_dir = 'c'\ndata_dir = 'd'\nfidelityfx_dir = 'f'\ntest_titles = ['t']",
+        )
+        .unwrap();
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("g")));
+        assert_eq!(parsed.paths.cache_dir, Some(PathBuf::from("c")));
+        assert_eq!(parsed.paths.data_dir, Some(PathBuf::from("d")));
+        assert_eq!(parsed.paths.fidelityfx_dir, Some(PathBuf::from("f")));
+        assert_eq!(parsed.paths.test_titles, vec![PathBuf::from("t")]);
+    }
+
+    /// An unconfigured game directory fails with the pointing message.
+    #[test]
+    fn require_game_dir_names_the_fix() {
+        let cfg = Config::default();
+        let err = cfg.require_game_dir().unwrap_err().to_string();
+        assert!(err.contains("no game directory configured"), "{err}");
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        let cfg = Config {
+            game_dir: Some("g".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.require_game_dir().unwrap(), Path::new("g"));
+    }
 }

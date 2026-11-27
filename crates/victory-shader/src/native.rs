@@ -1626,4 +1626,57 @@ pub(crate) mod tests {
         let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &trailing)).unwrap()[0];
         assert_eq!(p.layout[1].sgprs, 1, "none declared");
     }
+
+    /// Each FSPX entry problem is refused with its own message: an entry
+    /// past the part, a missing code entry, and a metadata record the
+    /// reader does not know.
+    #[test]
+    fn fspx_entry_problems_are_named() {
+        let code = [0x00, 0x00, 0x81, 0xBF]; // s_endpgm
+        let good = fspx(&code, 0, [64, 1, 1], false, &[]);
+        // The code entry (the third) points past the part.
+        let mut data = good.clone();
+        let code_entry = FSPX_HEADER + 16 * 2;
+        data[code_entry + 4..code_entry + 8].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert!(matches!(
+            native_programs(&data),
+            Err(ShaderError::Malformed("FSPX entry out of bounds"))
+        ));
+        // No entry of the code kind at all.
+        let mut data = good.clone();
+        data[code_entry] = 99;
+        assert!(matches!(
+            native_programs(&data),
+            Err(ShaderError::Malformed("FSPX entry missing"))
+        ));
+        // The first metadata record's tag is not one the reader knows.
+        let mut data = good.clone();
+        let meta_entry = FSPX_HEADER + 16 * 3;
+        let at = u32::from_le_bytes(data[meta_entry + 4..meta_entry + 8].try_into().unwrap()) as usize;
+        data[at + FSPX_RECORDS] = 0x99;
+        assert!(matches!(
+            native_programs(&data),
+            Err(ShaderError::Malformed("unknown FSPX metadata record"))
+        ));
+    }
+
+    /// An XDAT part's entry count is bounded, and an entry pointing past
+    /// the part is refused.
+    #[test]
+    fn xdat_entry_problems_are_named() {
+        let good = || part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Ls, &VS_CODE)])))]);
+        let mut data = good();
+        data[XDAT_OFFSET + 4..XDAT_OFFSET + 8].copy_from_slice(&65u32.to_le_bytes());
+        assert!(matches!(
+            native_programs(&data),
+            Err(ShaderError::Malformed("implausible XDAT entry count"))
+        ));
+        let mut data = good();
+        let at = XDAT_OFFSET + 12;
+        data[at + 4..at + 8].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert!(matches!(
+            native_programs(&data),
+            Err(ShaderError::Malformed("XDAT entry out of bounds"))
+        ));
+    }
 }

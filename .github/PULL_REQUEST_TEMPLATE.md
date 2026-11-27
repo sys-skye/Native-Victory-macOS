@@ -1,6 +1,6 @@
 ## What this changes
 
-<!-- One change per pull request. Link the issue or ROADMAP item. -->
+<!-- One change per pull request. Name the issue you claimed for it: Refs #123 (or Closes #123). -->
 
 ## How it was tested
 

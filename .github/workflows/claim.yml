@@ -1,0 +1,86 @@
+name: Claim
+
+# The issue tracker is the task queue. A comment of `/claim` on an issue books it,
+# `/release` frees it, and a claim with no pull request behind it expires.
+# This workflow only reads comments and edits issues; it never checks out code.
+
+on:
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: claim
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    if: github.event_name == 'issue_comment' && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const word = context.payload.comment.body.trim().split(/\s+/)[0];
+            if (word !== '/claim' && word !== '/release') return;
+            const who = context.payload.comment.user.login;
+            const issue = context.payload.issue;
+            const at = { ...context.repo, issue_number: issue.number };
+            const say = body => github.rest.issues.createComment({ ...at, body });
+            const holders = issue.assignees.map(a => a.login);
+            if (word === '/release') {
+              const role = context.payload.comment.author_association;
+              const maintainer = role === 'OWNER' || role === 'MEMBER' || role === 'COLLABORATOR';
+              if (!holders.includes(who) && !maintainer) return say(`@${who} this issue is not yours to release.`);
+              await github.rest.issues.removeAssignees({ ...at, assignees: holders });
+              await github.rest.issues.removeLabel({ ...at, name: 'claimed' }).catch(() => {});
+              return say('Released. This issue is free to claim.');
+            }
+            if (issue.state !== 'open') return say(`@${who} this issue is closed.`);
+            if (holders.length && !holders.includes(who)) {
+              return say(`@${who} this is already claimed by @${holders[0]}. Pick another issue, or ask them here.`);
+            }
+            await github.rest.issues.addAssignees({ ...at, assignees: [who] });
+            await github.rest.issues.addLabels({ ...at, labels: ['claimed'] });
+            await say(`Claimed by @${who}. Open a draft pull request with \`Refs #${issue.number}\` in its description within 24 hours, or the claim expires.`);
+
+  expire:
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const HOUR = 3600 * 1000;
+            const NO_PR = 24 * HOUR;   // a claim with no pull request behind it
+            const QUIET = 72 * HOUR;   // a claim whose pull requests have gone quiet
+            const now = Date.now();
+            const claimed = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo, state: 'open', labels: 'claimed', per_page: 100,
+            });
+            for (const issue of claimed) {
+              if (issue.pull_request) continue;
+              const at = { ...context.repo, issue_number: issue.number };
+              const events = await github.paginate(github.rest.issues.listEventsForTimeline, { ...at, per_page: 100 });
+              const since = events.filter(e => e.event === 'labeled' && e.label && e.label.name === 'claimed')
+                .map(e => Date.parse(e.created_at)).pop() ?? Date.parse(issue.updated_at);
+              // Open pull requests that mention this issue.
+              const prs = events.filter(e => e.event === 'cross-referenced' && e.source && e.source.issue
+                && e.source.issue.pull_request && e.source.issue.state === 'open').map(e => e.source.issue);
+              const last = Math.max(since, ...prs.map(p => Date.parse(p.updated_at)));
+              const expired = prs.length === 0 ? now - since > NO_PR : now - last > QUIET;
+              if (!expired) continue;
+              const holders = issue.assignees.map(a => a.login);
+              if (holders.length) await github.rest.issues.removeAssignees({ ...at, assignees: holders });
+              await github.rest.issues.removeLabel({ ...at, name: 'claimed' }).catch(() => {});
+              const why = prs.length === 0 ? 'no pull request referenced it within 24 hours'
+                : 'its pull request has had no activity for 72 hours';
+              await github.rest.issues.createComment({ ...at,
+                body: `The claim${holders.length ? ' by @' + holders.join(', @') : ''} has expired: ${why}. This issue is free to claim.` });
+            }

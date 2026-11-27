@@ -1200,4 +1200,44 @@ mod tests {
         // Doubling the diamond count must only double the visited sites (linear, not quadratic).
         assert!(v128 <= 2 * v64 + 8, "v64={v64}, v128={v128}");
     }
+
+    /// Every `SPI_PS_INPUT_ADDR` system bit maps to its input, as `PS_VGPRS`
+    /// documents them; the rest are the fixed-point position.
+    #[test]
+    fn ps_system_bits_map_as_documented() {
+        assert!(matches!(ps_system(7), Input::LineStipple));
+        for b in 8..=11 {
+            assert!(
+                matches!(ps_system(b), Input::Position(p) if p == b as u8 - 8),
+                "bit {b}"
+            );
+        }
+        assert!(matches!(ps_system(12), Input::FrontFace));
+        assert!(matches!(ps_system(13), Input::Ancillary));
+        assert!(matches!(ps_system(14), Input::SampleCoverage));
+        for b in [0, 1, 2, 3, 4, 5, 6, 15] {
+            assert!(matches!(ps_system(b), Input::FixedPosition), "bit {b}");
+        }
+    }
+
+    /// VGPRs are assigned in bit order across kinds: the first set bit's
+    /// inputs get the lowest VGPRs, whatever their kind, and all 16 bits set
+    /// give every entry of the table.
+    #[test]
+    fn ps_vgprs_numbers_vgprs_in_bit_order_across_kinds() {
+        // Line stipple (bit 7), position x (bit 8), front face (bit 12).
+        let v = ps_vgprs(1 << 7 | 1 << 8 | 1 << 12);
+        assert_eq!(
+            v,
+            [
+                (0, Input::LineStipple),
+                (1, Input::Position(0)),
+                (2, Input::FrontFace),
+            ]
+        );
+        // All bits: 6 barycentric kinds of 2, pull-model of 3, 9 system bits
+        // of 1 each.
+        assert_eq!(ps_vgprs(0xFFFF).len(), 6 * 2 + 3 + 9);
+        assert_eq!(ps_vgprs(0).len(), 0);
+    }
 }

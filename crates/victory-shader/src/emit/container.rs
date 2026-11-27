@@ -512,4 +512,108 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a, shader_hash(b"program a"));
     }
+
+    fn el(kind: u8, comp: u8, interp: u8, row: Option<u32>, usage: u8) -> SigElement {
+        SigElement {
+            name: String::new(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row,
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        }
+    }
+
+    /// A row's undecided float elements take the mode its decided elements
+    /// agree on; rows without one decided mode stay as they are. A decided
+    /// element is one that is not free (here a system value) with a mode.
+    #[test]
+    fn a_rows_undecided_floats_take_the_rows_mode() {
+        let mut els = vec![
+            el(3, 9, 5, Some(0), 0), // position: not free, mode 5
+            el(0, 9, 0, Some(0), 0), // free float in row 0
+            el(0, 9, 0, Some(1), 0), // free float in a row with no decided mode
+            el(0, 9, 0, None, 0),    // no row at all
+        ];
+        same_mode_per_row(&mut els, false);
+        assert_eq!(els[0].interp, 5);
+        assert_eq!(els[1].interp, 5);
+        assert_eq!(els[2].interp, 0);
+        assert_eq!(els[3].interp, 0);
+    }
+
+    /// Elements whose modes disagree leave the row's free floats alone.
+    #[test]
+    fn disagreeing_modes_leave_the_row_alone() {
+        let mut els = vec![
+            el(3, 9, 3, Some(0), 0),  // position, mode 3
+            el(10, 9, 7, Some(0), 0), // primitive id, mode 7
+            el(0, 9, 0, Some(0), 0),  // free float
+        ];
+        same_mode_per_row(&mut els, false);
+        assert_eq!(els[2].interp, 0);
+    }
+
+    /// An input float that is read (`usage` set) is not free, so it takes no
+    /// mode; the same element as an output is free and does.
+    #[test]
+    fn an_input_float_that_reads_is_not_free() {
+        let make = || vec![el(0, 4, 2, Some(0), 0), el(0, 9, 0, Some(0), 1)];
+        let mut els = make();
+        same_mode_per_row(&mut els, true);
+        assert_eq!(els[1].interp, 0, "input with usage set is not free");
+        let mut els = make();
+        same_mode_per_row(&mut els, false);
+        assert_eq!(els[1].interp, 2, "output ignores usage");
+    }
+
+    /// Only free elements are overwritten: system values and non-floats
+    /// decide a row but keep their own mode.
+    #[test]
+    fn only_free_elements_are_overwritten() {
+        let mut els = vec![
+            el(3, 9, 2, Some(0), 0), // position, decided
+            el(0, 9, 0, Some(0), 0), // free float
+            el(0, 4, 0, Some(0), 0), // i32, not free
+        ];
+        same_mode_per_row(&mut els, false);
+        assert_eq!([els[0].interp, els[1].interp, els[2].interp], [2, 2, 0]);
+    }
+
+    /// The semantic-kind, component-type and mask mappings, as the module
+    /// documents them.
+    #[test]
+    fn system_value_component_and_mask_mappings() {
+        // DXIL semantic kind -> system value register.
+        for (kind, want) in [
+            (1, 6),   // vertex id
+            (2, 8),   // instance id
+            (3, 1),   // position
+            (10, 7),  // primitive id
+            (13, 9),  // front face
+            (16, 64), // target
+            (17, 65), // depth
+            (30, 25), // cull primitive
+            (0, 0),   // arbitrary
+            (99, 0),  // unknown
+        ] {
+            assert_eq!(el(kind, 9, 0, None, 0).system_value(), want, "kind {kind}");
+        }
+        // DXIL component type.
+        for (comp, want) in [(1, 1), (5, 1), (4, 2), (9, 3), (0, 0)] {
+            assert_eq!(el(0, comp, 0, None, 0).sig_comp(), want, "comp {comp}");
+        }
+        // Component mask: `cols` bits from `col`.
+        let mut e = el(0, 9, 0, None, 0);
+        e.col = 1;
+        e.cols = 3;
+        assert_eq!(e.mask(), 0b1110);
+        e.col = 0;
+        e.cols = 4;
+        assert_eq!(e.mask(), 0b1111);
+    }
 }

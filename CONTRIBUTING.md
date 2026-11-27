@@ -33,8 +33,26 @@ rustup run 1.98.1 cargo clippy --workspace --all-targets --locked --target x86_6
 ## Find something to work on
 
 - [docs/ROADMAP.md](docs/ROADMAP.md) lists the open problems, with what is already known about each.
-- Issues labelled `good first issue` are small and self-contained.
-- Comment on an issue before starting something big, so two people don't do the same work.
+- Issues labelled `good first issue` are small and self-contained, and `help wanted` marks where help moves things most.
+
+## Claim it before you start
+
+The issue tracker is the task queue. Two people have fixed the same thing on the same day more than once, so every piece of work is booked on an issue first.
+
+1. **Check that it is free.** The issue has no assignee and no `claimed` label, and no open pull request mentions it:
+
+   ```bash
+   gh pr list --state open --search "<issue number> in:title,body"
+   ```
+
+2. **No issue for it yet?** Open one, with what is wrong and what you plan to do.
+3. **Claim it.** Comment `/claim` on the issue. That assigns it to you and adds the `claimed` label. If someone else holds it, you are told so; pick another, or ask them in the thread.
+4. **Open a draft pull request early**, with `Refs #<issue>` in its description, as soon as you have a first commit. The draft is what tells everyone the work is real.
+5. **Claims expire.** With no pull request that mentions the issue after 24 hours, or no activity on that pull request for 72 hours, the claim is removed and the issue is free again. Comment `/release` to give one up sooner.
+
+Then the loop is: develop, test, push, pick the next task, check that it is free, claim it, start.
+
+One issue is one task. If an issue covers several pieces of work (a tracking issue), say in your `/claim` comment which piece you are taking, or open a smaller issue for it and claim that.
 
 ## How the code is laid out
 

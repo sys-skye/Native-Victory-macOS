@@ -8,6 +8,9 @@
 //! 0x10  bitcode offset u32    (16 in standard PC DXIL)
 //! 0x14  bitcode size u32
 //! ```
+//!
+//! The parse rules below (size, magic, bitcode bounds, kind decode) are
+//! pinned by the tests at the end of this file.
 
 use crate::ShaderError;
 use crate::dxbc::u32_at;
@@ -207,5 +210,110 @@ mod tests {
     fn rejects_missing_bitcode_magic() {
         let bytes = build_standard(0, (6, 0), 0x100, &[0u8; 16]);
         assert!(DxilProgram::parse(&bytes).is_err());
+    }
+
+    /// The header's size, magic and bitcode bounds each refuse with their
+    /// own message.
+    #[test]
+    fn rejects_disagreeing_headers() {
+        let good = build_standard(0, (6, 0), 0x100, &fake_bitcode());
+        // Size in dwords larger than the part.
+        let mut bytes = good.clone();
+        let dwords = u32::from_le_bytes(good[4..8].try_into().unwrap()) + 1;
+        bytes[4..8].copy_from_slice(&dwords.to_le_bytes());
+        assert!(matches!(
+            DxilProgram::parse(&bytes),
+            Err(ShaderError::Malformed(
+                "program size disagrees with part size"
+            ))
+        ));
+        // Size below the fixed 24-byte header.
+        let mut bytes = good.clone();
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(
+            DxilProgram::parse(&bytes),
+            Err(ShaderError::Malformed(
+                "program size disagrees with part size"
+            ))
+        ));
+        // A truncated part.
+        assert!(matches!(
+            DxilProgram::parse(&good[..good.len() - 1]),
+            Err(ShaderError::Malformed(
+                "program size disagrees with part size"
+            ))
+        ));
+        // Missing the "DXIL" magic.
+        let mut bytes = good.clone();
+        bytes[8..12].copy_from_slice(b"XXXX");
+        assert!(matches!(
+            DxilProgram::parse(&bytes),
+            Err(ShaderError::Malformed("missing DXIL magic"))
+        ));
+        // Bitcode running past the program.
+        let mut bytes = good.clone();
+        bytes[20..24].copy_from_slice(&0xFFFFu32.to_le_bytes());
+        assert!(matches!(
+            DxilProgram::parse(&bytes),
+            Err(ShaderError::Malformed("bitcode out of bounds"))
+        ));
+        // Sanity: the untouched program parses.
+        assert!(DxilProgram::parse(&good).is_ok());
+    }
+
+    /// Every kind value decodes, unknown ones as `Unknown`.
+    #[test]
+    fn every_shader_kind_decodes() {
+        for (raw, want) in [
+            (0, ShaderKind::Pixel),
+            (1, ShaderKind::Vertex),
+            (2, ShaderKind::Geometry),
+            (3, ShaderKind::Hull),
+            (4, ShaderKind::Domain),
+            (5, ShaderKind::Compute),
+            (6, ShaderKind::Library),
+            (7, ShaderKind::RayGeneration),
+            (8, ShaderKind::Intersection),
+            (9, ShaderKind::AnyHit),
+            (10, ShaderKind::ClosestHit),
+            (11, ShaderKind::Miss),
+            (12, ShaderKind::Callable),
+            (13, ShaderKind::Mesh),
+            (14, ShaderKind::Amplification),
+            (15, ShaderKind::Node),
+            (16, ShaderKind::Unknown(16)),
+            (0xFFFF, ShaderKind::Unknown(0xFFFF)),
+        ] {
+            let bytes = build_standard(raw, (6, 6), 0x100, &fake_bitcode());
+            assert_eq!(DxilProgram::parse(&bytes).unwrap().kind, want, "kind {raw}");
+        }
+    }
+
+    /// A prefix that is not an `XDAT` table is still a prefix: not standard
+    /// layout, but no `xdat` extra.
+    #[test]
+    fn a_non_xdat_prefix_is_not_an_xdat_extra() {
+        let bitcode = fake_bitcode();
+        let prefix = b"ABCD\x01\x00\x00\x00";
+        let mut bytes = Vec::new();
+        let size = 24 + prefix.len() + bitcode.len();
+        bytes.extend_from_slice(&((5u32 << 16) | 0x65).to_le_bytes());
+        bytes.extend_from_slice(&((size / 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"DXIL");
+        bytes.extend_from_slice(&0x105u32.to_le_bytes());
+        bytes.extend_from_slice(&(16 + prefix.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(&bitcode);
+        let p = DxilProgram::parse(&bytes).unwrap();
+        assert_eq!(p.prefix, prefix);
+        assert!(!p.is_standard_layout());
+        assert_eq!(
+            p.xbox_extras(),
+            XboxExtras {
+                xdat: false,
+                xbop: false
+            }
+        );
     }
 }
