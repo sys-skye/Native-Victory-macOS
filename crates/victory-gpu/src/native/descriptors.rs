@@ -125,6 +125,42 @@ pub fn format(dxgi: u32) -> Option<Format> {
     })
 }
 
+/// The view-stride table's dword for `view` (`victory_shader::emit`, "Buffer views at computed
+/// heap indices"; what `descriptor::host::view_stride` and `view_kind` give the D3D12 host): a
+/// buffer view's element size in bytes (its structure stride, 4 for a raw view or a constant
+/// buffer, else its format's element size; at least 1), with `VIEW_INTEGER` (and `VIEW_SIGNED`)
+/// for a typed view of an integer format. 0 for anything [`decode`] makes no buffer of: a shader
+/// that takes a buffer at a heap index it computes reads the null view there.
+pub(super) fn stride_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+    let buffer = |r: &usize| matches!(resources.get(r), Some(Res::Buffer(..)));
+    let (format, stride, flags) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(r, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[7], d[8]),
+        View::Unordered(r, _, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[5], d[8]),
+        View::Placed(true, res, d) if res[0] == BUFFER => (d[0], d[5], d[8]),
+        View::Placed(false, res, d) if res[0] == BUFFER => (d[0], d[7], d[8]),
+        // A whole buffer: raw.
+        View::Shader(r, None) | View::Unordered(r, _, None) if buffer(r) => return 4,
+        _ => return 0,
+    };
+    if stride > 0 {
+        return stride & VIEW_STRIDE_BITS;
+    }
+    if flags & FLAG_RAW != 0 {
+        return 4;
+    }
+    let format = crate::resource::pc_format(format);
+    let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes).max(1) as u32;
+    // `UINT` and `SINT` formats (the D3D12 host's `integer_format`).
+    let kind = match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => VIEW_INTEGER,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    };
+    element | kind
+}
+
 /// Object and placed views have the same SRV/UAV union layout.
 fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> {
     let (mips, layers) = if unordered {
@@ -279,6 +315,47 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
 
 #[cfg(test)]
 mod tests {
+    /// The view-stride table's dwords: a structured view's stride, 4 for raw and constant
+    /// views, a typed view's element size with its integer kind, and 0 for what is no buffer view
+    /// (a texture view, a view of an object the host has no buffer for).
+    #[test]
+    fn stride_words_of_buffer_views() {
+        use super::{BUFFER, FLAG_RAW, Res, TEXTURE_2D, stride_word};
+        use crate::descriptor::View;
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let resources: std::collections::HashMap<usize, Res<()>> = [(7, Res::Buffer(0x1000, 0x1000)), (9, Res::Texture(()))].into();
+        let word = |view: View| stride_word(&view, &resources);
+        let srv = |format: u32, dimension: u32, stride: u32, flags: u32| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[6], d[7], d[8]) = (format, dimension, 16, stride, flags);
+            d
+        };
+        let uav = |format: u32, stride: u32, flags: u32| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[4], d[5], d[8]) = (format, BUFFER, 16, stride, flags);
+            d
+        };
+        assert_eq!(word(View::Constant(0x1000, 256)), 4);
+        assert_eq!(word(View::Shader(7, Some(srv(0, BUFFER, 48, 0)))), 48);
+        assert_eq!(word(View::Shader(7, Some(srv(39, BUFFER, 0, FLAG_RAW)))), 4);
+        assert_eq!(word(View::Shader(7, None)), 4);
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(42, 0, 0)))), 4 | VIEW_INTEGER, "R32_UINT");
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(59, 0, 0)))), 2 | VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(2, 0, 0)))), 16, "R32G32B32A32_FLOAT");
+        // Not buffer views: a texture view, a whole texture, a buffer view of an object the host
+        // does not know.
+        assert_eq!(word(View::Shader(7, Some(srv(28, TEXTURE_2D, 0, 0)))), 0);
+        assert_eq!(word(View::Shader(9, None)), 0);
+        assert_eq!(word(View::Shader(8, Some(srv(0, BUFFER, 48, 0)))), 0);
+        let mut resource = [0u32; 14];
+        resource[0] = BUFFER;
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&uav(0, 12, 0));
+        assert_eq!(word(View::Placed(true, resource, placed)), 12);
+        resource[0] = 3;
+        assert_eq!(word(View::Placed(true, resource, placed)), 0);
+    }
+
     #[test]
     fn host_formats_have_the_title_formats_element_size() {
         for dxgi in [2, 3, 10, 11, 13, 16, 17, 24, 26, 28, 30, 34, 35, 36, 41, 42, 49, 50, 51, 53, 54, 55, 56, 57, 61, 62, 65, 67, 71, 72, 77, 78, 86, 91, 98, 99, 115] {

@@ -1080,8 +1080,9 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed]) =
+        with_title(|t| (t.host.backend.residency_counts(), t.host.cleared(), [t.host.unset_roots(), t.host.unmapped(), t.host.failed()])).unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, "native draws so far");
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
         let (shaders_cached, shaders_translated) = crate::shader_cache::counts();

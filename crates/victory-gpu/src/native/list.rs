@@ -27,6 +27,10 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// The page table built for this heap (its view indices are the heap's own) and the pool-table
     /// generation it is current for.
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
+    /// The view-stride table (the translator's root SRV `t255`: a dword an entry, see
+    /// `NativeHost::view_strides`), made the first time a shader needs it and kept current by
+    /// every mirrored write after that.
+    pub strides: std::cell::RefCell<Option<Rc<super::addr::Pages<B>>>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
     /// Entries whose last mirror attempt could not complete yet, keyed by `(record, pool_gen, res_gen)`

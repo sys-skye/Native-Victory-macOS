@@ -336,6 +336,71 @@ fn a_compute_shader_loads_a_texture_by_heap_index() {
     assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }
 
+/// A compute program that takes its output buffer from the resource heap itself (entry 2, by
+/// the heap's base in s6): no table names that entry. It stores the green channel of entry 1's
+/// texel (1.0) at bytes 0 and 8.
+const CS_HEAP_BUFFER: &[u32] = &[
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF408_0300, 0xFA00_0040, // s_load_dwordx4 s[12:15], s[0:1], 0x40
+    0xF40C_0400, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xE070_0008, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 8
+    0xBF81_0000, // s_endpgm
+];
+
+/// A compute program that takes a buffer view from the resource heap itself reads the heap's
+/// view-stride table (the translator's root SRV 255) before the entry: it runs, where its
+/// dispatch used to be dropped ("root parameter 255 was never set"). While the entry holds no
+/// buffer view the table holds 0 there and the program reads the host's null view (nothing is
+/// stored); once the title writes one, the mirrored write brings the table's dword up to date
+/// and the stores land.
+#[test]
+fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP_BUFFER, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.heap && cs.root_srvs == [victory_shader::emit::VIEW_STRIDES]);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap buffer") else { panic!("{:?}", t.shaders) };
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let run = |t: &Title<Metal>| {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 3)
+    };
+    let canary = super::addr_tests::CANARY;
+    // Entry 2 is empty: stride 0, so the null view.
+    assert_eq!(run(&t), [canary; 3]);
+    assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0), "the dispatch ran");
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    assert_eq!(run(&t), [0x3F80_0000, canary, 0x3F80_0000]);
+    assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
+}
+
 /// A compute program asking a writable image for its size: a table at user data 4 holds the raw
 /// output UAV (dwords 0-3) and a texture UAV (dwords 8-15), as the title's metadata declares them.
 /// `image_get_resinfo` at level 0 (v0) returns width and height, which go to the output's dwords 0

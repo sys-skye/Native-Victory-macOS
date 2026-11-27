@@ -267,6 +267,14 @@ impl<B: ComputeBackend> Pages<B> {
         self.ptr
     }
 
+    /// Writes `words` from dword `at` on. The GPU may be reading the buffer: a reader sees the old
+    /// or the new dwords.
+    pub fn write_at(&self, at: usize, words: &[u32]) {
+        assert!((at + words.len()) * 4 <= self.len);
+        // SAFETY: inside the buffer `buf` keeps.
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.ptr.cast::<u32>().add(at), words.len()) };
+    }
+
     /// Writes `words` from the start.
     pub fn write(&self, words: &[u32]) {
         assert!(words.len() * 4 <= self.len);
