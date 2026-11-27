@@ -1313,3 +1313,138 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
     assert_eq!(got[16..20], [2; 4]);
     assert_eq!(got[20..], [0; 12]);
 }
+
+#[test]
+fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
+    // 1. `s_bfm_b64` with a dynamic width/offset (`((1 << 10) - 1) << 30 = 0xFF_C000_0000`,
+    //    lanes `30..39` across both 32-bit halves) written to `EXEC` and read back as data.
+    let bfm = [
+        0xBE86_047Eu32, // s_mov_b64 s[6:7], exec
+        0x7E10_028A,    // v_mov_b32 v8, 10
+        0x7E10_0508,    // v_readfirstlane_b32 s8, v8 (width = 10, dynamic)
+        0x92FE_9E08,    // s_bfm_b64 exec, s8, 30 (offset = 30 -> lanes 30..39)
+        0xBE8A_047E,    // s_mov_b64 s[10:11], exec
+        0x7E04_0287,    // v_mov_b32 v2, 7
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0x7E08_020B, // v_mov_b32 v4, s11
+        0xDC74_8100,
+        0x0002_0301, // global_store_dwordx2 v1, v[3:4], s[2:3] offset:256
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs_bfm = translate_io(&bfm, 5, 0, 64, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs_bfm, &[0, 0, c, d, 0], false);
+    let got_bfm = f.get(DST, 66);
+    for (i, &v) in got_bfm[..64].iter().enumerate() {
+        assert_eq!(v, if (30..40).contains(&i) { 7 } else { CANARY }, "bfm lane {i}");
+    }
+    assert_eq!(&got_bfm[64..66], &[0xC000_0000, 0x0000_00FF], "bfm mask words");
+
+    // 2. `s_brev_b64`: `v_cmp_gt_u32 vcc, 5, v0` sets bits `0..4` (`0x1F`), so `s_brev_b64` under a
+    //    narrowed `EXEC` (forcing `mask_number`) reverses into bits `59..63` (`lo = 0, hi = 0xF800_0000`).
+    let brev = [
+        0x7D88_0085u32, // v_cmp_gt_u32 vcc, 5, v0 (bits 0..4)
+        0xBE86_047E,    // s_mov_b64 s[6:7], exec
+        0xBEFE_0481,    // s_mov_b64 exec, 1 (narrow EXEC so vcc holds lanes outside EXEC)
+        0xBE88_0C6A,    // s_brev_b64 s[8:9], vcc
+        0x7E06_0208,    // v_mov_b32 v3, s8
+        0x7E08_0209,    // v_mov_b32 v4, s9
+        V_LSHLREV_V1_2_V0,
+        0xDC74_8000,
+        0x0002_0301, // global_store_dwordx2 v1, v[3:4], s[2:3]
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    let cs_brev = translate_io(&brev, 5, 0, 64, shaders::options());
+    dispatch(&mut t, &cs_brev, &[0, 0, c, d, 0], false);
+    assert_eq!(f.get(DST, 2), [0x0000_0000, 0xF800_0000], "s_brev_b64 words");
+
+    // 3. `s_bitset1_b64` and `s_bitset0_b64`: start with lanes `0..2` (`0x7`), clear bit 1 (`0x5`),
+    //    and set bit 35 (`hi = 0x8`).
+    let bitset = [
+        0x7D88_0083u32, // v_cmp_gt_u32 vcc, 3, v0 (bits 0..2 = 0x7)
+        0xBE86_047E,    // s_mov_b64 s[6:7], exec
+        0xBE88_046A,    // s_mov_b64 s[8:9], vcc
+        0xBEFE_0481,    // s_mov_b64 exec, 1
+        0xBE88_1C81,    // s_bitset0_b64 s[8:9], 1
+        0xBE88_1EA3,    // s_bitset1_b64 s[8:9], 35
+        0x7E06_0208,    // v_mov_b32 v3, s8
+        0x7E08_0209,    // v_mov_b32 v4, s9
+        V_LSHLREV_V1_2_V0,
+        0xDC74_8000,
+        0x0002_0301, // global_store_dwordx2 v1, v[3:4], s[2:3]
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    let cs_bitset = translate_io(&bitset, 5, 0, 64, shaders::options());
+    dispatch(&mut t, &cs_bitset, &[0, 0, c, d, 0], false);
+    assert_eq!(f.get(DST, 2), [0x0000_0005, 0x0000_0008], "s_bitset0/1_b64 words");
+
+    // 4. `s_wqm_b64`: only lane 37 (`quad 9`, lanes `36..39`, `hi = 0x0000_00F0`) is set in `vcc`.
+    //    Verifies `mask_dword` routes `Atom::Quad` through `mask_number` instead of returning all-1s.
+    let wqm = [
+        0x7D84_00A5u32, // v_cmp_eq_u32 vcc, 37, v0
+        0xBE88_0A6A,    // s_wqm_b64 s[8:9], vcc
+        0xBE86_047E,    // s_mov_b64 s[6:7], exec
+        0xBEFE_0481,    // s_mov_b64 exec, 1
+        0x7E06_0208,    // v_mov_b32 v3, s8
+        0x7E08_0209,    // v_mov_b32 v4, s9
+        V_LSHLREV_V1_2_V0,
+        0xDC74_8000,
+        0x0002_0301, // global_store_dwordx2 v1, v[3:4], s[2:3]
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    let cs_wqm = translate_io(&wqm, 5, 0, 64, shaders::options());
+    dispatch(&mut t, &cs_wqm, &[0, 0, c, d, 0], false);
+    assert_eq!(f.get(DST, 2), [0x0000_0000, 0x0000_00F0], "s_wqm_b64 quad 9 words");
+
+    // 5. `s_orn1_saveexec_b64` and `s_andn1_wrexec_b64`:
+    //    - Start with `EXEC = 0x0000_FF00` (lanes `8..15`), `vcc = v0 >= 12` (`lo = 0xFFFF_F000, hi = u32::MAX`).
+    //    - `s_orn1_saveexec_b64 s[8:9], vcc`: `s[8:9]` saves old `EXEC = (0x0000_FF00, 0)`, and new
+    //      `EXEC = !vcc | old_exec = 0x0000_0FFF | 0x0000_FF00 = (0x0000_FFFF, 0)` (lanes `0..15`).
+    //    - Next set `s[10:11] = v0 < 4` (`(0x0000_000F, 0)`) and run `s_andn1_wrexec_b64 s[12:13], s[10:11]`:
+    //      both `s[12:13]` and `EXEC` become `!s[10:11] & EXEC = (0x0000_FFF0, 0)` (lanes `4..15`).
+    let save_wrexec = [
+        0xBE86_047Eu32, // s_mov_b64 s[6:7], exec
+        0x7D86_008C,    // v_cmp_le_u32 vcc, 12, v0 (v0 >= 12 -> lo = 0xffff_f000, hi = 0xffff_ffff)
+        0xD4C4_000A,
+        0x0002_0084, // v_cmp_gt_u32 s[10:11], 4, v0 (v0 < 4 -> lo = 0x0000_000f, hi = 0)
+        0x92FE_8888, // s_bfm_b64 exec, 8, 8 (EXEC = 0x0000_ff00)
+        0xBE88_386A, // s_orn1_saveexec_b64 s[8:9], vcc
+        0xBE8C_390A, // s_andn1_wrexec_b64 s[12:13], s[10:11]
+        0x7E04_0299, // v_mov_b32 v2, 25 (active lanes 4..15 store 25)
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0x7E06_0208, // v_mov_b32 v3, s8
+        0x7E08_0209, // v_mov_b32 v4, s9
+        0x7E0A_020C, // v_mov_b32 v5, s12
+        0x7E0C_020D, // v_mov_b32 v6, s13
+        0xDC78_8100,
+        0x0002_0301, // global_store_dwordx4 v1, v[3:6], s[2:3] offset:256
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    f.put(DST, &[CANARY; 68]);
+    let cs_sw = translate_io(&save_wrexec, 5, 0, 64, shaders::options());
+    dispatch(&mut t, &cs_sw, &[0, 0, c, d, 0], false);
+    let got_sw = f.get(DST, 68);
+    for (i, &v) in got_sw[..64].iter().enumerate() {
+        assert_eq!(v, if (4..16).contains(&i) { 25 } else { CANARY }, "save/wrexec lane {i}");
+    }
+    assert_eq!(
+        &got_sw[64..68],
+        &[0x0000_FF00, 0, 0x0000_FFF0, 0],
+        "saved s[8:9] and wrexec s[12:13]"
+    );
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}

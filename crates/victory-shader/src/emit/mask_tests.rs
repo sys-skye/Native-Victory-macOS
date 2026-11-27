@@ -466,3 +466,350 @@ fn a_wave64_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
         }
     }
 }
+
+#[test]
+fn wqm_bitset_bfm_brev_quadmask_and_saveexec_masks_lower_as_data() {
+    const WQM_MASK_DATA: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_0A6A, // s_wqm_b64 s[2:3], vcc
+        0x8504_8987, // s_cselect_b32 s4, 7, 9
+        0x7E02_0202, // v_mov_b32_e32 v1, s2
+        0x7E04_0204, // v_mov_b32_e32 v2, s4
+    ];
+    const WQM_PLAIN_DATA: &[u32] = &[
+        0xBE82_03FF,
+        0x0100_0004, // s_mov_b32 s2, 0x01000004
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xBE84_0A02, // s_wqm_b64 s[4:5], s[2:3]
+        0x7E02_0204, // v_mov_b32_e32 v1, s4
+    ];
+    const BITSET_EXEC: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBEFE_046A, // s_mov_b64 exec, vcc
+        0xBEFE_1EA8, // s_bitset1_b64 exec, 40
+        0xBEFE_1C81, // s_bitset0_b64 exec, 1
+        0x7E02_0283, // v_mov_b32_e32 v1, 3
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+    ];
+    const BFM_EXEC: &[u32] = &[
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0x92FE_8488, // s_bfm_b64 exec, 8, 4
+        0x7E02_0283, // v_mov_b32_e32 v1, 3
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+    ];
+    const BREV_EXEC: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBEFE_0C6A, // s_brev_b64 exec, vcc
+        0x7E02_0283, // v_mov_b32_e32 v1, 3
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+    ];
+    const QUADMASK_EXEC: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBEFE_2D6A, // s_quadmask_b64 exec, vcc
+        0x7E02_0283, // v_mov_b32_e32 v1, 3
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+    ];
+    const SAVE_AND_WREXEC_DATA: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE84_386A, // s_orn1_saveexec_b64 s[4:5], vcc
+        0xBE86_396A, // s_andn1_wrexec_b64 s[6:7], vcc
+        0xBE88_3A6A, // s_andn2_wrexec_b64 s[8:9], vcc
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0x7E02_0204, // v_mov_b32_e32 v1, s4
+        0x7E04_0206, // v_mov_b32_e32 v2, s6
+        0x7E0A_0208, // v_mov_b32_e32 v5, s8
+    ];
+
+    for (name, body) in [
+        ("wqm_mask_data", WQM_MASK_DATA),
+        ("wqm_plain_data", WQM_PLAIN_DATA),
+        ("bitset_exec", BITSET_EXEC),
+        ("bfm_exec", BFM_EXEC),
+        ("brev_exec", BREV_EXEC),
+        ("quadmask_exec", QUADMASK_EXEC),
+        ("save_and_wrexec_data", SAVE_AND_WREXEC_DATA),
+    ] {
+        for (lanes, host32) in [(64, false), (64, true), (32, true)] {
+            if let Err(e) = lowered(body, lanes, host32) {
+                panic!("{name} ({lanes} lanes, wave32 host {host32}): {e:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn pixel_and_other_width_mask_number_negatives_stay_refused() {
+    let pixel = |body: &[u32]| -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0x7E02_0280, // v_mov_b32_e32 v1, 0
+            0xD765_0002,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v2, -1, 0
+        ];
+        words.extend_from_slice(body);
+        words.extend([
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![super::container::SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: true,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+            view_marks: false,
+        })
+    };
+
+    for (label, body, expected) in [
+        (
+            "pixel s_bfm_b64 in mask_number",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE88_106A, // s_bcnt1_i32_b64 s8, vcc
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                0x7DA8_0485, // v_cmpx_gt_u32_e32 5, v2
+                0xBF88_0002, // s_cbranch_execz +2 (narrows block.reach)
+                0x92FE_8408, // s_bfm_b64 exec, s8, 4 (non-active EXEC mask)
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec (reads via mask_number)
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
+            "pixel s_bfm_b64 written to EXEC",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE88_106A, // s_bcnt1_i32_b64 s8, vcc
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0x92FE_8408, // s_bfm_b64 exec, s8, 4
+                0x7E02_02F2, // v_mov_b32_e32 v1, 1.0
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            ][..],
+            "a lane mask read as data",
+        ),
+        (
+            "pixel s_brev_b64 in mask_number",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                0x7DA8_0482, // v_cmpx_gt_u32_e32 2, v2
+                0xBF88_0002, // s_cbranch_execz +2
+                0xBEFE_0C6A, // s_brev_b64 exec, vcc
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
+            "pixel s_quadmask_b64 in mask_number",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                0x7DA8_0482, // v_cmpx_gt_u32_e32 2, v2
+                0xBF88_0002, // s_cbranch_execz +2
+                0xBEFE_2D6A, // s_quadmask_b64 exec, vcc
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
+            "pixel s_wqm_b64 read as data in mask_dword",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBEFE_0A6A, // s_wqm_b64 exec, vcc (Atom::Quad, in st.active)
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec (routed to mask_number, not all-1s)
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
+            "pixel s_bitset0_b64 by non-host-lane constant",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                0x7DA8_0482, // v_cmpx_gt_u32_e32 2, v2
+                0xBF88_0002, // s_cbranch_execz +2
+                0xBEFE_1C83, // s_bitset0_b64 exec, 3
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
+            "pixel s_andn2_wrexec_b64 in mask_number",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2 (lanes 0..4)
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                0x7DA8_0482, // v_cmpx_gt_u32_e32 2, v2 (old_exec = lanes 0..1)
+                0xBE84_3A6A, // s_andn2_wrexec_b64 s[4:5], vcc (s[4:5] = lanes 2..4, outside old_exec)
+                0xBE86_1004, // s_bcnt1_i32_b64 s6, s[4:5]
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "saveexec",
+        ),
+        (
+            "pixel Atom::Opaque outer s_and_b64 wrapping inner s_brev_b64",
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBE84_0C6A, // s_brev_b64 s[4:5], vcc
+                0x87FE_047E, // s_and_b64 exec, exec, s[4:5]
+                0x7E02_02F2, // v_mov_b32_e32 v1, 1.0
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            ][..],
+            "lane mask",
+        ),
+        (
+            "pixel Atom::Opaque outer s_and_b64 wrapping inner s_lshr_b64",
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0x9084_816A, // s_lshr_b64 s[4:5], vcc, 1
+                0x87FE_047E, // s_and_b64 exec, exec, s[4:5]
+                0x7E02_02F2, // v_mov_b32_e32 v1, 1.0
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            ][..],
+            "lane mask",
+        ),
+    ] {
+        let err = pixel(body).err();
+        assert!(
+            matches!(&err, Some(crate::ShaderError::Unsupported { what, .. }) if what.contains(expected)),
+            "{label}: expected `{expected}`, got {err:?}"
+        );
+    }
+
+    // `saveexec` of the other width (`s_orn1_saveexec_b32` in wave64, and `s_orn1_saveexec_b64`
+    // in wave32) stays refused in both `MaskData::Host` and `MaskData::Console`.
+    let err_pixel_b32_in_w64 = pixel(&[
+        0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+        0xBE84_446A, // s_orn1_saveexec_b32 s4, vcc_lo
+        0xBE86_0F04, // s_bcnt1_i32_b32 s6, s4
+        0x7E02_0206, // v_mov_b32_e32 v1, s6
+    ])
+    .err();
+    assert!(
+        matches!(&err_pixel_b32_in_w64, Some(crate::ShaderError::Unsupported { what, .. }) if what.contains("lane mask")),
+        "{err_pixel_b32_in_w64:?}"
+    );
+    let err_cs_b32_in_w64 = lowered(
+        &[
+            0x7D88_0085, // v_cmp_gt_u32_e32 vcc, 5, v0
+            0xBE84_446A, // s_orn1_saveexec_b32 s4, vcc_lo
+            0x7E02_0204, // v_mov_b32_e32 v1, s4
+        ],
+        64,
+        true,
+    )
+    .err();
+    assert!(
+        matches!(&err_cs_b32_in_w64, Some(crate::ShaderError::Unsupported { what, .. }) if what.contains("other width")),
+        "{err_cs_b32_in_w64:?}"
+    );
+    let w32_words: Vec<u32> = [
+        PRELUDE,
+        &[
+            0xBEEB_0380, // s_mov_b32 vcc_hi, 0
+            0xBEFF_0380, // s_mov_b32 exec_hi, 0
+            0x7D82_0085, // v_cmp_lt_u32_e32 vcc_lo, 5, v0
+            0xBE84_386A, // s_orn1_saveexec_b64 s[4:5], vcc
+            0x7E02_0204, // v_mov_b32_e32 v1, s4
+        ],
+        EPILOGUE,
+    ]
+    .concat();
+    let native_w32 = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w32_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p_w32 = ir::build(&native_w32.code, false, 256).unwrap();
+    let st_w32 = structure::structure(&p_w32).unwrap();
+    let res_w32 = resource::track(&p_w32, &native_w32.layout, HwStage::Cs, Some(&st_w32)).unwrap();
+    let io_w32 = io::raise(&p_w32, &native_w32).unwrap();
+    let err_b64_in_w32 = lower::lower(&Parts {
+        native: &native_w32,
+        p: &p_w32,
+        st: &st_w32,
+        io: &io_w32,
+        res: &res_w32,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: true,
+        zero_copy_memory: false,
+        rect_list: false,
+        copy_params: [0; 32],
+        view_marks: false,
+    })
+    .err();
+    assert!(
+        matches!(&err_b64_in_w32, Some(crate::ShaderError::Unsupported { what, .. }) if what.contains("other width")),
+        "{err_b64_in_w32:?}"
+    );
+}

@@ -2594,7 +2594,16 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
+        // `Atom::Quad` evaluates to `true` as an EXEC derivative shortcut (`atom`), not the
+        // mask's quad-expanded bits: route any `s_wqm`-derived mask through `mask_number`.
+        let has_quad = self
+            .x
+            .st
+            .bools
+            .support(m)
+            .iter()
+            .any(|a| matches!(a, Atom::Quad(_)));
+        if (!self.x.st.active.contains(&lo) || has_quad) && !self.ballots.contains_key(&lo) {
             let xy = self.mask_number(lo)?;
             self.ballots.insert(lo, xy);
         }
@@ -2680,13 +2689,28 @@ impl<'a> Lower<'a> {
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
             .ok_or(WIDTH)?;
-        // (EXEC written besides the destination: a saveexec's new mask.)
-        if inst.write(Reg::S(*code)) != Some(lo)
-            || *code != EXEC && inst.write(Reg::S(EXEC)).is_some()
+        let (save, f_op) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+            (Some(f), _) => (Some(true), f),
+            (_, Some(f)) => (Some(false), f),
+            _ => (None, op),
+        };
+        let writes_dst = inst.write(Reg::S(*code)) == Some(lo);
+        let writes_exec = inst.write(Reg::S(EXEC)) == Some(lo);
+        // (EXEC written besides the destination: a saveexec's new mask, modelled on console lanes.)
+        if !writes_dst && !writes_exec
+            || (save.is_none() || self.mask_data != MaskData::Console)
+                && *code != EXEC
+                && inst.write(Reg::S(EXEC)).is_some()
         {
             return Err(SAVED);
         }
-        if matches!(op, "lshl" | "lshr") && self.mask_data != MaskData::Console {
+        if save.is_none()
+            && self.mask_data != MaskData::Console
+            && matches!(
+                op,
+                "lshl" | "lshr" | "bitset0" | "bitset1" | "bfm" | "brev" | "quadmask" | "wqm"
+            )
+        {
             return Err(SHIFT);
         }
         let at = if b == self.cur_ir {
@@ -2718,7 +2742,17 @@ impl<'a> Lower<'a> {
                 };
                 Ok(l.s.m.i32(x))
             };
-            if matches!(op, "lshl" | "lshr") {
+            if save == Some(true) && !writes_exec {
+                // `s_*_saveexec` writes the incoming `EXEC` into `sdst`.
+                let lo_e = self.i32_of(inst.read(Reg::S(EXEC)).ok_or(OPERAND)?)?;
+                let hi_e = if wave64 {
+                    self.i32_of(inst.read(Reg::S(EXEC + 1)).ok_or(OPERAND)?)?
+                } else {
+                    self.s.m.i32(0)
+                };
+                return Ok((lo_e, hi_e));
+            }
+            if save.is_none() && matches!(op, "lshl" | "lshr") {
                 // The shift count is the low 6 (5) bits of a plain number.
                 let n = word(self, 1, 0)?;
                 let a = word(self, 0, 0)?;
@@ -2743,15 +2777,106 @@ impl<'a> Lower<'a> {
                 let rh = self.s.m.cast(at, Cast::Trunc, rh, self.s.t.i32);
                 return Ok((rl, rh));
             }
+            if save.is_none() && matches!(op, "bitset0" | "bitset1") {
+                let old_lo = self.i32_of(inst.read(Reg::S(*code)).ok_or(OPERAND)?)?;
+                let bit = word(self, 0, 0)?;
+                let (k31, one, z, ones) = (
+                    self.s.m.i32(31),
+                    self.s.m.i32(1),
+                    self.s.m.i32(0),
+                    self.s.m.i32(u32::MAX),
+                );
+                let idx = self.s.m.bin(at, Bin::And, bit, k31);
+                let mask = self.s.m.bin(at, Bin::Shl, one, idx);
+                if !wave64 {
+                    let r = if op == "bitset1" {
+                        self.s.m.bin(at, Bin::Or, old_lo, mask)
+                    } else {
+                        let nmask = self.s.m.bin(at, Bin::Xor, mask, ones);
+                        self.s.m.bin(at, Bin::And, old_lo, nmask)
+                    };
+                    return Ok((r, z));
+                }
+                let old_hi = self.i32_of(inst.read(Reg::S(*code + 1)).ok_or(OPERAND)?)?;
+                let k32 = self.s.m.i32(32);
+                let hi_bit = self.s.m.bin(at, Bin::And, bit, k32);
+                let upper = self.s.m.cmp(at, pred::NE, hi_bit, z);
+                let lo_mask = self.s.m.select(at, upper, z, mask);
+                let hi_mask = self.s.m.select(at, upper, mask, z);
+                return Ok(if op == "bitset1" {
+                    (
+                        self.s.m.bin(at, Bin::Or, old_lo, lo_mask),
+                        self.s.m.bin(at, Bin::Or, old_hi, hi_mask),
+                    )
+                } else {
+                    let nlo = self.s.m.bin(at, Bin::Xor, lo_mask, ones);
+                    let nhi = self.s.m.bin(at, Bin::Xor, hi_mask, ones);
+                    (
+                        self.s.m.bin(at, Bin::And, old_lo, nlo),
+                        self.s.m.bin(at, Bin::And, old_hi, nhi),
+                    )
+                });
+            }
+            if save.is_none() && op == "bfm" {
+                let (w, o) = (word(self, 0, 0)?, word(self, 1, 0)?);
+                if !wave64 {
+                    let (k31, one, z) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+                    let w = self.s.m.bin(at, Bin::And, w, k31);
+                    let o = self.s.m.bin(at, Bin::And, o, k31);
+                    let m = self.s.m.bin(at, Bin::Shl, one, w);
+                    let m = self.s.m.bin(at, Bin::Sub, m, one);
+                    return Ok((self.s.m.bin(at, Bin::Shl, m, o), z));
+                }
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let k63 = self.s.m.i32(63);
+                let w = self.s.m.bin(at, Bin::And, w, k63);
+                let w = self.s.m.cast(at, Cast::ZExt, w, i64t);
+                let o = self.s.m.bin(at, Bin::And, o, k63);
+                let o = self.s.m.cast(at, Cast::ZExt, o, i64t);
+                let one = self.s.m.int_const(i64t, 1);
+                let m = self.s.m.bin(at, Bin::Shl, one, w);
+                let m = self.s.m.bin(at, Bin::Sub, m, one);
+                let r = self.s.m.bin(at, Bin::Shl, m, o);
+                let k32 = self.s.m.int_const(i64t, 32);
+                let rl = self.s.m.cast(at, Cast::Trunc, r, self.s.t.i32);
+                let rh = self.s.m.bin(at, Bin::LShr, r, k32);
+                let rh = self.s.m.cast(at, Cast::Trunc, rh, self.s.t.i32);
+                return Ok((rl, rh));
+            }
+            if save.is_none() && op == "brev" {
+                let i32t = self.s.t.i32;
+                let a = word(self, 0, 0)?;
+                let ra = self.s.op(at, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                if !wave64 {
+                    return Ok((ra, self.s.m.i32(0)));
+                }
+                let b = word(self, 0, 1)?;
+                let rb = self.s.op(at, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                return Ok((rb, ra));
+            }
+            if save.is_none() && op == "quadmask" {
+                let a = word(self, 0, 0)?;
+                let low = self.quad_mask(at, a);
+                if !wave64 {
+                    return Ok((low, self.s.m.i32(0)));
+                }
+                let b = word(self, 0, 1)?;
+                let high = self.quad_mask(at, b);
+                let k8 = self.s.m.i32(8);
+                let high = self.s.m.bin(at, Bin::Shl, high, k8);
+                return Ok((self.s.m.bin(at, Bin::Or, low, high), self.s.m.i32(0)));
+            }
             let mut out = [self.s.m.i32(0); 2];
             for h in 0..1 + u8::from(wave64) {
                 let a = word(self, 0, h)?;
                 let ones = self.s.m.i32(u32::MAX);
-                out[usize::from(h)] = match op {
-                    "mov" => a,
-                    "not" => self.s.m.bin(at, Bin::Xor, a, ones),
-                    "cselect" | "cmov" => {
-                        let c = if op == "cmov" {
+                out[usize::from(h)] = match f_op {
+                    "mov" if save.is_none() => a,
+                    "not" if save.is_none() => self.s.m.bin(at, Bin::Xor, a, ones),
+                    "wqm" if save.is_none() => self.wqm_word(at, a),
+                    "cselect" | "cmov" if save.is_none() => {
+                        let c = if f_op == "cmov" {
                             let old = inst.read(Reg::S(*code + h)).ok_or(OPERAND)?;
                             self.i32_of(old)?
                         } else {
@@ -2769,19 +2894,31 @@ impl<'a> Lower<'a> {
                         self.s.m.select(at, cond, a, c)
                     }
                     _ => {
-                        // (operation, complement of src1, complement of the result)
-                        let (f, not_c, not_r) = match op {
-                            "and" => (Bin::And, false, false),
-                            "or" => (Bin::Or, false, false),
-                            "xor" => (Bin::Xor, false, false),
-                            "andn2" => (Bin::And, true, false),
-                            "orn2" => (Bin::Or, true, false),
-                            "nand" => (Bin::And, false, true),
-                            "nor" => (Bin::Or, false, true),
-                            "xnor" => (Bin::Xor, false, true),
+                        // (operation, complement of src0, complement of src1, complement of result)
+                        let (f, not_a, not_c, not_r) = match f_op {
+                            "and" => (Bin::And, false, false, false),
+                            "or" => (Bin::Or, false, false, false),
+                            "xor" => (Bin::Xor, false, false, false),
+                            "andn2" => (Bin::And, false, true, false),
+                            "orn2" => (Bin::Or, false, true, false),
+                            "andn1" => (Bin::And, true, false, false),
+                            "orn1" => (Bin::Or, true, false, false),
+                            "nand" => (Bin::And, false, false, true),
+                            "nor" => (Bin::Or, false, false, true),
+                            "xnor" => (Bin::Xor, false, false, true),
                             _ => return Err(OP),
                         };
-                        let c = word(self, 1, h)?;
+                        let a = if not_a {
+                            self.s.m.bin(at, Bin::Xor, a, ones)
+                        } else {
+                            a
+                        };
+                        let c = if save.is_some() {
+                            let e = inst.read(Reg::S(EXEC + h)).ok_or(OPERAND)?;
+                            self.i32_of(e)?
+                        } else {
+                            word(self, 1, h)?
+                        };
                         let c = if not_c {
                             self.s.m.bin(at, Bin::Xor, c, ones)
                         } else {
@@ -2798,7 +2935,7 @@ impl<'a> Lower<'a> {
             }
             if self.mask_data == MaskData::Host
                 && wave64
-                && matches!(op, "not" | "orn2" | "nand" | "nor" | "xnor")
+                && matches!(f_op, "not" | "orn2" | "orn1" | "nand" | "nor" | "xnor")
             {
                 // On a 32-lane host wave, complementing sets bits 32..63 that
                 // belong to no lane; clear the high dword when wave size <= 32.
@@ -5341,8 +5478,8 @@ impl<'a> Lower<'a> {
             return match name {
                 "s_quadmask_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let low = self.quad_mask(a);
-                    let high = self.quad_mask(b);
+                    let low = self.quad_mask(c, a);
+                    let high = self.quad_mask(c, b);
                     let k8 = self.s.m.i32(8);
                     let high = self.s.m.bin(c, Bin::Shl, high, k8);
                     let mask = self.s.m.bin(c, Bin::Or, low, high);
@@ -5351,6 +5488,15 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(zero));
                     let nonzero = self.s.m.cmp(c, pred::NE, mask, zero);
                     self.set(scc, Val::Bit(nonzero));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (rl, rh) = (self.wqm_word(c, a), self.wqm_word(c, b));
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
                     Ok(())
                 }
                 "s_bcnt1_i32_b64" => {
@@ -5651,7 +5797,11 @@ impl<'a> Lower<'a> {
             "s_movk_i32" => (sext16(self), None),
             "s_quadmask_b32" => {
                 let pixels = src32(self, 0)?;
-                (self.quad_mask(pixels), None)
+                (self.quad_mask(c, pixels), None)
+            }
+            "s_wqm_b32" => {
+                let pixels = src32(self, 0)?;
+                (self.wqm_word(c, pixels), None)
             }
             "s_cselect_b32" => {
                 let cond = self.scc_in(inst)?;
@@ -5933,9 +6083,27 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, pred::SLT, both, z)
     }
 
+    /// `S_WQM_B32` on a 32-bit mask dword: each 4-bit quad with any set bit becomes `0xf`.
+    fn wqm_word(&mut self, c: usize, a: V) -> V {
+        let (odd, even) = (self.s.m.i32(0xAAAA_AAAA), self.s.m.i32(0x5555_5555));
+        let (hi2, lo2) = (self.s.m.i32(0xCCCC_CCCC), self.s.m.i32(0x3333_3333));
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let lo_odd = self.s.m.bin(c, Bin::And, a, odd);
+        let lo_even = self.s.m.bin(c, Bin::And, a, even);
+        let down1 = self.s.m.bin(c, Bin::LShr, lo_odd, one);
+        let up1 = self.s.m.bin(c, Bin::Shl, lo_even, one);
+        let pair_or = self.s.m.bin(c, Bin::Or, down1, up1);
+        let p = self.s.m.bin(c, Bin::Or, a, pair_or);
+        let p_hi2 = self.s.m.bin(c, Bin::And, p, hi2);
+        let p_lo2 = self.s.m.bin(c, Bin::And, p, lo2);
+        let down2 = self.s.m.bin(c, Bin::LShr, p_hi2, two);
+        let up2 = self.s.m.bin(c, Bin::Shl, p_lo2, two);
+        let quad_or = self.s.m.bin(c, Bin::Or, down2, up2);
+        self.s.m.bin(c, Bin::Or, p, quad_or)
+    }
+
     /// Packs whether each consecutive group of four pixels has a set bit.
-    fn quad_mask(&mut self, pixels: V) -> V {
-        let c = self.cur;
+    fn quad_mask(&mut self, c: usize, pixels: V) -> V {
         let one = self.s.m.i32(1);
         let shifted = self.s.m.bin(c, Bin::LShr, pixels, one);
         let mut mask = self.s.m.bin(c, Bin::Or, pixels, shifted);
