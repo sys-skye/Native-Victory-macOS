@@ -229,10 +229,11 @@ pub(crate) fn track_graphics(
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
+                    && let Some(reads) = a.dynamic.and_then(|d| t.first_lane_in_offset(load.0, d))
                 {
-                    offset.push((v, load));
+                    for v in reads {
+                        offset.push((v, load));
+                    }
                 }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
@@ -338,10 +339,24 @@ pub(crate) fn track_graphics(
 }
 
 /// A dword after copy propagation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Term {
     Const(u32),
     Value(Value),
+}
+
+/// The single non-constant 32-bit offset added to a heap/root base on the low half of an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LowOffset {
+    /// Canonicalized low-half addend `d` (`lo + extra == base + const + d`).
+    raw: Term,
+    /// `(canon(src), shift)` when `d` is `src << shift` (`1 <= shift <= 31`).
+    shifted: Option<(Term, u32)>,
+    /// Canonicalized unordered operand pair `[a, b]` and whether `d` came from a shift by 31
+    /// (`1 << 31` is negative in signed 32-bit multiplication).
+    product: Option<([Term; 2], bool)>,
+    /// Low output `Value` when `d` is `writes[0]` of a 64-bit shift or `v_mad_*64_*32`.
+    pair_lo: Option<Value>,
 }
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
@@ -380,6 +395,12 @@ struct Tracer<'a> {
     /// Live-in SGPRs whose pair an address was taken in with no root
     /// parameter filling them (tracked as title memory).
     memory_inputs: std::cell::RefCell<std::collections::BTreeSet<u8>>,
+    /// Memoized [`Self::edge_taken`] per `(pred, block)` CFG edge.
+    edge_taken_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), bool>>,
+    /// Precomputed single-value resolution of each phi along taken edges (`O(P + E)`).
+    joined: Vec<Option<Term>>,
+    /// Precomputed [`Sum`] for every SSA value (`O(V + E)`).
+    sums: Vec<Sum>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -421,6 +442,71 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+const MAX_HIGH_STEPS: usize = 512;
+
+/// Iterative Tarjan strongly-connected-components pass over `0..n`, returning SCCs in reverse
+/// topological order (every callee SCC appears before any caller SCC that reaches it).
+fn tarjan_sccs(n: usize, mut edges_of: impl FnMut(usize, &mut Vec<usize>)) -> Vec<Vec<usize>> {
+    let mut index = vec![0u32; n];
+    let mut lowlink = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut tarjan_stack: Vec<usize> = Vec::new();
+    let mut frames: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+    let mut next_idx = 1u32;
+    let mut sccs = Vec::new();
+    for start in 0..n {
+        if index[start] != 0 {
+            continue;
+        }
+        index[start] = next_idx;
+        lowlink[start] = next_idx;
+        next_idx += 1;
+        tarjan_stack.push(start);
+        on_stack[start] = true;
+        let mut nbrs = Vec::new();
+        edges_of(start, &mut nbrs);
+        frames.push((start, nbrs, 0));
+        while let Some((v, nbrs, pos)) = frames.last_mut() {
+            let v = *v;
+            if *pos < nbrs.len() {
+                let w = nbrs[*pos];
+                *pos += 1;
+                if w >= n {
+                    continue;
+                }
+                if index[w] == 0 {
+                    index[w] = next_idx;
+                    lowlink[w] = next_idx;
+                    next_idx += 1;
+                    tarjan_stack.push(w);
+                    on_stack[w] = true;
+                    let mut w_nbrs = Vec::new();
+                    edges_of(w, &mut w_nbrs);
+                    frames.push((w, w_nbrs, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
+                }
+            } else {
+                frames.pop();
+                if let Some((parent, _, _)) = frames.last() {
+                    lowlink[*parent] = lowlink[*parent].min(lowlink[v]);
+                }
+                if lowlink[v] == index[v] {
+                    let mut comp = Vec::new();
+                    while let Some(u) = tarjan_stack.pop() {
+                        on_stack[u] = false;
+                        comp.push(u);
+                        if u == v {
+                            break;
+                        }
+                    }
+                    sccs.push(comp);
+                }
+            }
+        }
+    }
+    sccs
+}
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -479,6 +565,9 @@ impl<'a> Tracer<'a> {
             first_spilled: Default::default(),
             spill_at: Default::default(),
             memory_inputs: Default::default(),
+            edge_taken_cache: Default::default(),
+            joined: Vec::new(),
+            sums: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -496,6 +585,8 @@ impl<'a> Tracer<'a> {
         if !t.spilled.is_empty() {
             t.origin = t.propagate_copies(n)?;
         }
+        t.joined = t.compute_joined(n);
+        t.sums = t.compute_sums(n);
         Ok(t)
     }
 
@@ -638,7 +729,10 @@ impl<'a> Tracer<'a> {
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => self.xor_undone(inst, k, &o).or(Some(Term::Value(v))),
+                            None => self
+                                .identity_op(inst, k, &o)
+                                .or_else(|| self.xor_undone(inst, k, &o))
+                                .or(Some(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -694,114 +788,421 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
-    fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
+    /// The SOP2 operands of `v` if one of `names` wrote it as dword `half`.
+    fn sop2_half(&self, v: Value, half: usize, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
-        if !names.contains(&inst.name()) || inst.writes.first()?.1 != v {
+        if !names.contains(&inst.name()) || inst.writes.get(half)?.1 != v {
             return None;
         }
         let Fields::Sop { src, .. } = &inst.fields else {
             return None;
         };
-        Some((
-            inst,
-            [
-                self.term(inst, src.first()?)?,
-                self.term(inst, src.get(1)?)?,
-            ],
-        ))
+        let half_term = |op: &Operand| match *op {
+            Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+            Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + half as u8))?)),
+            Operand::Const(c) if half == 0 => inline(c).map(Term::Const),
+            Operand::Const(c @ 128..=208) => inline(c).map(|lo| Term::Const(((lo as i32) >> 31) as u32)),
+            Operand::Literal(x) if half == 0 => Some(Term::Const(x)),
+            Operand::Literal(x) if x >> 31 == 0 => Some(Term::Const(0)),
+            _ => None,
+        };
+        Some((inst, [half_term(src.first()?)?, half_term(src.get(1)?)?]))
+    }
+
+    /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
+    fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
+        self.sop2_half(v, 0, names)
     }
 
     fn sum(&self, t: Term) -> Sum {
-        let v = match t {
-            Term::Const(c) => {
-                return Sum {
-                    base: None,
-                    offset: c,
-                    dynamic: None,
-                };
+        match t {
+            Term::Const(c) => Sum {
+                base: None,
+                offset: c,
+                dynamic: None,
+            },
+            Term::Value(v) => self.sums[v.0 as usize],
+        }
+    }
+
+    /// Precomputes [`Self::joined_on_taken_edges`] across all phis in `O(P + E)` via Tarjan SCCs.
+    fn compute_joined(&self, n: usize) -> Vec<Option<Term>> {
+        let mut out = vec![None; n];
+        let mut phi_vals = Vec::new();
+        let mut phi_id = vec![None; n];
+        for (vi, p) in self.phis.iter().enumerate() {
+            if p.is_some() {
+                phi_id[vi] = Some(phi_vals.len());
+                phi_vals.push(Value(vi as u32));
             }
-            Term::Value(v) => v,
-        };
-        let dynamic = Sum {
-            base: None,
-            offset: 0,
-            dynamic: Some(v),
-        };
-        if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
-            return match self.param_value(v) {
-                Some((p, 0))
-                    if matches!(
-                        self.layout[p].root,
-                        RootType::Table
-                            | RootType::Descriptor
-                            | RootType::ResourceHeap
-                            | RootType::SamplerHeap
-                    ) =>
+        }
+        if phi_vals.is_empty() {
+            return out;
+        }
+        let sccs = tarjan_sccs(phi_vals.len(), |k, nbrs| {
+            let v = phi_vals[k];
+            let (b, i) = self.phis[v.0 as usize].unwrap();
+            let block = &self.p.blocks[b];
+            let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+            for (&a, &q) in block.phis[i].args.iter().zip(&block.preds) {
+                if !self.edge_taken(q, b) {
+                    continue;
+                }
+                let raw = if is_vgpr { self.vorigin(a) } else { self.origin(a) };
+                if let Term::Value(w) = raw
+                    && let Some(wk) = phi_id[w.0 as usize]
                 {
-                    Sum {
-                        base: Some(v),
-                        offset: 0,
-                        dynamic: None,
+                    nbrs.push(wk);
+                }
+            }
+        });
+        let mut in_comp = vec![false; phi_vals.len()];
+        for comp in sccs {
+            for &k in &comp {
+                in_comp[k] = true;
+            }
+            let mut first: Option<Term> = None;
+            let mut mismatch = false;
+            for &k in &comp {
+                let u = phi_vals[k];
+                let (b, i) = self.phis[u.0 as usize].unwrap();
+                let block = &self.p.blocks[b];
+                let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+                for (&a, &q) in block.phis[i].args.iter().zip(&block.preds) {
+                    if !self.edge_taken(q, b) {
+                        continue;
+                    }
+                    let raw = if is_vgpr { self.vorigin(a) } else { self.origin(a) };
+                    if let Term::Value(w) = raw
+                        && let Some(wk) = phi_id[w.0 as usize]
+                        && in_comp[wk]
+                    {
+                        continue;
+                    }
+                    let resolved = match raw {
+                        Term::Value(w) => out[w.0 as usize].unwrap_or(raw),
+                        _ => raw,
+                    };
+                    match first {
+                        None => first = Some(resolved),
+                        Some(f) if f == resolved => {}
+                        Some(_) => {
+                            mismatch = true;
+                            break;
+                        }
                     }
                 }
-                _ => dynamic,
-            };
-        }
-        if self.getpc(v).is_some() {
-            return Sum {
-                base: Some(v),
-                offset: 0,
-                dynamic: None,
-            };
-        }
-        if let Some((_, [_, unshifted])) = self.sop2(
-            v,
-            &[
-                "s_lshl1_add_u32",
-                "s_lshl2_add_u32",
-                "s_lshl3_add_u32",
-                "s_lshl4_add_u32",
-            ],
-        ) {
-            let y = self.sum(unshifted);
-            // Only for heap/table bases, where lowering reads the SMEM/flat base register
-            // directly rather than adding `Address::dynamic` on top of the root address.
-            if y.dynamic.is_none()
-                && y.base
-                    .and_then(|b| self.param_value(b))
-                    .is_some_and(|(p, d)| {
-                        d == 0
-                            && matches!(
-                                self.layout[p].root,
-                                RootType::ResourceHeap | RootType::SamplerHeap | RootType::Table
-                            )
-                    })
-            {
-                return Sum {
-                    base: y.base,
-                    offset: y.offset,
-                    dynamic: Some(v),
-                };
+                if mismatch {
+                    break;
+                }
             }
-            return dynamic;
+            for &k in &comp {
+                in_comp[k] = false;
+            }
+            if !mismatch && let Some(val) = first {
+                for &k in &comp {
+                    out[phi_vals[k].0 as usize] = Some(val);
+                }
+            }
         }
-        let Some([a, b]) = self
-            .sop2(v, &["s_add_u32", "s_add_i32"])
-            .map(|(_, t)| t)
-            .or_else(|| self.vadd(v))
-        else {
-            return dynamic;
+        out
+    }
+
+    /// Precomputes [`Sum`] across all SSA values `0..n` in `O(V + E)` via Tarjan SCCs.
+    fn compute_sums(&self, n: usize) -> Vec<Sum> {
+        let mut sums: Vec<Sum> = (0..n)
+            .map(|vi| Sum {
+                base: None,
+                offset: 0,
+                dynamic: Some(Value(vi as u32)),
+            })
+            .collect();
+        if n == 0 {
+            return sums;
+        }
+        let is_heap_param = |b: Value| {
+            self.param_value(b).is_some_and(|(p, d)| {
+                d == 0
+                    && matches!(
+                        self.layout[p].root,
+                        RootType::ResourceHeap | RootType::SamplerHeap | RootType::Table
+                    )
+            })
         };
-        let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-            return dynamic;
+        let push_term = |t: Term, nbrs: &mut Vec<usize>| {
+            if let Term::Value(w) = t {
+                nbrs.push(w.0 as usize);
+            }
+        };
+        let sccs = tarjan_sccs(n, |vi, nbrs| {
+            let v = Value(vi as u32);
+            if let Some(j) = self.joined[vi]
+                && j != Term::Value(v)
+            {
+                push_term(j, nbrs);
+            }
+            if let Some((b, i)) = self.phis[vi] {
+                let block = &self.p.blocks[b];
+                let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+                for (&a, &q) in block.phis[i].args.iter().zip(&block.preds) {
+                    if self.edge_taken(q, b) {
+                        push_term(if is_vgpr { self.vorigin(a) } else { self.origin(a) }, nbrs);
+                    }
+                }
+                return;
+            }
+            if self.inputs[vi].is_some() || self.spilled.contains_key(&v) || self.getpc(v).is_some() {
+                return;
+            }
+            if let Some(unshifted) = self
+                .sop2(
+                    v,
+                    &[
+                        "s_lshl1_add_u32",
+                        "s_lshl2_add_u32",
+                        "s_lshl3_add_u32",
+                        "s_lshl4_add_u32",
+                    ],
+                )
+                .map(|(_, [_, u])| u)
+                .or_else(|| self.vlshl_add(v).map(|(_, _, u)| u))
+                .or_else(|| self.vmad64_addend(v, 0))
+            {
+                push_term(unshifted, nbrs);
+                return;
+            }
+            if let Some(lane) = self.first_lane_source(v) {
+                push_term(self.vorigin(lane), nbrs);
+                return;
+            }
+            if let Some([a, b]) = self
+                .sop2(v, &["s_add_u32", "s_add_i32"])
+                .map(|(_, t)| t)
+                .or_else(|| self.vadd(v))
+            {
+                push_term(a, nbrs);
+                push_term(b, nbrs);
+            }
+        });
+        let term_sum = |t: Term, sums: &[Sum]| match t {
+            Term::Const(c) => Sum {
+                base: None,
+                offset: c,
+                dynamic: None,
+            },
+            Term::Value(w) => sums[w.0 as usize],
+        };
+        let mut in_comp = vec![false; n];
+        for comp in sccs {
+            let single_acyclic = if comp.len() == 1 {
+                let vi = comp[0];
+                let v = Value(vi as u32);
+                match self.phis[vi] {
+                    Some((b, i)) => {
+                        let block = &self.p.blocks[b];
+                        let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+                        !block
+                            .phis[i]
+                            .args
+                            .iter()
+                            .zip(&block.preds)
+                            .any(|(&a, &q)| {
+                                self.edge_taken(q, b)
+                                    && (if is_vgpr { self.vorigin(a) } else { self.origin(a) })
+                                        == Term::Value(v)
+                            })
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if !single_acyclic {
+                for &ui in &comp {
+                    in_comp[ui] = true;
+                }
+                let mut ok = comp.iter().all(|&ui| self.phis[ui].is_some());
+                let mut base_found: Option<Value> = None;
+                let mut ext_count = 0usize;
+                if ok {
+                    for &ui in &comp {
+                        let (b, i) = self.phis[ui].unwrap();
+                        let block = &self.p.blocks[b];
+                        let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+                        let mut any_taken = false;
+                        for (&a, &q) in block.phis[i].args.iter().zip(&block.preds) {
+                            if !self.edge_taken(q, b) {
+                                continue;
+                            }
+                            any_taken = true;
+                            let term = if is_vgpr { self.vorigin(a) } else { self.origin(a) };
+                            if let Term::Value(w) = term
+                                && in_comp[w.0 as usize]
+                            {
+                                continue;
+                            }
+                            ext_count += 1;
+                            match term_sum(term, &sums).base.filter(|&hb| self.heap_base(hb)) {
+                                Some(hb) if base_found.is_none_or(|prev| prev == hb) => {
+                                    base_found = Some(hb);
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !any_taken || !ok {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                for &ui in &comp {
+                    in_comp[ui] = false;
+                }
+                if ok && ext_count > 0 && let Some(hb) = base_found {
+                    for &ui in &comp {
+                        sums[ui] = Sum {
+                            base: Some(hb),
+                            offset: 0,
+                            dynamic: Some(Value(ui as u32)),
+                        };
+                    }
+                }
+                continue;
+            }
+            let vi = comp[0];
+            let v = Value(vi as u32);
+            let dynamic = sums[vi];
+            if let Some(joined) = self.joined[vi]
+                && joined != Term::Value(v)
+            {
+                let y = term_sum(joined, &sums);
+                if y.base.is_some() {
+                    sums[vi] = Sum {
+                        base: y.base,
+                        offset: y.offset,
+                        dynamic: if y.dynamic.is_some() { Some(v) } else { None },
+                    };
+                    continue;
+                }
+            }
+            if let Some((b, i)) = self.phis[vi] {
+                let block = &self.p.blocks[b];
+                let is_vgpr = matches!(block.phis[i].reg, Reg::V(_));
+                let mut count = 0usize;
+                let mut base_found: Option<Value> = None;
+                let mut ok = true;
+                for (&a, &q) in block.phis[i].args.iter().zip(&block.preds) {
+                    if !self.edge_taken(q, b) {
+                        continue;
+                    }
+                    count += 1;
+                    let term = if is_vgpr { self.vorigin(a) } else { self.origin(a) };
+                    match term_sum(term, &sums).base.filter(|&hb| self.heap_base(hb)) {
+                        Some(hb) if base_found.is_none_or(|prev| prev == hb) => {
+                            base_found = Some(hb);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && count > 0 && let Some(hb) = base_found {
+                    sums[vi] = Sum {
+                        base: Some(hb),
+                        offset: 0,
+                        dynamic: Some(v),
+                    };
+                }
+                continue;
+            }
+            if self.inputs[vi].is_some() || self.spilled.contains_key(&v) {
+                sums[vi] = match self.param_value(v) {
+                    Some((p, 0))
+                        if matches!(
+                            self.layout[p].root,
+                            RootType::Table
+                                | RootType::Descriptor
+                                | RootType::ResourceHeap
+                                | RootType::SamplerHeap
+                        ) =>
+                    {
+                        Sum {
+                            base: Some(v),
+                            offset: 0,
+                            dynamic: None,
+                        }
+                    }
+                    _ => dynamic,
+                };
+                continue;
+            }
+            if self.getpc(v).is_some() {
+                sums[vi] = Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                };
+                continue;
+            }
+            if let Some(unshifted) = self
+                .sop2(
+                    v,
+                    &[
+                        "s_lshl1_add_u32",
+                        "s_lshl2_add_u32",
+                        "s_lshl3_add_u32",
+                        "s_lshl4_add_u32",
+                    ],
+                )
+                .map(|(_, [_, u])| u)
+                .or_else(|| self.vlshl_add(v).map(|(_, _, u)| u))
+                .or_else(|| self.vmad64_addend(v, 0))
+            {
+                let y = term_sum(unshifted, &sums);
+                // Only for heap/table bases, where lowering reads the SMEM/flat base register
+                // directly rather than adding `Address::dynamic` on top of the root address.
+                if y.dynamic.is_none() && y.base.is_some_and(is_heap_param) {
+                    sums[vi] = Sum {
+                        base: y.base,
+                        offset: y.offset,
+                        dynamic: Some(v),
+                    };
+                }
+                continue;
+            }
+            if let Some(lane) = self.first_lane_source(v) {
+                let y = term_sum(self.vorigin(lane), &sums);
+                if y.base.is_some_and(is_heap_param) {
+                    sums[vi] = Sum {
+                        base: y.base,
+                        offset: y.offset,
+                        dynamic: Some(v),
+                    };
+                }
+                continue;
+            }
+            let Some([a, b]) = self
+                .sop2(v, &["s_add_u32", "s_add_i32"])
+                .map(|(_, t)| t)
+                .or_else(|| self.vadd(v))
+            else {
+                continue;
+            };
+            let (x, y) = (term_sum(a, &sums), term_sum(b, &sums));
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                continue;
+            }
+            sums[vi] = Sum {
+                base: x.base.or(y.base),
+                offset: x.offset.wrapping_add(y.offset),
+                dynamic: x.dynamic.or(y.dynamic),
+            };
         }
-        Sum {
-            base: x.base.or(y.base),
-            offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
-        }
+        sums
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -809,6 +1210,88 @@ impl<'a> Tracer<'a> {
         let inst = self.def(lo)?;
         (inst.name() == "s_getpc_b64" && inst.writes.first().is_some_and(|w| w.1 == lo))
             .then_some(inst)
+    }
+
+    /// `v_lshl_add_u32 dst, src0, shift, unshifted` writing `v`: `(src0, shift, unshifted)`.
+    fn vlshl_add(&self, v: Value) -> Option<(Term, u32, Term)> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_lshl_add_u32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let Term::Const(shift) = self.vterm(inst, f.src.get(1)?)? else {
+            return None;
+        };
+        Some((
+            self.vterm(inst, f.src.first()?)?,
+            shift & 31,
+            self.vterm(inst, f.src.get(2)?)?,
+        ))
+    }
+
+    /// `v_mad_u64_u32` or `v_mad_i64_i32` writing `v` as output dword `half` (`0` or `1`):
+    /// `(lo_out, [src0, src1], signed, [add_lo, add_hi])`.
+    fn vmad64(&self, v: Value, half: usize) -> Option<(Value, [Term; 2], bool, [Term; 2])> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        let signed = match inst.name() {
+            "v_mad_u64_u32" => false,
+            "v_mad_i64_i32" => true,
+            _ => return None,
+        };
+        if inst.write(Reg::V(reg + half as u8)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let lo_out = inst.write(Reg::V(reg))?;
+        let src0 = self.vterm(inst, f.src.first()?)?;
+        let src1 = self.vterm(inst, f.src.get(1)?)?;
+        let add_op = f.src.get(2)?;
+        let add_word = |h: usize| -> Option<Term> {
+            match *add_op {
+                Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+                Operand::Scalar { code, .. } => {
+                    Some(self.origin(inst.read(Reg::S(code + h as u8))?))
+                }
+                Operand::Vector { reg: r, .. } => {
+                    Some(self.vorigin(inst.read(Reg::V(r + h as u8))?))
+                }
+                Operand::Const(c) if h == 0 => inline(c).map(Term::Const),
+                Operand::Const(c @ 128..=208) => {
+                    inline(c).map(|lo| Term::Const(((lo as i32) >> 31) as u32))
+                }
+                Operand::Literal(x) if h == 0 => Some(Term::Const(x)),
+                Operand::Literal(x) if x >> 31 == 0 => Some(Term::Const(0)),
+                _ => None,
+            }
+        };
+        Some((lo_out, [src0, src1], signed, [add_word(0)?, add_word(1)?]))
+    }
+
+    /// Dword `half` (`0` or `1`) of the 64-bit addend `src2` of `v_mad_*64_*32` writing `v` as
+    /// its `half` output dword.
+    fn vmad64_addend(&self, v: Value, half: usize) -> Option<Term> {
+        self.vmad64(v, half).map(|(_, _, _, add)| add[half])
     }
 
     /// The operands of a VALU addition (`v_add_co_u32`, `v_add_nc_u32`)
@@ -1023,7 +1506,8 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
+        let low_terms = [lo, extra.dynamic.map_or(Term::Const(0), Term::Value)];
+        if !self.high_half_with(hi, high, &low_terms, Some(base))
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             return Err(if high.is_none() {
@@ -1051,28 +1535,857 @@ impl<'a> Tracer<'a> {
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
-        // The compiler can mask the carry to the address width. Strip the AND only
-        // if it keeps every possible bit of its input (0 + 0 + SCC is at most 1).
-        let hi = match hi {
-            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
-                Some((_, [t, Term::Const(mask)] | [Term::Const(mask), t]))
-                    if self.possible_bits(t, 1) & !mask == 0 => t,
-                _ => hi,
-            },
-            _ => hi,
-        };
-        let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
-            // The high half cut to a 40-bit address (`s_bfe_u32 hi, hi, 8 bits from 0`).
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_bfe_u32"])
-                .is_some_and(|(_, [a, b])| a == want && b == Term::Const(0x8_0000)))
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
-            || self.joined_on_taken_edges(hi) == Some(want)
-            || self.plus_carry(hi) == Some(want)
+        self.high_half_with(hi, high, &[], None)
     }
 
+    /// [`Self::high_half`] when `low_terms` (excluding `base`) hold the 32-bit
+    /// offset terms added to the low half of the address.
+    fn high_half_with(
+        &self,
+        hi: Term,
+        high: Option<Value>,
+        low_terms: &[Term],
+        base: Option<Value>,
+    ) -> bool {
+        let mut steps = 0usize;
+        let mut memo = std::collections::HashMap::new();
+        self.high_half_inner(hi, high, low_terms, base, &mut Vec::new(), &mut steps, &mut memo)
+            .0
+    }
+
+    /// Returns `(valid, min_cycle_level, used_backedge)`, where `0` is grounded in a base case
+    /// and `1..=seen.len()` is the earliest ancestor phi in `seen` reached along a cycle back-edge.
+    #[allow(clippy::too_many_arguments)]
+    fn high_half_inner(
+        &self,
+        hi: Term,
+        high: Option<Value>,
+        low_terms: &[Term],
+        base: Option<Value>,
+        seen: &mut Vec<Value>,
+        steps: &mut usize,
+        memo: &mut std::collections::HashMap<(Value, Vec<Term>), bool>,
+    ) -> (bool, usize, bool) {
+        *steps += 1;
+        if *steps > MAX_HIGH_STEPS {
+            return (false, usize::MAX, true);
+        }
+        let hi = self.strip_high_mask(hi);
+        let want = high.map_or(Term::Const(0), Term::Value);
+        if hi == want {
+            return (true, 0, false);
+        }
+        let Term::Value(v) = hi else {
+            return (false, usize::MAX, false);
+        };
+        // The high half cut to a 40-bit or 48-bit address (`s_bfe_u32` / `v_bfe_u32` from bit 0).
+        if let Some((_, [a, Term::Const(0x8_0000 | 0x10_0000)])) = self.sop2(v, &["s_bfe_u32"]) {
+            return self.high_half_inner(a, high, low_terms, base, seen, steps, memo);
+        }
+        if let Some((a, 0, 8 | 16)) = self.vbfe_u32(v) {
+            return self.high_half_inner(a, high, low_terms, base, seen, steps, memo);
+        }
+        if let Some([a, b]) = self
+            .sop2(v, &["s_addc_u32"])
+            .map(|(_, ops)| ops)
+            .or_else(|| self.vadd_ci(v))
+        {
+            if a == want && self.offset_high_half(b, low_terms, base)
+                || b == want && self.offset_high_half(a, low_terms, base)
+            {
+                return (true, 0, false);
+            }
+            // Carry added onto an already-valid high half (e.g. a second offset's carry).
+            if b == Term::Const(0) {
+                return self.high_half_inner(a, high, low_terms, base, seen, steps, memo);
+            }
+            if a == Term::Const(0) {
+                return self.high_half_inner(b, high, low_terms, base, seen, steps, memo);
+            }
+        }
+        // The low half's carry added through `src_scc` (`s_add_u32 hi, x, src_scc`, either order),
+        // as `s_addc_u32 hi, x, 0` adds it.
+        if let Some(x) = self.plus_carry(hi) {
+            return self.high_half_inner(x, high, low_terms, base, seen, steps, memo);
+        }
+        if let Some((lo_out, _, _, [_, add_hi])) = self.vmad64(v, 1)
+            && self
+                .extract_low_offset(low_terms, base)
+                .is_some_and(|l| l.pair_lo == Some(lo_out))
+        {
+            return self.high_half_inner(add_hi, high, low_terms, base, seen, steps, memo);
+        }
+        if let Some(lane) = self.first_lane_source(v) {
+            return self.high_half_inner(
+                self.vorigin(lane),
+                high,
+                low_terms,
+                base,
+                seen,
+                steps,
+                memo,
+            );
+        }
+        let key = (v, low_terms.to_vec());
+        if let Some(&cached) = memo.get(&key) {
+            return if cached {
+                (true, 0, false)
+            } else {
+                (false, usize::MAX, false)
+            };
+        }
+        if let Some(idx) = seen.iter().position(|&s| s == v) {
+            return (true, idx + 1, true);
+        }
+        if seen.len() >= MAX_ROUNDS {
+            return (false, usize::MAX, true);
+        }
+        if let Some((cond, t, f)) = self.picked(v).or_else(|| self.lane_picked(v)) {
+            let step_pick = |arm_true: bool| -> Vec<Term> {
+                low_terms
+                    .iter()
+                    .map(|&lt| {
+                        let Term::Value(lv) = lt else { return lt };
+                        match self.picked(lv).or_else(|| self.lane_picked(lv)) {
+                            Some((c, lt_t, lt_f)) if c == cond => {
+                                if arm_true { lt_t } else { lt_f }
+                            }
+                            _ => lt,
+                        }
+                    })
+                    .collect()
+            };
+            seen.push(v);
+            let (ok_t, lv_t, be_t) =
+                self.high_half_inner(t, high, &step_pick(true), base, seen, steps, memo);
+            let (ok_f, lv_f, be_f) = if ok_t {
+                self.high_half_inner(f, high, &step_pick(false), base, seen, steps, memo)
+            } else {
+                (false, usize::MAX, false)
+            };
+            seen.pop();
+            let used_be = be_t || be_f;
+            let res = if ok_t && ok_f {
+                (true, lv_t.min(lv_f), used_be)
+            } else {
+                (false, usize::MAX, used_be)
+            };
+            if res.0 && res.1 == 0 {
+                memo.insert(key, true);
+            } else if !res.0 && !res.2 {
+                memo.insert(key, false);
+            }
+            return res;
+        }
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            let block = &self.p.blocks[b];
+            let phi = &block.phis[i];
+            let is_vgpr = matches!(phi.reg, Reg::V(_));
+            let my_level = seen.len() + 1;
+            seen.push(v);
+            let mut count = 0usize;
+            let mut min_level = usize::MAX;
+            let mut used_be = false;
+            for (edge, (&arg, &q)) in phi.args.iter().zip(&block.preds).enumerate() {
+                if !self.edge_taken(q, b) {
+                    continue;
+                }
+                count += 1;
+                let term = if is_vgpr {
+                    self.vorigin(arg)
+                } else {
+                    self.origin(arg)
+                };
+                let edge_low: Vec<Term> = low_terms
+                    .iter()
+                    .map(|&lt| {
+                        let Term::Value(lv) = lt else { return lt };
+                        match self.phis[lv.0 as usize] {
+                            Some((lb, li)) if lb == b => {
+                                let lphi = &block.phis[li];
+                                let la = lphi.args[edge];
+                                if matches!(lphi.reg, Reg::V(_)) {
+                                    self.vorigin(la)
+                                } else {
+                                    self.origin(la)
+                                }
+                            }
+                            _ => lt,
+                        }
+                    })
+                    .collect();
+                let (ok, lv, be) =
+                    self.high_half_inner(term, high, &edge_low, base, seen, steps, memo);
+                used_be |= be;
+                if !ok {
+                    seen.pop();
+                    if !used_be {
+                        memo.insert(key, false);
+                    }
+                    return (false, usize::MAX, used_be);
+                }
+                min_level = min_level.min(lv);
+            }
+            seen.pop();
+            if count > 0 && min_level < my_level {
+                if min_level == 0 {
+                    memo.insert(key, true);
+                }
+                return (true, min_level, used_be);
+            }
+            if count == 0 && !used_be {
+                memo.insert(key, false);
+            }
+            return (false, usize::MAX, true);
+        }
+        memo.insert(key, false);
+        (false, usize::MAX, false)
+    }
+
+    /// Strips bit-preserving masks (`s_and_b32`, `s_and_b64`, `v_and_b32`, and zero-offset
+    /// `s_bfe_u32` / `v_bfe_u32`) from `hi` when every possible set bit of the inner value is kept.
+    fn strip_high_mask(&self, mut hi: Term) -> Term {
+        for _ in 0..4 {
+            let Term::Value(v) = hi else { break };
+            let masked = self
+                .sop2_half(v, 0, &["s_and_b32", "s_and_b64"])
+                .or_else(|| self.sop2_half(v, 1, &["s_and_b64"]))
+                .map(|(_, ops)| ops)
+                .or_else(|| self.vand_b32(v));
+            if let Some([t, Term::Const(mask)] | [Term::Const(mask), t]) = masked
+                && self.possible_bits(t, 4) & !mask == 0
+            {
+                hi = t;
+                continue;
+            }
+            let bfe = self
+                .sop2(v, &["s_bfe_u32"])
+                .and_then(|(_, [t, b])| match b {
+                    Term::Const(pack) => Some((t, pack & 31, (pack >> 16) & 0x7f)),
+                    Term::Value(_) => None,
+                })
+                .or_else(|| self.vbfe(v, false));
+            if let Some((t, 0, width)) = bfe
+                && width > 0
+            {
+                let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+                if self.possible_bits(t, 4) & !mask == 0 {
+                    hi = t;
+                    continue;
+                }
+            }
+            break;
+        }
+        hi
+    }
+
+    /// Canonicalizes scalar/VGPR copies and `v_readfirstlane_b32` reads without traversing ALU ops.
+    fn canon_term(&self, mut t: Term) -> Term {
+        for _ in 0..8 {
+            let Term::Value(v) = t else { break };
+            if let Some(lane) = self.first_lane_source(v) {
+                t = self.vorigin(lane);
+                continue;
+            }
+            let next = self.vorigin(v);
+            if next == t {
+                break;
+            }
+            t = next;
+        }
+        t
+    }
+
+    fn canon_pair(&self, a: Term, b: Term) -> [Term; 2] {
+        let (a, b) = (self.canon_term(a), self.canon_term(b));
+        if a <= b { [a, b] } else { [b, a] }
+    }
+
+    /// Whether `t` reaches `target` as an unshifted additive base term.
+    fn reaches_base(&self, t: Term, target: Value) -> bool {
+        let mut stack = vec![t];
+        let mut steps = 0usize;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > 32 {
+                return false;
+            }
+            if cur == Term::Value(target) {
+                return true;
+            }
+            let c = self.canon_term(cur);
+            if c == Term::Value(target) {
+                return true;
+            }
+            let Term::Value(v) = c else { continue };
+            if let Some(j) = self.joined_on_taken_edges(c)
+                && j != c
+            {
+                stack.push(j);
+                continue;
+            }
+            if let Some([a, b]) = self
+                .sop2(v, &["s_add_u32", "s_add_i32"])
+                .map(|(_, ops)| ops)
+                .or_else(|| self.vadd(v))
+            {
+                stack.extend([a, b]);
+            } else if let Some(u) = self
+                .sop2(
+                    v,
+                    &[
+                        "s_lshl1_add_u32",
+                        "s_lshl2_add_u32",
+                        "s_lshl3_add_u32",
+                        "s_lshl4_add_u32",
+                    ],
+                )
+                .map(|(_, [_, u])| u)
+                .or_else(|| self.vlshl_add(v).map(|(_, _, u)| u))
+                .or_else(|| self.vmad64_addend(v, 0))
+            {
+                stack.push(u);
+            }
+        }
+        false
+    }
+
+    /// Extracts the unique non-constant 32-bit dynamic offset added to `base` in `low_terms`,
+    /// recording its exact def-use shift, product, or 64-bit pair low output.
+    fn extract_low_offset(&self, low_terms: &[Term], base: Option<Value>) -> Option<LowOffset> {
+        let mut found: Option<LowOffset> = None;
+        let mut push_found = |item: LowOffset| -> bool {
+            if found.is_some() {
+                return false;
+            }
+            found = Some(item);
+            true
+        };
+        let base_or_const = |x: Term| {
+            matches!(self.canon_term(x), Term::Const(_))
+                || base.is_some_and(|hb| self.reaches_base(x, hb))
+        };
+        let mut stack = low_terms.to_vec();
+        let mut steps = 0usize;
+        while let Some(raw) = stack.pop() {
+            steps += 1;
+            if steps > 32 {
+                return None;
+            }
+            if base.is_some_and(|hb| raw == Term::Value(hb)) {
+                continue;
+            }
+            let c = self.canon_term(raw);
+            if matches!(c, Term::Const(_)) || base.is_some_and(|hb| c == Term::Value(hb)) {
+                continue;
+            }
+            let Term::Value(v) = c else { continue };
+            if let Some(j) = self.joined_on_taken_edges(c)
+                && j != c
+            {
+                stack.push(j);
+                continue;
+            }
+            if let Some([a, b]) = self
+                .sop2(v, &["s_add_u32", "s_add_i32"])
+                .map(|(_, ops)| ops)
+                .or_else(|| self.vadd(v))
+                && (base_or_const(a) || base_or_const(b))
+            {
+                stack.extend([a, b]);
+                continue;
+            }
+            let lshl_add = self
+                .sop2(
+                    v,
+                    &[
+                        "s_lshl1_add_u32",
+                        "s_lshl2_add_u32",
+                        "s_lshl3_add_u32",
+                        "s_lshl4_add_u32",
+                    ],
+                )
+                .map(|(inst, [x, u])| {
+                    let k = u32::from(inst.name().as_bytes()[6] - b'0');
+                    (x, k, u)
+                })
+                .or_else(|| self.vlshl_add(v));
+            if let Some((x, k, u)) = lshl_add
+                && base_or_const(u)
+            {
+                stack.push(u);
+                if k == 0 {
+                    stack.push(x);
+                } else {
+                    let src = self.canon_term(x);
+                    if !push_found(LowOffset {
+                        raw: Term::Value(v),
+                        shifted: Some((src, k)),
+                        product: Some((self.canon_pair(src, Term::Const(1u32 << k)), k == 31)),
+                        pair_lo: None,
+                    }) {
+                        return None;
+                    }
+                }
+                continue;
+            }
+            if let Some((lo_out, [a, b], signed, [add_lo, _])) = self.vmad64(v, 0)
+                && base_or_const(add_lo)
+            {
+                stack.push(add_lo);
+                let (ca, cb) = (self.canon_term(a), self.canon_term(b));
+                let shifted = (!signed)
+                    .then(|| match (ca, cb) {
+                        (x, Term::Const(m)) | (Term::Const(m), x)
+                            if m > 1 && m.is_power_of_two() =>
+                        {
+                            Some((x, m.trailing_zeros()))
+                        }
+                        _ => None,
+                    })
+                    .flatten();
+                if !push_found(LowOffset {
+                    raw: Term::Value(v),
+                    shifted,
+                    product: Some((self.canon_pair(ca, cb), false)),
+                    pair_lo: Some(lo_out),
+                }) {
+                    return None;
+                }
+                continue;
+            }
+            if !push_found(self.classify_low_leaf(v)) {
+                return None;
+            }
+        }
+        found
+    }
+
+    fn classify_low_leaf(&self, v: Value) -> LowOffset {
+        if let Some((x, k)) = self.ulshl32(v) {
+            let src = self.canon_term(x);
+            if k == 0 {
+                return match src {
+                    Term::Value(sv) if sv != v => self.classify_low_leaf(sv),
+                    _ => LowOffset {
+                        raw: src,
+                        shifted: None,
+                        product: None,
+                        pair_lo: None,
+                    },
+                };
+            }
+            return LowOffset {
+                raw: Term::Value(v),
+                shifted: Some((src, k)),
+                product: Some((self.canon_pair(src, Term::Const(1u32 << k)), k == 31)),
+                pair_lo: None,
+            };
+        }
+        if let Some((lo_out, src_lo, shift, signed_in)) = self.lshl64(v, 0) {
+            let src = self.canon_term(src_lo);
+            return LowOffset {
+                raw: Term::Value(v),
+                shifted: Some((src, shift)),
+                product: (!signed_in).then(|| {
+                    (
+                        self.canon_pair(src, Term::Const(1u32 << shift)),
+                        shift == 31,
+                    )
+                }),
+                pair_lo: Some(lo_out),
+            };
+        }
+        if let Some([a, b]) = self.mul_lo32(v) {
+            let (ca, cb) = (self.canon_term(a), self.canon_term(b));
+            let shifted = match (ca, cb) {
+                (x, Term::Const(m)) | (Term::Const(m), x) if m > 1 && m.is_power_of_two() => {
+                    Some((x, m.trailing_zeros()))
+                }
+                _ => None,
+            };
+            return LowOffset {
+                raw: Term::Value(v),
+                shifted,
+                product: Some((self.canon_pair(ca, cb), false)),
+                pair_lo: None,
+            };
+        }
+        LowOffset {
+            raw: Term::Value(v),
+            shifted: None,
+            product: None,
+            pair_lo: None,
+        }
+    }
+
+    /// Whether `t` is 0 or the exact upper 32 bits of the dynamic 32-bit offset in `low_terms`
+    /// (excluding `base`), matched by SSA def-use and exact shift/multiplier rather than graph
+    /// reachability.
+    fn offset_high_half(&self, t: Term, low_terms: &[Term], base: Option<Value>) -> bool {
+        let t = self.strip_high_mask(self.canon_term(self.strip_high_mask(t)));
+        if t == Term::Const(0) {
+            return true;
+        }
+        let Term::Value(v) = t else { return false };
+        let Some(low) = self.extract_low_offset(low_terms, base) else {
+            return false;
+        };
+        if let Some((lo_out, src_lo, shift, signed_in)) = self.lshl64(v, 1) {
+            return low.pair_lo == Some(lo_out)
+                || (!signed_in && low.shifted == Some((self.canon_term(src_lo), shift)));
+        }
+        if let Some((lo_out, [a, b], signed, [Term::Const(0), Term::Const(0)])) = self.vmad64(v, 1)
+        {
+            let ops = self.canon_pair(a, b);
+            return low.pair_lo == Some(lo_out)
+                || low
+                    .product
+                    .is_some_and(|(p, sh31)| p == ops && !(signed && sh31));
+        }
+        if let Some(([a, b], signed)) = self.mul_hi32(v) {
+            let ops = self.canon_pair(a, b);
+            return low
+                .product
+                .is_some_and(|(p, sh31)| p == ops && !(signed && sh31));
+        }
+        if let Some((x, r)) = self.ulshr32(v) {
+            return low.shifted == Some((self.canon_term(x), 32 - r));
+        }
+        if let Some((x, off, width)) = self.ubfe32(v) {
+            return off > 0
+                && off + width == 32
+                && low.shifted == Some((self.canon_term(x), width));
+        }
+        if let Some((x, r)) = self.ashr32(v) {
+            let cx = self.canon_term(x);
+            return (r == 31 && low.raw == cx) || low.shifted == Some((cx, 32 - r));
+        }
+        if let Some((x, off, width)) = self.ibfe32(v) {
+            let cx = self.canon_term(x);
+            return off > 0
+                && off + width == 32
+                && ((off == 31 && low.raw == cx) || low.shifted == Some((cx, width)));
+        }
+        false
+    }
+
+    /// `s_lshl_b32(x, shift)` or `v_lshlrev_b32(shift, x)` writing `v`: `(x, shift & 31)`.
+    fn ulshl32(&self, v: Value) -> Option<(Term, u32)> {
+        if let Some((_, [x, Term::Const(s)])) = self.sop2(v, &["s_lshl_b32"]) {
+            return Some((x, s & 31));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_lshlrev_b32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let Term::Const(s) = self.vterm(inst, f.src.first()?)? else {
+            return None;
+        };
+        Some((self.vterm(inst, f.src.get(1)?)?, s & 31))
+    }
+
+    /// `s_lshr_b32(x, shift)` or `v_lshrrev_b32(shift, x)` (`1..32`) writing `v`.
+    fn ulshr32(&self, v: Value) -> Option<(Term, u32)> {
+        let (x, r) = if let Some((_, [x, Term::Const(s)])) = self.sop2(v, &["s_lshr_b32"]) {
+            (x, s & 31)
+        } else {
+            let inst = self.def(v)?;
+            let Fields::Valu(f) = &inst.fields else {
+                return None;
+            };
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return None;
+            };
+            if inst.name() != "v_lshrrev_b32"
+                || inst.write(Reg::V(reg)) != Some(v)
+                || f.abs != 0
+                || f.neg != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+            {
+                return None;
+            }
+            let Term::Const(s) = self.vterm(inst, f.src.first()?)? else {
+                return None;
+            };
+            (self.vterm(inst, f.src.get(1)?)?, s & 31)
+        };
+        (1..32).contains(&r).then_some((x, r))
+    }
+
+    /// `s_ashr_i32(x, shift)` or `v_ashrrev_i32(shift, x)` (`1..32`) writing `v`.
+    fn ashr32(&self, v: Value) -> Option<(Term, u32)> {
+        let (x, r) = if let Some((_, [x, Term::Const(s)])) = self.sop2(v, &["s_ashr_i32"]) {
+            (x, s & 31)
+        } else {
+            let inst = self.def(v)?;
+            let Fields::Valu(f) = &inst.fields else {
+                return None;
+            };
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return None;
+            };
+            if inst.name() != "v_ashrrev_i32"
+                || inst.write(Reg::V(reg)) != Some(v)
+                || f.abs != 0
+                || f.neg != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+            {
+                return None;
+            }
+            let Term::Const(s) = self.vterm(inst, f.src.first()?)? else {
+                return None;
+            };
+            (self.vterm(inst, f.src.get(1)?)?, s & 31)
+        };
+        (1..32).contains(&r).then_some((x, r))
+    }
+
+    fn ubfe32(&self, v: Value) -> Option<(Term, u32, u32)> {
+        self.sop2(v, &["s_bfe_u32"])
+            .and_then(|(_, [x, b])| match b {
+                Term::Const(pack) => Some((x, pack & 31, (pack >> 16) & 0x7f)),
+                Term::Value(_) => None,
+            })
+            .or_else(|| self.vbfe(v, false))
+    }
+
+    fn ibfe32(&self, v: Value) -> Option<(Term, u32, u32)> {
+        self.sop2(v, &["s_bfe_i32"])
+            .and_then(|(_, [x, b])| match b {
+                Term::Const(pack) => Some((x, pack & 31, (pack >> 16) & 0x7f)),
+                Term::Value(_) => None,
+            })
+            .or_else(|| self.vbfe(v, true))
+    }
+
+    /// 32-bit low multiply (`s_mul_i32`, `s_mulk_i32`, `v_mul_lo_u32`, `v_mul_lo_i32`) writing `v`.
+    fn mul_lo32(&self, v: Value) -> Option<[Term; 2]> {
+        if let Some((_, ops)) = self.sop2(v, &["s_mul_i32"]) {
+            return Some(ops);
+        }
+        let inst = self.def(v)?;
+        match (inst.name(), &inst.fields) {
+            ("s_mulk_i32", Fields::Sop { dst: Some(d), imm: Some(imm), .. })
+                if inst.writes.first().is_some_and(|w| w.1 == v) =>
+            {
+                Some([self.term(inst, d)?, Term::Const(i32::from(*imm as i16) as u32)])
+            }
+            ("v_mul_lo_u32" | "v_mul_lo_i32", Fields::Valu(f))
+                if f.abs == 0 && f.neg == 0 && f.sdwa.is_none() && f.dpp.is_none() =>
+            {
+                let Some(Operand::Vector { reg, .. }) = f.dst else {
+                    return None;
+                };
+                if inst.write(Reg::V(reg)) != Some(v) {
+                    return None;
+                }
+                Some([
+                    self.vterm(inst, f.src.first()?)?,
+                    self.vterm(inst, f.src.get(1)?)?,
+                ])
+            }
+            _ => None,
+        }
+    }
+
+    /// 32-bit high multiply (`s_mul_hi_u32`, `s_mul_hi_i32`, `v_mul_hi_u32`, `v_mul_hi_i32`)
+    /// writing `v`: `([src0, src1], signed)`.
+    fn mul_hi32(&self, v: Value) -> Option<([Term; 2], bool)> {
+        if let Some((inst, ops)) = self.sop2(v, &["s_mul_hi_u32", "s_mul_hi_i32"]) {
+            return Some((ops, inst.name() == "s_mul_hi_i32"));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        let signed = match inst.name() {
+            "v_mul_hi_u32" => false,
+            "v_mul_hi_i32" => true,
+            _ => return None,
+        };
+        if inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some((
+            [
+                self.vterm(inst, f.src.first()?)?,
+                self.vterm(inst, f.src.get(1)?)?,
+            ],
+            signed,
+        ))
+    }
+
+    /// For `v` written as output dword `half` (`0` or `1`) of `s_lshl_b64` or `v_lshlrev_b64`
+    /// shifting a zero- or sign-extended 32-bit value by `1..32`:
+    /// `(low_output_dword, low_input_term, shift, signed_input)`.
+    fn lshl64(&self, v: Value, half: usize) -> Option<(Value, Term, u32, bool)> {
+        let inst = self.def(v)?;
+        if inst.writes.get(half)?.1 != v {
+            return None;
+        }
+        let lo_out = inst.writes.first()?.1;
+        let (src_lo, src_hi, shift) = match (inst.name(), &inst.fields) {
+            ("s_lshl_b64", Fields::Sop { src, .. }) => {
+                let Term::Const(shift) = self.term(inst, src.get(1)?)? else {
+                    return None;
+                };
+                let s = shift & 63;
+                if !(1..32).contains(&s) {
+                    return None;
+                }
+                let Operand::Scalar { code, .. } = *src.first()? else {
+                    return None;
+                };
+                if code == NULL {
+                    return None;
+                }
+                (
+                    self.origin(inst.read(Reg::S(code))?),
+                    self.origin(inst.read(Reg::S(code + 1))?),
+                    s,
+                )
+            }
+            ("v_lshlrev_b64", Fields::Valu(f))
+                if f.abs == 0 && f.neg == 0 && f.sdwa.is_none() && f.dpp.is_none() =>
+            {
+                let Term::Const(shift) = self.vterm(inst, f.src.first()?)? else {
+                    return None;
+                };
+                let s = shift & 63;
+                if !(1..32).contains(&s) {
+                    return None;
+                }
+                let Operand::Vector { reg, .. } = *f.src.get(1)? else {
+                    return None;
+                };
+                (
+                    self.vorigin(inst.read(Reg::V(reg))?),
+                    self.vorigin(inst.read(Reg::V(reg + 1))?),
+                    s,
+                )
+            }
+            _ => return None,
+        };
+        if src_hi == Term::Const(0) {
+            return Some((lo_out, src_lo, shift, false));
+        }
+        let Term::Value(hi_v) = self.canon_term(src_hi) else {
+            return None;
+        };
+        let signed = self
+            .ashr32(hi_v)
+            .is_some_and(|(x, r)| r == 31 && self.canon_term(x) == self.canon_term(src_lo));
+        signed.then_some((lo_out, src_lo, shift, true))
+    }
+
+    /// `v_add_co_ci_u32` operands `[src0, src1]` when `v` is its VGPR destination.
+    fn vadd_ci(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+        ])
+    }
+
+    /// `v_and_b32` operands `[src0, src1]` when `v` is its VGPR destination.
+    fn vand_b32(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_and_b32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+        ])
+    }
+
+    /// `v_bfe_u32` (`signed == false`) or `v_bfe_i32` (`signed == true`) writing `v` with constant
+    /// offset and width.
+    fn vbfe(&self, v: Value, signed: bool) -> Option<(Term, u32, u32)> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        let want = if signed { "v_bfe_i32" } else { "v_bfe_u32" };
+        if inst.name() != want
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let (Term::Const(off), Term::Const(width)) = (
+            self.vterm(inst, f.src.get(1)?)?,
+            self.vterm(inst, f.src.get(2)?)?,
+        ) else {
+            return None;
+        };
+        Some((self.vterm(inst, f.src.first()?)?, off & 31, width & 31))
+    }
+
+    fn vbfe_u32(&self, v: Value) -> Option<(Term, u32, u32)> {
+        self.vbfe(v, false)
+    }
+
+    /// What phi `t` holds in every lane that reads it: the one value its
+    /// args bring along the edges some lane takes (a register set inside a
+    /// region that only a skip no lane takes bypasses, as
+    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
     /// `x` for `s_add_u32 hi, x, src_scc` (either order): the high half plus the carry of the low
     /// half's add, as `s_addc_u32 hi, x, 0` would make it.
     fn plus_carry(&self, hi: Term) -> Option<Term> {
@@ -1089,22 +2402,9 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// What phi `t` holds in every lane that reads it: the one value its
-    /// args bring along the edges some lane takes (a register set inside a
-    /// region that only a skip no lane takes bypasses, as
-    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
     fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
         let Term::Value(v) = t else { return None };
-        let (b, i) = self.phis[v.0 as usize]?;
-        let block = &self.p.blocks[b];
-        let mut taken = block.phis[i]
-            .args
-            .iter()
-            .zip(&block.preds)
-            .filter(|&(_, &q)| self.edge_taken(q, b))
-            .map(|(&a, _)| self.origin(a));
-        let first = taken.next()?;
-        taken.all(|x| x == first).then_some(first)
+        self.joined.get(v.0 as usize).copied().flatten()
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1410,18 +2710,68 @@ impl<'a> Tracer<'a> {
         if depth == 0 {
             return u32::MAX;
         }
+        let bits = |t| self.possible_bits(t, depth - 1);
+        if let Some([a, b]) = self.vand_b32(v) {
+            return bits(a) & bits(b);
+        }
+        if let Some([a, b]) = self.vadd_ci(v) {
+            let max = bits(a).saturating_add(bits(b)).saturating_add(1);
+            return u32::MAX.checked_shr(max.leading_zeros()).unwrap_or(0);
+        }
+        if let Some((a, off, width)) = self.vbfe_u32(v) {
+            let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+            return (bits(a) >> off) & mask;
+        }
+        if let Some(inst) = self.def(v)
+            && inst.name() == "v_lshrrev_b32"
+            && let Fields::Valu(f) = &inst.fields
+            && let Some(Operand::Vector { reg, .. }) = f.dst
+            && inst.write(Reg::V(reg)) == Some(v)
+            && f.abs == 0
+            && f.neg == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
+            && let (Some(Term::Const(shift)), Some(a)) = (
+                f.src.first().and_then(|s| self.vterm(inst, s)),
+                f.src.get(1).and_then(|s| self.vterm(inst, s)),
+            )
+        {
+            return bits(a) >> (shift & 31);
+        }
+        if let Some((_, _, s, false)) = self.lshl64(v, 1) {
+            return (1u32 << s) - 1;
+        }
         let Some((inst, [a, b])) = self.sop2(
             v,
-            &["s_and_b32", "s_or_b32", "s_lshl_b32", "s_add_u32", "s_addc_u32"],
+            &[
+                "s_and_b32",
+                "s_or_b32",
+                "s_lshl_b32",
+                "s_lshr_b32",
+                "s_bfe_u32",
+                "s_add_u32",
+                "s_addc_u32",
+            ],
         ) else {
             return u32::MAX;
         };
-        let bits = |t| self.possible_bits(t, depth - 1);
         match inst.name() {
             "s_and_b32" => bits(a) & bits(b),
             "s_or_b32" => bits(a) | bits(b),
             "s_lshl_b32" => match b {
                 Term::Const(shift) => bits(a) << (shift & 31),
+                _ => u32::MAX,
+            },
+            "s_lshr_b32" => match b {
+                Term::Const(shift) => bits(a) >> (shift & 31),
+                _ => u32::MAX,
+            },
+            "s_bfe_u32" => match b {
+                Term::Const(pack) => {
+                    let (off, width) = (pack & 31, (pack >> 16) & 0x7f);
+                    let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+                    (bits(a) >> off) & mask
+                }
                 _ => u32::MAX,
             },
             // A carry can set every bit below the most significant possible bit.
@@ -1492,6 +2842,9 @@ impl<'a> Tracer<'a> {
         let Some(lanes) = self.lanes else {
             return true;
         };
+        if let Some(&taken) = self.edge_taken_cache.borrow().get(&(q, b)) {
+            return taken;
+        }
         let mut edge = vec![(lanes.reach[q], true)];
         if let LaneExit::Branch {
             when,
@@ -1503,7 +2856,9 @@ impl<'a> Tracer<'a> {
             edge.push((when, taken == b));
         }
         // The very test lowering makes, so both drop the same edges.
-        lanes.bools.meet(&edge)
+        let taken = lanes.bools.meet(&edge);
+        self.edge_taken_cache.borrow_mut().insert((q, b), taken);
+        taken
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -2512,12 +3867,14 @@ pub(crate) fn infer_roots(
                 ) else {
                     continue;
                 };
-                if t.high_half(hi, None) {
-                    if let Some(n) = t.undeclared_entry_sgpr(lo) {
-                        let e = heap_roles.entry(n).or_default();
-                        e.0 |= res;
-                        e.1 |= smp;
-                    }
+                let soff = t.term(inst, soffset).unwrap_or(Term::Const(0));
+                if let Some(n) = t.undeclared_entry_sgpr(lo)
+                    && let base = p.inputs.iter().find(|i| i.0 == Reg::S(n)).map(|i| i.1)
+                    && t.high_half_with(hi, None, &[lo, soff], base)
+                {
+                    let e = heap_roles.entry(n).or_default();
+                    e.0 |= res;
+                    e.1 |= smp;
                 } else if stage == HwStage::Vs
                     && inst.name() == "s_load_dwordx4"
                     && res
@@ -2541,19 +3898,24 @@ pub(crate) fn infer_roots(
                 saddr,
                 ..
             } if inst.name().starts_with("global_load_dword") => {
-                let pair = match saddr {
-                    Some(Operand::Scalar { code, .. }) if *code != NULL => inst
-                        .read(Reg::S(*code))
-                        .map(|v| t.origin(v))
-                        .zip(inst.read(Reg::S(code + 1)).map(|v| t.origin(v))),
-                    _ => inst
-                        .read(Reg::V(*reg))
-                        .map(|v| t.vorigin(v))
-                        .zip(inst.read(Reg::V(reg + 1)).map(|v| t.vorigin(v))),
+                let (pair, voff) = match saddr {
+                    Some(Operand::Scalar { code, .. }) if *code != NULL => (
+                        inst.read(Reg::S(*code))
+                            .map(|v| t.origin(v))
+                            .zip(inst.read(Reg::S(code + 1)).map(|v| t.origin(v))),
+                        inst.read(Reg::V(*reg)).map_or(Term::Const(0), |v| t.vorigin(v)),
+                    ),
+                    _ => (
+                        inst.read(Reg::V(*reg))
+                            .map(|v| t.vorigin(v))
+                            .zip(inst.read(Reg::V(reg + 1)).map(|v| t.vorigin(v))),
+                        Term::Const(0),
+                    ),
                 };
                 if let Some((lo, hi)) = pair
-                    && t.high_half(hi, None)
                     && let Some(n) = t.undeclared_entry_sgpr(lo)
+                    && let base = p.inputs.iter().find(|i| i.0 == Reg::S(n)).map(|i| i.1)
+                    && t.high_half_with(hi, None, &[lo, voff], base)
                 {
                     let e = heap_roles.entry(n).or_default();
                     e.0 |= res;
@@ -2755,23 +4117,137 @@ impl Tracer<'_> {
             }
             if let Some((_, [a, b])) = self.sop2(v, &["s_add_u32", "s_add_i32"]) {
                 stack.extend([a, b]);
-            } else if let Some((_, [_, unshifted])) = self.sop2(
+            } else if let Some(unshifted) = self
+                .sop2(
+                    v,
+                    &[
+                        "s_lshl1_add_u32",
+                        "s_lshl2_add_u32",
+                        "s_lshl3_add_u32",
+                        "s_lshl4_add_u32",
+                    ],
+                )
+                .map(|(_, [_, u])| u)
+                .or_else(|| self.vlshl_add(v).map(|(_, _, u)| u))
+                .or_else(|| self.vmad64_addend(v, 0))
+            {
+                stack.push(unshifted);
+            } else if let Some([a, b]) = self.vadd(v) {
+                stack.extend([a, b]);
+            } else if let Some(lane) = self.first_lane_source(v) {
+                stack.push(self.vorigin(lane));
+            } else if let Some(joined) = self.joined_on_taken_edges(cur)
+                && joined != cur
+            {
+                stack.push(joined);
+            }
+        }
+        found
+    }
+
+    /// `v_readfirstlane_b32` values in `block` that compute dynamic descriptor offset `d` through
+    /// pure scalar ALU operations and values from outside `block`.
+    fn first_lane_in_offset(&self, block: usize, d: Value) -> Option<Vec<Value>> {
+        let mut reads = Vec::new();
+        let mut stack = vec![self.origin(d)];
+        let mut seen = Vec::new();
+        while let Some(cur) = stack.pop() {
+            let Term::Value(v) = cur else { continue };
+            if seen.contains(&v) {
+                continue;
+            }
+            if seen.len() >= 64 {
+                return None;
+            }
+            seen.push(v);
+            if self.first_lane_source(v).is_some() {
+                if !reads.contains(&v) {
+                    reads.push(v);
+                }
+                continue;
+            }
+            if self.phis[v.0 as usize].is_some_and(|(pb, _)| pb == block) {
+                return None;
+            }
+            let Some((def_b, def_i)) = self.defs[v.0 as usize] else {
+                continue;
+            };
+            if def_b != block {
+                continue;
+            }
+            let inst = self.inst((def_b, def_i));
+            if let Some((_, ops)) = self.sop2(
                 v,
                 &[
+                    "s_lshl_b32",
+                    "s_lshr_b32",
+                    "s_ashr_i32",
+                    "s_and_b32",
+                    "s_or_b32",
+                    "s_xor_b32",
+                    "s_bfe_u32",
+                    "s_bfe_i32",
+                    "s_mul_i32",
+                    "s_add_u32",
+                    "s_add_i32",
+                    "s_sub_u32",
+                    "s_sub_i32",
                     "s_lshl1_add_u32",
                     "s_lshl2_add_u32",
                     "s_lshl3_add_u32",
                     "s_lshl4_add_u32",
                 ],
             ) {
-                stack.push(unshifted);
-            } else if let Some([a, b]) = self.vadd(v) {
-                stack.extend([a, b]);
-            } else if let Some(lane) = self.first_lane_source(v) {
-                stack.push(self.vorigin(lane));
+                stack.extend(ops);
+            } else if inst.name() == "s_lshl_b64"
+                && inst.writes.first().is_some_and(|w| w.1 == v)
+                && let Fields::Sop { src, .. } = &inst.fields
+                && let (Some(&Operand::Scalar { code, .. }), Some(shift)) =
+                    (src.first(), src.get(1).and_then(|s| self.term(inst, s)))
+                && code != NULL
+            {
+                let lo = self.origin(inst.read(Reg::S(code))?);
+                let hi = self.origin(inst.read(Reg::S(code + 1))?);
+                stack.extend([lo, hi, shift]);
+            } else {
+                return None;
             }
         }
-        found
+        (!reads.is_empty()).then_some(reads)
+    }
+
+    /// Bitwise identity SOP2 operations (`x & 0xffffffff`, `x | 0`, `x ^ 0`) on dword `k`.
+    fn identity_op(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let (pair, neutral) = match inst.name() {
+            "s_and_b32" => (false, u32::MAX),
+            "s_and_b64" => (true, u32::MAX),
+            "s_or_b32" | "s_xor_b32" => (false, 0),
+            "s_or_b64" | "s_xor_b64" => (true, 0),
+            _ => return None,
+        };
+        if k > usize::from(pair) {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let half = |op: &Operand| -> Option<Term> {
+            match *op {
+                Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+                Operand::Scalar { code, .. } => o[inst.read(Reg::S(code + k as u8))?.0 as usize],
+                Operand::Const(c) if k == 0 => inline(c).map(Term::Const),
+                Operand::Const(c @ 128..=208) => {
+                    inline(c).map(|lo| Term::Const(((lo as i32) >> 31) as u32))
+                }
+                Operand::Literal(x) if k == 0 => Some(Term::Const(x)),
+                Operand::Literal(x) if x >> 31 == 0 => Some(Term::Const(0)),
+                _ => None,
+            }
+        };
+        match (half(src.first()?)?, half(src.get(1)?)?) {
+            (x, Term::Const(c)) | (Term::Const(c), x) if c == neutral => Some(x),
+            _ => None,
+        }
     }
 
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
@@ -4661,5 +6137,338 @@ pub(crate) mod tests {
         let inf2 = infer_roots(&p2, &[], HwStage::Vs).unwrap();
         assert!(inf2.heaps.is_empty());
         assert_eq!(inf2.vertex_table, None);
+    }
+
+    #[test]
+    fn heap_addresses_with_shifted_offsets_carries_and_joins_trace_cleanly() {
+        // 1. Scalar 32-bit shift pair: s9 = Constants (unmasked index), s10 = ResourceHeap.
+        //    off_lo = s9 << 5, off_hi = s9 >> 27, s[12:13] = s10 + off_64, masked to 48 bits.
+        let shifted_32 = [
+            0x8F0E_8509u32, // s_lshl_b32 s14, s9, 5
+            0x900F_9B09,    // s_lshr_b32 s15, s9, 27
+            0x800C_0E0A,    // s_add_u32 s12, s10, s14
+            0x820D_0F80,    // s_addc_u32 s13, 0, s15
+            0x938D_FF0D,
+            0x0010_0000, // s_bfe_u32 s13, s13, 0x100000 (16 bits from 0)
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xE030_2000,
+            0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+            S_ENDPGM,
+        ];
+        let r1 = track_words(
+            &shifted_32,
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r1.scalar[0].1.param, 1);
+        assert!(r1.scalar[0].1.dynamic.is_some());
+
+        // Also inferred by `infer_roots` when s10 is undeclared!
+        let code1: Vec<u8> = shifted_32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p1 = crate::ir::build(&code1, false, 256).unwrap();
+        let inf1 = infer_roots(&p1, &[param(Constants, 9, 1)], HwStage::Ps).unwrap();
+        assert_eq!(inf1.heaps, [(10, ResourceHeap)]);
+
+        // Negatives: unrelated SGPR, mismatched shift, mismatched bit-field (offset or width),
+        // shared-parameter-only expression (`s9 >> 1` against `s9 * 4` or `s9`), and arbitrary or
+        // multiplier-mismatched `v_mad_u64_u32` must all be refused and never inferred as a heap.
+        let assert_refused_and_not_inferred = |words: &[u32], label: &str| {
+            let bad_code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let bp = crate::ir::build(&bad_code, false, 256).unwrap();
+            let err = track(
+                &bp,
+                &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+                HwStage::Ps,
+                lanes(&bp).as_ref(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ShaderError::Unsupported {
+                        what: "an address into a descriptor heap with an untracked high half",
+                        ..
+                    }
+                ),
+                "{label}: {err:?}"
+            );
+            let bad_inf = infer_roots(&bp, &[param(Constants, 9, 1)], HwStage::Ps).unwrap();
+            assert!(bad_inf.heaps.is_empty(), "{label}: {:?}", bad_inf.heaps);
+        };
+
+        // 1a. Unrelated SGPR and mismatched right shift (`lo = s10 + (s9 << 5)`, `hi = addc(0, s9 >> 3)`).
+        for (label, bad_hi) in [
+            ("unrelated s8 >> 27", [0x900F_9B08u32, 0x800C_0E0A, 0x820D_0F80]),
+            ("unrelated addc s8", [0xBF80_0000u32, 0x800C_0E0A, 0x820D_8008]),
+            ("mismatched shift s9 >> 3", [0x900F_8309u32, 0x800C_0E0A, 0x820D_0F80]),
+        ] {
+            let mut bad = shifted_32;
+            bad[1..4].copy_from_slice(&bad_hi);
+            assert_refused_and_not_inferred(&bad, label);
+        }
+
+        // 1b. Matched vs mismatched bit-field extract on `lo = s10 + (s9 << 5)`:
+        //     `s_bfe_u32 s15, s9, (5 << 16) | 27` succeeds; wrong width `3` or wrong offset `20`
+        //     (`20 + 12 == 32`) are refused.
+        let bfe_prog = |pack: u32| {
+            [
+                0x8F0E_8509u32, // s_lshl_b32 s14, s9, 5
+                0x938F_FF09,
+                pack,           // s_bfe_u32 s15, s9, pack
+                0x800C_0E0A,    // s_add_u32 s12, s10, s14
+                0x820D_0F80,    // s_addc_u32 s13, 0, s15
+                0xF408_0406,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+                0xE030_2000,
+                0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+                S_ENDPGM,
+            ]
+        };
+        let r_bfe = track_words(
+            &bfe_prog(0x0005_001B),
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r_bfe.scalar[0].1.param, 1);
+        assert_refused_and_not_inferred(&bfe_prog(0x0003_001B), "mismatched bfe width 3 at 27");
+        assert_refused_and_not_inferred(&bfe_prog(0x000C_0014), "mismatched bfe offset 20 width 12");
+
+        // 1c. Shared-parameter-only case (`lo = s10 + s9 * 4` or `s10 + s9`, `hi = addc(0, s9 >> 1)`):
+        //     refused, whereas matched `s9 >> 30` against `s9 * 4` succeeds.
+        let mul4_prog = |lo_op: u32, hi_shr: u32| {
+            [
+                lo_op,
+                hi_shr,
+                0x800C_0E0A, // s_add_u32 s12, s10, s14
+                0x820D_0F80, // s_addc_u32 s13, 0, s15
+                0xF408_0406,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+                0xE030_2000,
+                0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+                S_ENDPGM,
+            ]
+        };
+        let r_mul4 = track_words(
+            &mul4_prog(0x930E_8409, 0x900F_9E09), // s14 = s9 * 4, s15 = s9 >> 30
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r_mul4.scalar[0].1.param, 1);
+        assert_refused_and_not_inferred(
+            &mul4_prog(0x930E_8409, 0x900F_8109), // s14 = s9 * 4, s15 = s9 >> 1
+            "shared parameter s9 * 4 vs s9 >> 1",
+        );
+        assert_refused_and_not_inferred(
+            &mul4_prog(0xBE8E_0309, 0x900F_8109), // s14 = s9, s15 = s9 >> 1
+            "shared parameter s9 vs s9 >> 1",
+        );
+
+        // 1d. Zero-addend `v_mad_u64_u32`: matched multiplier `12` (`lo = s10 + s9 * 12`,
+        //     `hi = addc(0, readfirstlane((v_mad_u64_u32 s9, 12, 0).hi))`) succeeds; mismatched
+        //     multiplier `20` on the same `s9`, unrelated `s8`, or direct `hi` without carry are
+        //     all refused.
+        let mad_prog = |mad_src: u32, with_addc: bool| {
+            [
+                0x930E_8C09u32, // s_mul_i32 s14, s9, 12
+                0xD576_1602,
+                mad_src,        // v_mad_u64_u32 v[2:3], s22, src0, src1, 0
+                0x7E1E_0503,    // v_readfirstlane_b32 s15, v3
+                0x800C_0E0A,    // s_add_u32 s12, s10, s14
+                if with_addc {
+                    0x820D_0F80 // s_addc_u32 s13, 0, s15
+                } else {
+                    0xBE8D_030F // s_mov_b32 s13, s15
+                },
+                0xF408_0406,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+                0xE030_2000,
+                0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+                S_ENDPGM,
+            ]
+        };
+        let r_mad = track_words(
+            &mad_prog(0x0201_1809, true), // s9 * 12 + 0
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r_mad.scalar[0].1.param, 1);
+        assert_refused_and_not_inferred(
+            &mad_prog(0x0201_2809, true), // s9 * 20 + 0 (wrong multiplier on shared s9)
+            "mismatched mad multiplier 20 vs 12",
+        );
+        assert_refused_and_not_inferred(
+            &mad_prog(0x0201_1808, true), // s8 * 12 + 0 (arbitrary mad source)
+            "arbitrary mad source s8",
+        );
+        assert_refused_and_not_inferred(
+            &mad_prog(0x0201_1809, false), // s13 = v3 directly without addc carry
+            "direct zero-addend mad high half without addc",
+        );
+
+        // 2. Scalar `s_lshl_b64` of zero-extended index + `s_and_b64` 48-bit mask (`s_bfm_b64`).
+        let shifted_64 = [
+            0xBE8E_0309u32, // s_mov_b32 s14, s9
+            0xBE8F_0380,    // s_mov_b32 s15, 0
+            0x8F8E_850E,    // s_lshl_b64 s[14:15], s[14:15], 5
+            0x800C_0E0A,    // s_add_u32 s12, s10, s14
+            0x820D_800F,    // s_addc_u32 s13, s15, 0
+            0x9286_80B0,    // s_bfm_b64 s[6:7], 48, 0
+            0x878C_060C,    // s_and_b64 s[12:13], s[12:13], s[6:7]
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xE030_2000,
+            0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+            S_ENDPGM,
+        ];
+        let r2 = track_words(
+            &shifted_64,
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r2.scalar[0].1.param, 1);
+        assert!(r2.scalar[0].1.dynamic.is_some());
+
+        // 3. Control-flow phi joining `s_mov_b32 s5, 0` on one taken arm and `s_addc_u32 s5, 0, 0`
+        //    on the other taken arm.
+        let joined_hi = [
+            0xBF06_8002u32, // s_cmp_eq_u32 s2, 0
+            0xBF84_0003,    // s_cbranch_scc0 -> else (offset +3 dwords = dword 5)
+            0xBE84_0300,    // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xBF82_0002,    // s_branch -> join (dword 7)
+            0x8004_0200,    // else: s_add_u32 s4, s0, s2
+            0x8205_8080,    // s_addc_u32 s5, 0, 0
+            0xF408_0202,
+            0xFA00_0000, // join: s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            S_ENDPGM,
+        ];
+        // When only the `s_addc_u32` arm is taken (or both arms compute `s4 = s0 + s2`),
+        // `hi` joined across `0` and `s_addc_u32(0, 0)` traces cleanly.
+        let mut both_added = joined_hi;
+        both_added[2] = 0x8004_0200; // s_add_u32 s4, s0, s2 (so lo agrees across both arms)
+        let r3 = track_words(
+            &both_added,
+            &[param(Table, 0, 1), param(Constants, 2, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r3.scalar[0].1.param, 0);
+        assert!(r3.scalar[0].1.dynamic.is_some());
+
+        // 4. Per-lane 64-bit VGPR heap address (`v_add_co_u32` + `v_add_co_ci_u32` with `saddr: off`)
+        //    feeding a waterfall loop.
+        let vgpr_heap = [
+            0xBE86_0301u32, // s_mov_b32 s6, s1
+            0xBE87_0380,    // s_mov_b32 s7, 0
+            0xF408_0A03,
+            0xFA00_0000, // s_load_dwordx4 s[40:43], s[6:7], 0x0
+            0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+            0xD70F_0202,
+            0x0002_0200, // v_add_co_u32 v2, s2, s0, v1
+            0xD528_0203,
+            0x0009_0080, // v_add_co_ci_u32 v3, s2, 0, 0, s2
+            0xDC38_8000,
+            0x047D_0002, // global_load_dwordx4 v[4:7], v[2:3], off
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E18_0504, // loop: v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0x7DE4_080C, // v_cmpx_eq_u64 s[12:13], v[4:5]
+            0x7DE4_0C0E, // v_cmpx_eq_u64 s[14:15], v[6:7]
+            0xE030_0000,
+            0x8003_0800, // buffer_load_dword v8, off, s[12:15], 0
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF4, // s_cbranch_execnz -> loop
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_0000,
+            0x800A_0800, // buffer_store_dword v8, off, s[40:43], 0
+            S_ENDPGM,
+        ];
+        let r4 = waterfall(&vgpr_heap, false).unwrap();
+        let buf = r4
+            .descriptors
+            .iter()
+            .find(|d| matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        let Source::Fetched { load, first: 0 } = buf.source else {
+            panic!("{:?}", buf.source);
+        };
+        let addr = r4.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!((addr.param, addr.offset), (0, 0));
+        assert!(addr.dynamic.is_some());
+    }
+
+    #[test]
+    fn deep_diamond_phi_and_add_chains_track_in_linear_time() {
+        // 24 chained if/else diamonds (2^24 = 16,777,216 paths) inside an outer loop, updating
+        // both a title-memory VGPR address (`v[2:3]`) and a heap SGPR address (`s[12:13]`),
+        // exercising `flat_address -> address -> sum` and `joined_on_taken_edges` + `edge_taken`.
+        let mut words = vec![
+            0xBE8C_030Au32, // s_mov_b32 s12, s10 (ResourceHeap)
+            0xBE8D_0380,    // s_mov_b32 s13, 0
+            0x7E04_0202,    // v_mov_b32 v2, s2 (title-memory low)
+            0x7E06_0203,    // v_mov_b32 v3, s3 (title-memory high)
+            0xBE8E_0380,    // s_mov_b32 s14, 0 (loop counter)
+        ];
+        let loop_head = words.len();
+        for step in 0..24u32 {
+            let bit = 1u32 << (step & 7);
+            words.extend([
+                0x870F_FF09,
+                bit,         // s_and_b32 s15, s9, bit
+                0xBF06_800F, // s_cmp_eq_u32 s15, 0
+                0xBF84_0002, // s_cbranch_scc0 -> else (+2 dwords)
+                0x4A04_0484, // then: v_add_nc_u32 v2, 4, v2
+                0xBF82_0001, // s_branch -> join (+1 dword)
+                0x4A04_0488, // else: v_add_nc_u32 v2, 8, v2
+            ]);
+        }
+        words.push(0x800E_810E); // s_add_u32 s14, s14, 1
+        words.push(0xBF0C_820E); // s_cmp_lt_u32 s14, 2
+        let rel = (loop_head as isize) - (words.len() as isize + 1);
+        words.push(0xBF85_0000 | ((rel as i16 as u16) as u32)); // s_cbranch_scc1 -> loop_head
+        // Plus a 24-diamond heap-offset phi chain outside the loop (`2^24` paths).
+        for step in 0..24u32 {
+            let bit = 1u32 << (step & 7);
+            words.extend([
+                0x870F_FF09,
+                bit,         // s_and_b32 s15, s9, bit
+                0xBF06_800F, // s_cmp_eq_u32 s15, 0
+                0xBF84_0002, // s_cbranch_scc0 -> else (+2 dwords)
+                0x800C_900C, // then: s_add_u32 s12, s12, 16
+                0xBF82_0001, // s_branch -> join (+1 dword)
+                0x800C_A00C, // else: s_add_u32 s12, s12, 32
+            ]);
+        }
+        words.extend([
+            0xDC30_8000,
+            0x047D_0002, // global_load_dword v4, v[2:3], off
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xE070_0000,
+            0x8004_0400, // buffer_store_dword v4, off, s[16:19], 0
+            S_ENDPGM,
+        ]);
+
+        let t0 = std::time::Instant::now();
+        let r = track_words(
+            &words,
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Cs,
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "24-diamond phi chain took {elapsed:?}"
+        );
+        assert_eq!(r.scalar.len(), 2);
+        assert_eq!(r.scalar[0].1.param, MEMORY);
+        assert_eq!(r.scalar[1].1.param, 1);
     }
 }
