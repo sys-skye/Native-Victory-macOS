@@ -140,7 +140,12 @@ fn prewarm(shader: &Arc<Shader>) {
             return false;
         }
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        let n = crate::prewarm::pool_size(cores);
+        // `VICTORY_PREWARM_WORKERS=<n>`: the pool's size instead of all cores but two.
+        let n = std::env::var("VICTORY_PREWARM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| crate::prewarm::pool_size(cores));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
                 crate::prewarm::lower_priority();
@@ -203,15 +208,17 @@ impl Shader {
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                // For `victory translate --cache`, once the translator has changed.
+                crate::native::shaders::keep(&container);
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
                 {
                     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
                 }
-                // A vertex shader keeps its container: a rectangle-list draw translates it again;
-                // so does a pixel shader, for a draw into unsigned-integer targets.
-                if !matches!(self.stage, "vertex" | "pixel") {
+                // A vertex shader keeps its container (a rectangle-list draw translates it again),
+                // and a pixel shader its (integer colour targets do: the title may have freed it).
+                if self.stage != "vertex" && self.stage != "pixel" {
                     *container = Vec::new();
                 }
                 made
@@ -243,15 +250,7 @@ impl Shader {
         self.threads
             .get_or_init(|| {
                 self.native()?;
-                let mut container = vec![0; self.size];
-                let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
-                if at == 0 || !crate::queue::read_bytes(at, &mut container) {
-                    return Err("its container is no longer in title memory".into());
-                }
-                if blake3::hash(&container).to_hex()[..16] != *self.hash {
-                    return Err("its container changed since the pipeline was made".into());
-                }
-                crate::native::shaders::translate_threads(&container).map(Arc::new)
+                crate::native::shaders::translate_threads(&self.container_again()?).map(Arc::new)
             })
             .clone()
     }
@@ -267,6 +266,38 @@ impl Shader {
     pub(crate) fn uint_cached(&self, uint: u8) -> bool {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
         crate::native::shaders::uint_cached(&container, uint)
+    }
+
+    /// The container: kept (vertex and pixel shaders), or read again from where the title held
+    /// it (a compute shader's is let go once translated).
+    fn container_again(&self) -> Result<Vec<u8>, String> {
+        let kept = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.is_empty() {
+            return Ok(kept.clone());
+        }
+        drop(kept);
+        let mut container = vec![0; self.size];
+        let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+            return Err("its container is no longer in title memory".into());
+        }
+        if blake3::hash(&container).to_hex()[..16] != *self.hash {
+            return Err("its container changed since the pipeline was made".into());
+        }
+        Ok(container)
+    }
+
+    /// A pixel shader's translation for integer colour targets (`Options::integer_targets`);
+    /// not kept here (the disk cache and the pipeline caches keep it). Made from the kept
+    /// container, so it does not need the title to hold the container still (pixel containers
+    /// cost ~110 MB of host memory).
+    pub(crate) fn translate_targets(&self, integer: u8) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        crate::native::shaders::translate_targets(&self.container_again()?, integer).map(Arc::new)
+    }
+
+    /// Whether [`Self::translate_targets`] would find its translation on disk.
+    pub(crate) fn targets_cached(&self, integer: u8) -> bool {
+        self.container_again().is_ok_and(|c| crate::native::shaders::targets_cached(&c, integer))
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.
@@ -811,7 +842,9 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
+    // The pixel program's input enables, from the register image (pair 0).
+    let ps_input = piece(0).and_then(victory_shader::emit::graphics::ps_input_ena);
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
@@ -1606,9 +1639,16 @@ mod tests {
 /// with `user_sgprs` user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_compute_container(code: &[u32], records: &[[u8; 32]], user_sgprs: u32) -> Vec<u8> {
+    test_compute_container_of(code, records, user_sgprs, 32, false)
+}
+
+/// [`test_compute_container`] of `threads` x 1 x 1 in a group, in 64-lane waves if `wave64`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_compute_container_of(code: &[u32], records: &[[u8; 32]], user_sgprs: u32, threads: u32, wave64: bool) -> Vec<u8> {
     let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    // Thread-group size 32, 1, 1; wave32; 16 VGPRs.
-    let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, user_sgprs << 1]);
+    // Thread-group size `threads`, 1, 1; the wave size; 16 VGPRs (granules of 8, or 4 in wave64).
+    let (flags, granules) = if wave64 { (0, 3) } else { (1 << 4 << 16, 1) };
+    let registers = words(&[0, 0, 0, threads | 1 << 16, 1 | flags, granules, user_sgprs << 1]);
     let code = words(code);
     let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
     metadata.extend([0x40, 4, records.len() as u8, 0]);
@@ -1792,5 +1832,23 @@ mod pieces_tests {
         pipeline(p).shaders[0].at.store(0x10, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(native_threads(p).1.err().as_deref(), Some("its container is no longer in title memory"));
         release(p);
+    }
+
+    /// A pixel shader keeps its container once translated: its integer-target translation is
+    /// made when the title holds the container nowhere any more (`at` 0).
+    #[test]
+    fn a_pixel_shader_translates_for_integer_targets_after_the_title_freed_its_container() {
+        // `exp mrt0 v0, v1, v1, v0 vm; exp mrt1 v2, off, off, off done vm; s_endpgm`.
+        let code: Vec<u8> = [0xF800_100Fu32, 0x0001_0100, 0xF800_1811, 0x0000_0002, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let mut meta = [0; 0x10];
+        meta[12] = 0x40;
+        let c = victory_shader::emit::graphics::container(victory_shader::native::HwStage::Ps, &code, &meta).unwrap();
+        let s = shader("pixel", &c);
+        assert_eq!(s.at.load(std::sync::atomic::Ordering::Relaxed), 0, "not in title memory");
+        s.native().expect("translates");
+        s.translate_targets(0b10).expect("translated for an integer mrt1");
     }
 }

@@ -543,7 +543,9 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
             signals: &[(&f, 1)],
         },
     );
-    assert!(refused.is_err(), "the indexed record without an index buffer is refused");
+    let err = refused.expect_err("the indexed record without an index buffer is refused");
+    assert_eq!(err.refused, [0], "only the bad pass was refused");
+    assert!(err.committed, "the command buffer still committed");
     assert!(m.wait(&f, 1, 10_000), "the fence signal still landed");
     let p = s.pixels();
     assert!(
@@ -590,7 +592,9 @@ fn a_pass_refused_mid_encoding_closes_its_encoder() {
             signals: &[(&f, 1)],
         },
     );
-    assert!(refused.is_err(), "the indexed record without an index buffer is refused");
+    let err = refused.expect_err("the indexed record without an index buffer is refused");
+    assert_eq!(err.refused, [0], "only the bad pass was refused");
+    assert!(err.committed, "the command buffer still committed");
     assert!(m.wait(&f, 1, 10_000), "the fence signal still landed");
     assert!(s.pixels().iter().any(|c| c[1] > 100), "the pass after the refused one drew");
 }

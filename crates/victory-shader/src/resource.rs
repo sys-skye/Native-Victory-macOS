@@ -1509,6 +1509,7 @@ impl<'a> Tracer<'a> {
         let dynamic = s.dynamic.or(extra.dynamic);
         let low_terms = [lo, extra.dynamic.map_or(Term::Const(0), Term::Value)];
         if !self.high_half_with(hi, high, &low_terms, Some(base))
+            && !(high.is_none() && self.scc_carry(lo, hi, base))
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             return Err(if high.is_none() {
@@ -1522,6 +1523,40 @@ impl<'a> Tracer<'a> {
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
         })
+    }
+
+    /// `hi` is `s_add_u32 0, src_scc` (or `src_scc, 0`) reading the carry `SCC` left by
+    /// `s_add_u32 lo, <base>, <offset>` for a table or heap `base` (`#258`).
+    fn scc_carry(&self, lo: Term, hi: Term, base: Value) -> bool {
+        let (Term::Value(lo_v), Term::Value(hi_v)) = (lo, hi) else {
+            return false;
+        };
+        let Some((lo_inst, [la, lb])) = self.sop2(lo_v, &["s_add_u32"]) else {
+            return false;
+        };
+        if la != Term::Value(base) && lb != Term::Value(base) {
+            return false;
+        }
+        let Some(lo_scc) = lo_inst.write(Reg::Scc) else {
+            return false;
+        };
+        let Some(hi_inst) = self.def(hi_v) else {
+            return false;
+        };
+        if hi_inst.name() != "s_add_u32"
+            || hi_inst.writes.first().map(|w| w.1) != Some(hi_v)
+            || hi_inst.read(Reg::Scc) != Some(lo_scc)
+        {
+            return false;
+        }
+        let Fields::Sop { src, .. } = &hi_inst.fields else {
+            return false;
+        };
+        let [a, b] = src.as_slice() else {
+            return false;
+        };
+        let is_zero = |op: &Operand| self.term(hi_inst, op) == Some(Term::Const(0));
+        *a == Operand::Const(253) && is_zero(b) || *b == Operand::Const(253) && is_zero(a)
     }
 
     /// Whether `v` is a root parameter holding a descriptor heap address.
@@ -1603,11 +1638,6 @@ impl<'a> Tracer<'a> {
             if a == Term::Const(0) {
                 return self.high_half_inner(b, high, low_terms, base, seen, steps, memo);
             }
-        }
-        // The low half's carry added through `src_scc` (`s_add_u32 hi, x, src_scc`, either order),
-        // as `s_addc_u32 hi, x, 0` adds it.
-        if let Some(x) = self.plus_carry(hi) {
-            return self.high_half_inner(x, high, low_terms, base, seen, steps, memo);
         }
         if let Some((lo_out, _, _, [_, add_hi])) = self.vmad64(v, 1)
             && self
@@ -2381,26 +2411,6 @@ impl<'a> Tracer<'a> {
 
     fn vbfe_u32(&self, v: Value) -> Option<(Term, u32, u32)> {
         self.vbfe(v, false)
-    }
-
-    /// What phi `t` holds in every lane that reads it: the one value its
-    /// args bring along the edges some lane takes (a register set inside a
-    /// region that only a skip no lane takes bypasses, as
-    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
-    /// `x` for `s_add_u32 hi, x, src_scc` (either order): the high half plus the carry of the low
-    /// half's add, as `s_addc_u32 hi, x, 0` would make it.
-    fn plus_carry(&self, hi: Term) -> Option<Term> {
-        const SRC_SCC: u8 = 253;
-        let Term::Value(v) = hi else { return None };
-        let inst = self.def(v)?;
-        if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
-            return None;
-        }
-        let Fields::Sop { src, .. } = &inst.fields else { return None };
-        match src[..] {
-            [Operand::Const(SRC_SCC), ref x] | [ref x, Operand::Const(SRC_SCC)] => self.term(inst, x),
-            _ => None,
-        }
     }
 
     fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
@@ -4556,6 +4566,137 @@ pub(crate) mod tests {
                 what: "an address into a descriptor heap with an untracked high half", ..
             })
         ));
+    }
+
+    #[test]
+    fn a_heap_or_table_address_carry_added_as_scc_source_tracks_the_offset() {
+        let run = |setup: &[u32], root: RootParam| {
+            let mut words = setup.to_vec();
+            words.extend([
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE070_0000,
+                0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+                S_ENDPGM,
+            ]);
+            let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[root], HwStage::Cs, lanes(&p).as_ref())
+        };
+
+        // Both operand orders of `s_add_u32 hi, 0, src_scc` and of the low add, on heap & table,
+        // including an `s_mov_b32` copy of the base SGPR and a waterfall `v_readfirstlane_b32` offset.
+        assert_eq!(
+            run(
+                &[
+                    0x8004_A004, // s_add_u32 s4, s4, 32
+                    0x8005_FD80, // s_add_u32 s5, 0, src_scc
+                ],
+                param(ResourceHeap, 4, 1),
+            )
+            .unwrap()
+            .scalar,
+            [((0, 2), at(0, 32))],
+        );
+        assert_eq!(
+            run(
+                &[
+                    0xBE82_0304, // s_mov_b32 s2, s4
+                    0x8004_02A0, // s_add_u32 s4, 32, s2
+                    0x8005_80FD, // s_add_u32 s5, src_scc, 0
+                ],
+                param(Table, 4, 1),
+            )
+            .unwrap()
+            .scalar,
+            [((0, 3), at(0, 32))],
+        );
+        let waterfall = run(
+            &[
+                0x3402_0085, // v_lshlrev_b32_e32 v1, 5, v0
+                0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+                0x8004_0604, // s_add_u32 s4, s4, s6
+                0x8005_FD80, // s_add_u32 s5, 0, src_scc
+            ],
+            param(ResourceHeap, 4, 1),
+        )
+        .unwrap();
+        assert_eq!(waterfall.scalar.len(), 1);
+        assert_eq!(waterfall.scalar[0].1.param, 0);
+        assert!(waterfall.scalar[0].1.dynamic.is_some());
+
+        // Negatives:
+        // 1. `s_add_i32` as the low add sets signed overflow in SCC, not unsigned carry.
+        assert!(matches!(
+            run(
+                &[
+                    0x8104_A004, // s_add_i32 s4, s4, 32
+                    0x8005_FD80, // s_add_u32 s5, 0, src_scc
+                ],
+                param(ResourceHeap, 4, 1),
+            ),
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half",
+                ..
+            })
+        ));
+        // 2. Non-zero constant on the high `s_add_u32`.
+        assert!(matches!(
+            run(
+                &[
+                    0x8004_A004, // s_add_u32 s4, s4, 32
+                    0x8005_FD81, // s_add_u32 s5, 1, src_scc
+                ],
+                param(ResourceHeap, 4, 1),
+            ),
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half",
+                ..
+            })
+        ));
+        // 3. Chained low add not taking the base itself (an earlier add's carry could be lost).
+        assert!(matches!(
+            run(
+                &[
+                    0x8006_9004, // s_add_u32 s6, s4, 16
+                    0x8004_9006, // s_add_u32 s4, s6, 16
+                    0x8005_FD80, // s_add_u32 s5, 0, src_scc
+                ],
+                param(ResourceHeap, 4, 1),
+            ),
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half",
+                ..
+            })
+        ));
+        // 4. Intervening instruction overwriting SCC before `s_add_u32 s5, 0, src_scc`.
+        assert!(matches!(
+            run(
+                &[
+                    0x8004_A004, // s_add_u32 s4, s4, 32
+                    0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                    0x8005_FD80, // s_add_u32 s5, 0, src_scc
+                ],
+                param(ResourceHeap, 4, 1),
+            ),
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half",
+                ..
+            })
+        ));
+        // 5. A 64-bit root descriptor's base (`high.is_some()`) is not accepted as `0 + src_scc`:
+        //    `traced_address` rejects it as `"an address with an untracked high half"`, so `address`
+        //    classifies the load as title memory (`MEMORY`) rather than root parameter 0.
+        let root_desc = run(
+            &[
+                0xBE82_0305, // s_mov_b32 s2, s5 (keep root descriptor high half live-in)
+                0x8004_A004, // s_add_u32 s4, s4, 32
+                0x8005_FD80, // s_add_u32 s5, 0, src_scc
+            ],
+            param(Descriptor, 4, 2),
+        )
+        .unwrap();
+        assert_eq!(root_desc.scalar[0].1.param, MEMORY);
     }
 
     #[test]

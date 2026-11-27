@@ -45,6 +45,7 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     ("crates/victory-metal/tests/fixtures/tex_fill.dxil", "compiled from tex_fill.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_ps.dxil", "compiled from tri_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_vs.dxil", "compiled from tri_vs.hlsl"),
+    ("crates/victory-metal/tests/fixtures/uint_fill.dxil", "compiled from uint_fill.hlsl"),
     // shortcut: one source file over the size limit, until it is split into modules.
     ("crates/victory-shader/src/emit/lower.rs", "hand-written translator source, over the size limit"),
     ("tools/swizzle/gen_xor_tables.py", "script that generates the swizzle tables"),

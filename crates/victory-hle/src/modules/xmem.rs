@@ -341,6 +341,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        victory_gpu::native::freed::record_alloc(user as u64, size as u64);
         user.cast()
     }
 }
@@ -362,6 +363,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::native::freed::record_free(user as u64, size as u64);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

@@ -893,17 +893,78 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         if let Some(xor) = &self.xor {
-            // The equations mix every coordinate into the low address bits, so a row is not a few
-            // runs: one element at a time.
-            for z in 0..depth {
-                let (s, _) = self.split(first + z);
-                let base = u64::from(s) * self.slice_size + m.offset;
-                for y in 0..m.height {
-                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                    for x in 0..m.width {
-                        let tiled = (base + self.xor_address(xor, m, x, y, first + z)) as usize;
-                        copy(tiled, linear_row + x as usize * n, n);
+            let [bw, bh, _] = self.block;
+            let log2 = self.alignment.trailing_zeros();
+            let (tx, ty) = m.tail.map_or((0, 0), |t| (t.x, t.y));
+            let pitch_blocks = u64::from(m.pitch / bw);
+            // Address bits below every bit touched by Y, Z or pipe-bank XOR are never flipped by
+            // `yz_xor`, so adjacent columns that advance monotonically inside those low bits form a
+            // contiguous run on every row and depth slice.
+            let yz_mask: usize = xor
+                .bits
+                .iter()
+                .enumerate()
+                .fold(xor.pipe_bank as usize, |acc, (i, b)| {
+                    if b[1] != 0 || b[2] != 0 {
+                        acc | (1usize << i)
+                    } else {
+                        acc
                     }
+                });
+            let low_x_mask = if yz_mask == 0 {
+                usize::MAX
+            } else {
+                (1usize << yz_mask.trailing_zeros()) - 1
+            };
+            let col_parts = |x: u32| -> (usize, usize) {
+                let sx = x + tx;
+                (
+                    ((u64::from(sx / bw)) << log2) as usize,
+                    xor.x[sx as usize & (XOR_XY - 1)] as usize,
+                )
+            };
+            let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
+            let (mut b0, mut x0) = col_parts(0);
+            let mut l0 = 0usize;
+            for x in 1..m.width {
+                let (bx, xx) = col_parts(x);
+                let at = x as usize * n;
+                let len = at - l0;
+                if bx != b0
+                    || (xx & !low_x_mask) != (x0 & !low_x_mask)
+                    || (xx & low_x_mask) != (x0 & low_x_mask) + len
+                {
+                    runs.push((b0, x0, l0, len));
+                    (b0, x0, l0) = (bx, xx, at);
+                }
+            }
+            runs.push((b0, x0, l0, bytes - l0));
+            let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+            let run_len = body
+                .first()
+                .map(|r| r.3)
+                .filter(|&len| body.iter().all(|r| r.3 == len));
+            for z in 0..depth {
+                let gz = first + z;
+                let (s, _) = self.split(gz);
+                let z_base = (u64::from(s) * self.slice_size + m.offset) as usize;
+                let z_xor = (xor.z[gz as usize & (XOR_Z - 1)] ^ xor.pipe_bank) as usize;
+                for y in 0..m.height {
+                    let sy = y + ty;
+                    let row_base =
+                        z_base + (((u64::from(sy / bh) * pitch_blocks) << log2) as usize);
+                    let yz_xor = (xor.y[sy as usize & (XOR_XY - 1)] as usize) ^ z_xor;
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    match run_len {
+                        Some(1) => copy_xor_runs::<1>(body, row_base, yz_xor, linear_row, &mut copy),
+                        Some(2) => copy_xor_runs::<2>(body, row_base, yz_xor, linear_row, &mut copy),
+                        Some(4) => copy_xor_runs::<4>(body, row_base, yz_xor, linear_row, &mut copy),
+                        Some(8) => copy_xor_runs::<8>(body, row_base, yz_xor, linear_row, &mut copy),
+                        Some(16) => copy_xor_runs::<16>(body, row_base, yz_xor, linear_row, &mut copy),
+                        Some(32) => copy_xor_runs::<32>(body, row_base, yz_xor, linear_row, &mut copy),
+                        _ => copy_xor_runs::<0>(body, row_base, yz_xor, linear_row, &mut copy),
+                    }
+                    copy_xor_runs::<0>(last, row_base, yz_xor, linear_row, &mut copy);
                 }
             }
             return Ok(());
@@ -967,6 +1028,20 @@ fn copy_runs<const N: usize>(
     for &(tiled, linear, len) in runs {
         let len = if N == 0 { len } else { N };
         copy(tiled_row + tiled, linear_row + linear, len);
+    }
+}
+
+/// Copy XOR-swizzled column runs inline at a known byte width (`N = 0` uses each run's length).
+fn copy_xor_runs<const N: usize>(
+    runs: &[(usize, usize, usize, usize)],
+    row_base: usize,
+    yz_xor: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(col_block, col_xor, linear, len) in runs {
+        let len = if N == 0 { len } else { N };
+        copy(row_base + col_block + (col_xor ^ yz_xor), linear_row + linear, len);
     }
 }
 

@@ -21,6 +21,11 @@ diagnostics = []
 name = "guard_runs"
 harness = false
 
+# The corpus sweep (docs/native-host.md, "Sweeping a shader corpus"); its tests run with the crate's.
+[[example]]
+name = "sweep"
+test = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
 windows = { workspace = true, optional = true, features = [

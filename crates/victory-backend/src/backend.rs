@@ -63,7 +63,8 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
     /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
-    /// words) instead of `groups`.
+    /// words) instead of `groups`. A record that asks for more than 2^22 groups in all
+    /// dispatches nothing.
     pub indirect: Option<(&'a B::Buffer, *const u8)>,
     /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
     /// The record runs only if the index is below the count, which the GPU reads when it runs.
@@ -108,6 +109,11 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// The bytes of GPU memory the device holds for this process now, where the backend knows
+    /// (Metal's `currentAllocatedSize`), for memory measurements.
+    fn allocated_bytes(&self) -> u64 {
+        0
+    }
     /// A zeroed buffer of the host's own (`len` bytes) and where the CPU writes it. It lives
     /// while the caller or work submitted with it holds it: memory the GPU reads after the
     /// caller let go (a page table that was replaced) must not be the caller's to free.

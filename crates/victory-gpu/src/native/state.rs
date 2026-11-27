@@ -399,12 +399,17 @@ impl Graphics {
         &self.inputs
     }
 
-    /// The colour target formats the host knows; `None` if one is not (the pipeline is refused).
-    pub fn color_formats(&self) -> Option<Vec<Format>> {
+    /// The colour target formats the host knows; `Err` contains the first unknown DXGI format.
+    pub fn color_formats(&self) -> Result<Vec<Format>, u32> {
+        // If the state has explicit bound formats (used for console draws), they are already known.
         if let Some((color, _)) = &self.bound {
-            return Some(color.clone());
+            return Ok(color.clone());
         }
-        self.rt_formats.iter().map(|&f| format(f)).collect()
+        // Convert each DXGI format number to a host `Format`. If any conversion fails we return the offending DXGI value.
+        self.rt_formats
+            .iter()
+            .map(|&f| format(f).ok_or(f))
+            .collect()
     }
 
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
@@ -920,6 +925,14 @@ mod tests {
     }
 
     #[test]
+    fn unknown_color_format_is_propagated() {
+        // This value is not a known DXGI format.
+        let unknown_dxgi = 0xFFFF_FFFFu32;
+        let g = Graphics { rt_formats: vec![unknown_dxgi], ..Default::default() };
+        assert_eq!(g.color_formats(), Err(unknown_dxgi));
+    }
+
+    #[test]
     fn blend_depth_stencil_and_raster_subobjects_are_read() {
         let mut g = Graphics::default();
         // Blend: target 0 on, (SRC_ALPHA, INV_SRC_ALPHA, ADD / ONE, ZERO, ADD), write mask 0b0111;
@@ -961,7 +974,7 @@ mod tests {
             })
         );
         assert_eq!((state[0].write_mask, state[1].blend, state[1].write_mask), (0b0111, None, 0b1000));
-        assert_eq!(g.color_formats(), Some(vec![Format::Rgba8Unorm, Format::Rgba16Float]));
+        assert_eq!(g.color_formats(), Ok(vec![Format::Rgba8Unorm, Format::Rgba16Float]));
         assert_eq!(g.depth_format(), Ok(Some(Format::D32Float)));
         assert_eq!(g.depth_test(), Some((false, Compare::LessEqual)));
         let st = g.stencil().unwrap();

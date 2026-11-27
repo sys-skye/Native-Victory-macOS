@@ -17,7 +17,8 @@ nice cargo build --release -j6 --target x86_64-apple-darwin -p victory
 ## Run
 
 - Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Click the window; the keyboard drives the pad (Enter/Space = A, Esc/Backspace = B, arrows = D-pad, WASD = left stick, Tab = Menu, Q/E = shoulders, Z/C = triggers).
-- After a run: `tools/macos/run-summary.sh [runs/<date>/victory.log]` prints fps per 64 frames, shader refusals, dropped work, GPU errors and how the run ended (newest log by default).
+- After a run: `tools/macos/run-summary.sh [runs/<date>/victory.log]` prints fps per 64 frames, shader refusals, dropped work, GPU errors and how the run ended (newest log by default). `run-summary.sh --compare <before.log> <after.log>` prints one before/after table of two runs (commit, fps median and last, first world frame, first binds, refusals, dropped work by kind, GPU errors, how it ended) and the refusals by cause, largest change first, with new and gone causes marked; plain text, to paste into an issue in a fenced block. A log from run-native.sh ends with `# exit code N` (and `# stopped by --seconds` when the limit stopped it). That is how the table tells a host SIGSEGV (139) from the time limit; older logs read as unknown.
+- For a tester report: `tools/macos/tester-report.sh [--out DIR] [log]` writes a gzipped copy of the log with $HOME, the user name and host names replaced (to `~/victory-reports/` by default, never inside the repo; the original log is untouched), prints its path and sha256, and prints an issue body for the tester-report template (Mac, commit, console model, shader converter, VICTORY_* variables, run-summary.sh output). It uploads nothing.
 - Headless, for agents: `tools/macos/run-native.sh --headless --seconds 120 <game folder>`, or the binary directly:
 
 ```bash

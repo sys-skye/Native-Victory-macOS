@@ -162,7 +162,7 @@ mod tests {
         let mut g = Graphics::default();
         apply(&mut g, &blend([1, 0, 5, 6, 1, 2, 6, 1, 4, 15]));
         let d = graphics_state_for(&g, vec![Format::Bgra8Unorm, Format::Rgba16Float], Some(Format::D32Float));
-        assert_eq!(d.color_formats(), Some(vec![Format::Bgra8Unorm, Format::Rgba16Float]));
+        assert_eq!(d.color_formats(), Ok(vec![Format::Bgra8Unorm, Format::Rgba16Float]));
         assert_eq!(d.depth_format(), Ok(Some(Format::D32Float)));
         assert_eq!(d.color_state().len(), 2);
         // The same blend on every target (the description is not independent).

@@ -783,7 +783,9 @@ fn data_dwords(name: &str) -> u8 {
 }
 
 /// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`. Derivatives
+/// are 32-bit whatever `a16` says; the `_g16` opcodes pack them, each
+/// direction from a new dword (LLVM: gfx1010 to gfx1030 alike).
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -805,6 +807,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let mut g16 = false;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -814,15 +817,13 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
-    } else {
-        whole + 2 * derivs + packed
-    }
+    let derivs = if g16 { derivs.div_ceil(2) } else { derivs };
+    whole + 2 * derivs + if a16 { packed.div_ceil(2) } else { packed }
 }

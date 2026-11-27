@@ -18,12 +18,18 @@ use victory_metal::metal::Metal;
 mod addr_tests;
 #[path = "heap_tests.rs"]
 mod heap_tests;
+#[path = "legacy_fma_tests.rs"]
+mod legacy_fma_tests;
 #[path = "mesh_tests.rs"]
 mod mesh_tests;
+#[path = "scaled_vertex_tests.rs"]
+mod scaled_vertex_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
 #[path = "split_wave_tests.rs"]
 mod split_wave_tests;
+#[path = "stale_tests.rs"]
+mod stale_tests;
 #[path = "state_tests.rs"]
 mod state_tests;
 #[path = "texture_tests.rs"]
@@ -157,6 +163,8 @@ unsafe extern "C" {
 struct TitlePages {
     va: u64,
     len: usize,
+    /// Pages of `page` bytes unmapped since, by index: no longer ours to deallocate.
+    gone: std::cell::RefCell<Vec<(usize, usize)>>,
 }
 
 impl TitlePages {
@@ -177,7 +185,25 @@ impl TitlePages {
                 h.memory().mapped(at as usize, page, info, off);
             }
         }
-        TitlePages { va, len }
+        TitlePages { va, len, gone: Default::default() }
+    }
+
+    /// The title maps title page `k` (of `page` bytes) from pool offset `off` instead.
+    fn remap(&self, h: &Host, info: &PoolInfo, pool: &Alias, k: usize, off: usize, page: usize) {
+        let (mut at, mut cur, mut max) = (self.va + (k * page) as u64, 0, 0);
+        // SAFETY: Mach VM calls on our own task over a page of the reservation, as in `new`.
+        let r = unsafe { mach_vm_remap(mach_task_self(), &mut at, page as u64, 0, 0x4000, mach_task_self(), pool.primary as u64 + off as u64, 0, &mut cur, &mut max, 0) };
+        assert_eq!(r, 0, "mach_vm_remap");
+        h.memory().mapped(at as usize, page, info, off);
+    }
+
+    /// The title unmaps title page `k` (of `page` bytes).
+    fn unmap(&self, h: &Host, k: usize, page: usize) {
+        let at = self.va + (k * page) as u64;
+        // SAFETY: a page of the reservation, which is not used again (`gone`).
+        assert_eq!(unsafe { mach_vm_deallocate(mach_task_self(), at, page as u64) }, 0);
+        h.memory().unmapped(at as usize, page);
+        self.gone.borrow_mut().push((k * page, page));
     }
 
     fn write<T: Copy>(&self, at: usize, v: &[T]) {
@@ -193,8 +219,18 @@ impl TitlePages {
 
 impl Drop for TitlePages {
     fn drop(&mut self) {
-        // SAFETY: the range came from `mach_vm_allocate` in `new`.
-        unsafe { mach_vm_deallocate(mach_task_self(), self.va, self.len as u64) };
+        // The pages given back may hold someone else's mapping by now (the GPU driver's
+        // notification queue was seen there): deallocate only the rest.
+        let mut gone = self.gone.borrow().clone();
+        gone.sort_unstable();
+        let mut at = 0;
+        for (from, len) in gone.into_iter().chain([(self.len, 0)]) {
+            if from > at {
+                // SAFETY: part of the range `new` allocated, still ours.
+                unsafe { mach_vm_deallocate(mach_task_self(), self.va + at as u64, (from - at) as u64) };
+            }
+            at = at.max(from + len);
+        }
     }
 }
 
@@ -241,6 +277,133 @@ fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() 
     l.dispatch(1, 1, 1).unwrap();
     run(&h, &[&l]);
     assert_eq!(title.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    drop(slots);
+}
+
+/// A wrap keeps the physical pages it was made over: once the title maps other pool pages at
+/// those title addresses, or unmaps them, the GPU still reads the old pages through it (no fault,
+/// no zeros; seen on an M5 Pro, macOS 27). The host mirrors such a heap entry again before the
+/// next work it submits (`NativeHost::follow_title_pages`), so the view reads the new page, and
+/// then zeros (the null view) once part of its range is unmapped.
+#[test]
+fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    // Title pages 0 and 1 are pool pages 2 and 1 (the source, across them); title page 2, pool
+    // page 3, takes the output.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // Pool page 4 holds other words where title page 1's are.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..132u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 32) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        d[1] = 1; // buffer view
+        d[6] = 64; // elements
+        d[8] = 1; // raw (SRV flags word)
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // buffer
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap());
+    assert!(h.mirror(start + 32).unwrap());
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    // dst[i] = src[i] * 3 + 1 through the heap's views; dst starts at a canary.
+    let pass = || {
+        title.write(dst, &[0xCAFE_CAFEu32; 64]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+        title.read::<u32>(dst, 64)
+    };
+    let expect = |page1: &dyn Fn(u32) -> u32| (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { page1(i) * 3 + 1 }).collect::<Vec<_>>();
+    assert_eq!(pass(), expect(&|i| i));
+    title.remap(&h, &info, &pool, 1, 4 * page, page);
+    assert_eq!(pass(), expect(&|i| i + 68), "the view still read the old pool page");
+    title.unmap(&h, 1, page);
+    assert_eq!(pass(), vec![1; 64], "a view with an unmapped page is the null view");
+    // A null view (address 0) written over a followed entry is not followed any more.
+    assert!(heap.title_views.borrow().contains_key(&0));
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], start);
+    assert!(h.mirror(start).unwrap());
+    assert!(!heap.title_views.borrow().contains_key(&0), "a null view's pages are followed");
+    drop(slots);
+}
+
+/// The title copies one view into many heap entries; following the pages under them walks the
+/// pool table once for that range a look, not once an entry, and every copy still follows a
+/// remap (#267 review: 54 copies of the 174 MiB view cost about 3 ms a look).
+#[test]
+fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..132u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 32) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1);
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    // Entries 0 to 2: three copies of the source view; entry 3: the output.
+    for k in 0..3 {
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start + 32 * k);
+        assert!(h.mirror(start + 32 * k).unwrap());
+    }
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 96);
+    assert!(h.mirror(start + 96).unwrap());
+    let walks = || super::host::SIGNATURES.with(|n| n.replace(0));
+    // A pool-table change elsewhere: one walk for the three copies, none moved.
+    h.memory().pool_created(&PoolInfo { id: 2, base: 0x1000, len: 0x1000, memory_entry: None });
+    walks();
+    run(&h, &[]);
+    assert_eq!(walks(), 1);
+    // Remapped under them: still one walk, and the copy the program reads follows.
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    title.remap(&h, &info, &pool, 1, 4 * page, page);
+    title.write(dst, &[0xCAFE_CAFEu32; 64]);
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[3, 1]);
+    l.set_compute_root_table(1, &heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    walks();
+    run(&h, &[&l]);
+    assert_eq!(walks(), 1);
+    let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
+    assert_eq!(title.read::<u32>(dst, 64), expect);
     drop(slots);
 }
 
@@ -601,6 +764,47 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
     assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
 }
 
+/// A buffer view of address 0 (a null view) is the null view for good: a change to the pool table
+/// (world streaming maps pages between almost every submission) does not make it be tried again.
+#[test]
+fn a_null_buffer_view_is_not_retried_when_the_pool_table_changes() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], handle);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    submit();
+    assert!(matches!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        [(0, _, _, 0)]
+    ));
+
+    // Pages mapped elsewhere move the pool table's generation on.
+    for (n, at) in [0x80000usize, 0x90000].into_iter().enumerate() {
+        let pool = PoolInfo {
+            id: n + 1,
+            base: 0x40000 + n * 0x4000,
+            len: 0x4000,
+            memory_entry: None,
+        };
+        host.memory().mapped(at, pool.len, &pool, 0);
+        submit();
+    }
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 1);
+}
+
 #[test]
 fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
     let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
@@ -742,6 +946,92 @@ fn clear_and_draw_into_render_target() {
     assert_eq!(px(0, 0), [0, 0, 255, 255], "cleared corner");
     assert_eq!(px(15, 15), [0, 0, 255, 255], "cleared corner");
     let _ = Rc::strong_count(&color);
+    drop((views, smp));
+}
+
+/// Compute writes a depth texture through an unordered view of its depth plane, and a draw after
+/// it in the same list tests against what compute wrote. A full-screen draw at depth 0.02 with
+/// `LessEqual` passes where `tex_fill` stored x / 255 >= 0.02 (columns 6 and up) and fails left of
+/// them. Without the twin the unordered view is of the depth texture itself, and the depth test
+/// does not see the compute writes: every pixel failed on this Mac (M4 Pro).
+#[test]
+fn a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    let pool = Pool::new(&h, 4);
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    pool.write(0, &[vertex(-1.0, -1.0, GREEN), vertex(3.0, -1.0, GREEN), vertex(-1.0, 3.0, GREEN)]);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: Some(Format::D32Float),
+            depth_test: Some((false, Compare::LessEqual)),
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let fill = h.compute_pipeline(&fixture("tex_fill"), [8, 8, 1]).unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = h.texture(&rt).unwrap();
+    // A title depth texture: DXGI 40 (D32_FLOAT); flags 2 | 4, a depth target compute also writes.
+    let res = crate::resource::test_texture_at(pool.va(16384), (W as u64, W as u32), 1, 40, victory_formats::texture::Swizzle::LINEAR.0, 2 | 4);
+    let desc = crate::resource::texture_info(res).unwrap().desc().unwrap();
+    assert_eq!(desc.format, Format::D32Float);
+    let depth = h.texture(&desc).unwrap();
+    h.register_texture(res as usize, &depth);
+    let white = h.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+    h.backend.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
+    h.register_texture(0xA11CF, &white);
+
+    // Entry 0: the pixel shader's texture; entry 1: the R32_FLOAT unordered view of the depth.
+    let views = vec![0u32; 8 * 4];
+    let smp = vec![0u32; 4 * 4];
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = h.heap(HeapKind::Resource, vstart, 4).unwrap();
+    let sheap = h.heap(HeapKind::Sampler, sstart, 4).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null_mut(), 0xA11CF as _, &srv, vstart);
+    crate::descriptor::create_uav(std::ptr::null_mut(), res, std::ptr::null_mut(), &[41u32, 4, 0, 0, 0, 0, 0, 0, 0, 0], vstart + 32);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(h.mirror(vstart).unwrap() && h.mirror(vstart + 32).unwrap() && h.mirror(sstart).unwrap());
+    assert!(h.twin_of(&depth).is_some(), "the unordered view made a twin");
+
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), Some(&depth));
+    l.clear_render_target(&color, [0.0, 0.0, 0.0, 1.0]);
+    l.clear_depth(&depth, 1.0);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_compute_pipeline(&fill);
+    l.set_compute_root_table(0, &vheap, 1);
+    l.dispatch((W / 8) as u32, (W / 8) as u32, 1).unwrap();
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_graphics_root_constants(0, &[0.02f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer(0, pool.va(0));
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l]);
+
+    let mut out = vec![0u8; W * W * 4];
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let row: Vec<u8> = (0..W).map(|x| out[(8 * W + x) * 4 + 1]).collect();
+    let want: Vec<u8> = (0..W).map(|x| if x >= 6 { 255 } else { 0 }).collect();
+    assert_eq!(row, want, "green where the depth compute wrote is 0.02 or more");
     drop((views, smp));
 }
 
@@ -908,6 +1198,43 @@ fn a_command_at_unmapped_title_memory_is_dropped_alone() {
     assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
     let kept: Vec<u32> = pool.read(src, 16);
     assert_eq!(kept, (0..16).collect::<Vec<u32>>(), "the copy was dropped, not run");
+}
+
+/// A committed buffer's memory is the host's own (no pool holds it): root views and copies into it
+/// reach it while the buffer lives, and are refused as unmapped once it is released.
+#[test]
+fn root_views_and_copies_reach_committed_buffer_memory() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 1);
+    pool.write(0, &(0..N as u32).collect::<Vec<_>>());
+    // What `XMemAllocDefault` gives a committed buffer: host heap memory, 64 KiB aligned.
+    let layout = std::alloc::Layout::from_size_align(3 * N * 4, 1 << 16).unwrap();
+    // SAFETY: non-zero size; freed below, after the GPU is done with it.
+    let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+    let at = mem as u64;
+    let (src, dst) = (at + (N * 4) as u64, at + (2 * N * 4) as u64);
+    let key = 0xC0FFEE;
+    h.register_own_buffer(key, at, layout.size() as u64);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(src, pool.va(0), N * 4);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, src);
+    l.set_compute_root_view(2, dst);
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 0);
+    // SAFETY: inside the allocation; read after the fence wait.
+    let out = unsafe { std::slice::from_raw_parts(dst as *const u32, N) };
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..4]);
+
+    h.release_resource(key);
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 2, "the copy and the dispatch were refused once the buffer went");
+    // SAFETY: allocated above with this layout; the GPU is idle.
+    unsafe { std::alloc::dealloc(mem, layout) };
 }
 
 /// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value

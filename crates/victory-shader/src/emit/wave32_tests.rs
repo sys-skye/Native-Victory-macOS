@@ -330,6 +330,111 @@ fn a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site() {
     );
 }
 
+#[test]
+fn a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier() {
+    // Two console waves (no lockstep). After a barrier, every lane reads LDS word 0 and branches
+    // on its first lane; the branch skips a block holding a barrier and a lane read across the
+    // halves. Both halves read that word after the same group barrier: an exchange site, unless
+    // a write that can touch the word may run in the same barrier phase, in any wave.
+    const WORD_0: [u32; 2] = [0xD834_0000, 0x0000_1614]; // ds_write_b32 v20, v22
+    const WORD_1: [u32; 2] = [0xD834_0000, 0x0000_1617]; // ds_write_b32 v23, v22
+    const OR_WORD_0: [u32; 2] = [0xD828_0000, 0x0000_1614]; // ds_or_b32 v20, v22
+    const APPEND: [u32; 2] = [0xD8F8_0000, 0x1800_0000]; // ds_append v24
+    const BARRIER: u32 = 0xBF8A_0000;
+    // `sibling`: a branch (on a scalar) to a path that runs it and ends, right after the barrier,
+    // or (`own_barrier`) right before it, the path then passing a barrier of its own first.
+    let program = |after_barrier: &[u32], in_block: &[u32], sibling: &[u32], own_barrier: bool| {
+        let mut w = vec![
+            0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+            0x7E10_0280, // v_mov_b32_e32 v8, 0
+            0x7E12_0280, // v_mov_b32_e32 v9, 0
+            0x7E28_0280, // v_mov_b32_e32 v20, 0
+            0x7E2A_0285, // v_mov_b32_e32 v21, 5
+            0x7E2C_0287, // v_mov_b32_e32 v22, 7
+            0x7E2E_0284, // v_mov_b32_e32 v23, 4
+            0xD834_0000,
+            0x0000_1514, // ds_write_b32 v20, v21
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        let mut main = vec![BARRIER];
+        main.extend(after_barrier);
+        // s_cbranch_scc0 over the block, to the s_endpgm.
+        let skip = 0xBF84_0006 + in_block.len() as u32;
+        main.extend([
+            0xD8D8_0000,
+            0x0C00_0014, // ds_read_b32 v12, v20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_050C, // v_readfirstlane_b32 s2, v12
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            skip,
+        ]);
+        main.extend(in_block);
+        main.extend([
+            BARRIER,
+            0xD760_0004,
+            0x0001_5101, // v_readlane_b32 s4, v1, 40
+            0x7E0A_0204, // v_mov_b32_e32 v5, s4
+            0xDC70_8000,
+            0x007D_0508, // global_store_dword v[8:9], v5, off
+            S_ENDPGM,
+        ]);
+        let at = if own_barrier {
+            0
+        } else {
+            1 + after_barrier.len()
+        };
+        if !sibling.is_empty() {
+            // s_cbranch_scc1 to the sibling path.
+            let to_sibling = 0xBF85_0000 + (main.len() - at) as u32;
+            let branch = [
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8103, // s_cmp_eq_u32 s3, 1
+                to_sibling,
+            ];
+            main.splice(at..at, branch);
+        }
+        w.extend(main);
+        if !sibling.is_empty() {
+            if own_barrier {
+                w.push(BARRIER);
+            }
+            w.extend(sibling);
+            w.push(S_ENDPGM);
+        }
+        lowered(&w, 128, true, true)
+    };
+    let refused = |r: Result<Lowered, crate::ShaderError>| match r {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what == lower::DIVERGENT_EXCHANGE,
+        _ => false,
+    };
+    let accepted = |r: Result<Lowered, crate::ShaderError>| r.expect("lowers").exchanges;
+    assert!(accepted(program(&[], &[], &[], false)));
+    // A write to another word in the same phase changes nothing.
+    assert!(accepted(program(&[], &WORD_1, &[], false)));
+    assert!(accepted(program(&[], &[], &WORD_1, false)));
+    // A write to the word in an earlier phase (the cullers' flag, ORed in before the barrier).
+    let earlier = [OR_WORD_0[0], OR_WORD_0[1], 0xBF8C_C07F, BARRIER];
+    assert!(accepted(program(&earlier, &[], &[], false)));
+    // In the read's phase, a write to the word between the barrier and the read, after the
+    // read, or as an atomic: the halves may read apart.
+    for in_block in [WORD_0, OR_WORD_0] {
+        assert!(refused(program(&in_block, &[], &[], false)));
+        assert!(refused(program(&[], &in_block, &[], false)));
+    }
+    // `ds_append` (its address is M0's) counts as a write to any word, but a console wave the
+    // host splits refuses it first.
+    let append = |r: Result<Lowered, crate::ShaderError>| match r {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what.starts_with("ds_append"),
+        _ => false,
+    };
+    assert!(append(program(&APPEND, &[], &[], false)));
+    // Another wave that passes the barrier on a path without the read, or a barrier instruction
+    // of its own, writes the word and ends early.
+    assert!(refused(program(&[], &[], &WORD_0, false)));
+    assert!(refused(program(&[], &[], &WORD_0, true)));
+    assert!(accepted(program(&[], &[], &WORD_1, true)));
+}
+
 /// A sum over the 64 lanes the way a compiler expands `WaveActiveSum`: all
 /// lanes on, butterflies inside each row of 16, then the rows' sums by lane.
 const REDUCE: &[u32] = &[

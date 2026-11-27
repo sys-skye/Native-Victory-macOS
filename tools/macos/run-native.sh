@@ -3,7 +3,7 @@
 # Usage: tools/macos/run-native.sh [--headless] [--seconds N] [--console series-x|series-s] <game folder or .exe>
 #   --headless            no window; frames go to an offscreen layer
 #   --seconds N, --seconds=N stop the run after N decimal seconds (default: run until you close it)
-#   --console MODEL       console model reported to the game (default: series-s on <=16 GB Macs, else series-x)
+#   --console MODEL       console model reported to the game (default: series-s on <=24 GB Macs, else series-x)
 # Extra VICTORY_* variables in your environment are passed through
 # (see docs/native-host.md, "Bring-up diagnostics").
 set -uo pipefail
@@ -34,15 +34,6 @@ decimal_seconds=$((10#$seconds))
 [[ $# -eq 1 ]] || { sed -n 2,9p "$0"; exit 2; }
 
 ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-if [[ -z "$console" ]]; then
-  # Series X reports 13.5 GiB of title memory, which exceeds Metal's working
-  # set on 16 GB Macs (#8). Default <=16 GB Macs to Series S (7.6 GiB).
-  if (( ram_gb <= 16 )); then
-    console="series-s"
-  else
-    console="series-x"
-  fi
-fi
 
 target="$1"
 if [[ -d "$target" ]]; then
@@ -57,6 +48,7 @@ exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
 cd "$(dirname "$0")/../.."
 
 source tools/macos/native-binary.sh
+[[ -n "$console" ]] || console=$(default_console "$ram_gb")
 bin=$(native_binary) || exit 2
 [[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
 
@@ -78,7 +70,8 @@ echo "Log: $log"
 pid=$!
 timer=""
 if (( decimal_seconds > 0 )); then
-  ( sleep "$decimal_seconds"; kill "$pid" 2>/dev/null ) &
+  # The marker tells run-summary.sh that the limit, not a crash, ended the run.
+  ( sleep "$decimal_seconds" && { echo "# stopped by --seconds" >> "$log"; kill "$pid" 2>/dev/null; } ) &
   timer=$!
 fi
 # A background job ignores Ctrl-C in a script, so pass it on: stop the game, its
@@ -89,6 +82,8 @@ stop_timer() {
 trap 'pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; stop_timer; wait "$pid"; echo; echo "Stopped. Log: $log"; exit 130' INT TERM
 wait "$pid"
 rc=$?
+# For run-summary.sh: a host crash (139) writes no log line of its own.
+echo "# exit code $rc" >> "$log"
 stop_timer
 
 echo

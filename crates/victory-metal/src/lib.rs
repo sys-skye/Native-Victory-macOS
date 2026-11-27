@@ -6,6 +6,8 @@
 pub use victory_backend::{backend, resources};
 #[cfg(target_os = "macos")]
 mod archive;
+#[cfg(target_os = "macos")]
+pub use archive::is_compiler_crash;
 pub mod disk;
 #[cfg(target_os = "macos")]
 pub mod gfx;

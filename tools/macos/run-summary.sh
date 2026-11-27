@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Summarise a run log: fps, shader work, dropped work, audio, GPU errors, how it ended.
 # Usage: run-summary.sh [runs/<date>/victory.log]   (default: newest log under runs/)
+#        run-summary.sh --compare <before.log> <after.log>   (a before/after table for an issue)
 #        run-summary.sh --self-test
 set -u
 export LC_ALL=C
@@ -10,7 +11,7 @@ summarise() {
   # matches a literal "x1b"), so the escape is built here: the timestamp-driven parts below read
   # nothing otherwise.
   esc=$(printf '\033')
-  sed "s/${esc}\\[[0-9;]*m//g" "$1" | awk -v file="$1" '
+  sed "s/${esc}\\[[0-9;]*m//g" "$1" | awk -v file="$1" -v mode="${2:-summary}" '
 function secs(ts,   h) { # ISO time of day to seconds; wraps at midnight
   h = substr(ts, 12, 2) * 3600 + substr(ts, 15, 2) * 60 + substr(ts, 18, 9)
   if (h < lastsec - 43200) day++
@@ -98,6 +99,13 @@ function tomsec(v,   n) {
   if (line ~ /[Ww]atchdog|[Kk]illed|[Tt]erminated|timed out|time limit/ && line !~ /BacktraceBreakpad|GPU Timeout|dstorage|command buffer failed/) {
     if (++nend <= 3) endl[nend] = substr(line, 1, 160)
   }
+  # Lines only the --compare table reads (run-native.sh writes the "# " ones).
+  if (line ~ /^# commit /) commit = $3
+  if (line ~ /^# .*console=/ && console == "") { console = line; sub(/.*console=/, "", console) }
+  if (line ~ /^console  /) { console = line; sub(/^console +/, "", console) }
+  if (line ~ /^# exit code /) exitcode = $4
+  if (line ~ /^# stopped by --seconds/) timedout = 1
+  if (line ~ /the world.s first frame/ && world == "" && match(line, /frame=[0-9]+/)) world = substr(line, RSTART + 6, RLENGTH - 6)
   if (line ~ /profile at [0-9.]+s:/) { np = 0; prof = line }
   else if (line ~ /[ ]profile .* calls [0-9]+ total/) { np++; pl[np] = line }
 }
@@ -109,13 +117,49 @@ function top(arr, n, outn, idx,   i, j, best, bi, used) { # selection sort of ar
   }
   return i - 1
 }
+function emit(kind, key, value) { gsub(/\t/, " ", key); printf "%s\t%s\t%s\n", kind, key, value }
+function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, one per line
+  emit("row", "commit", commit == "" ? "-" : commit)
+  emit("row", "console", console == "" ? "-" : console)
+  emit("row", "run length (s)", sprintf("%.1f", tlast - t0))
+  emit("row", "last frame", curframe + 0)
+  # fps of each 64-frame window: consecutive frame counters, as the summary reads them.
+  nw = 0
+  for (i = 2; i <= n; i++) if (ft[fr[i]] > ft[fr[i - 1]]) win[++nw] = (fr[i] - fr[i - 1]) / (ft[fr[i]] - ft[fr[i - 1]])
+  if (nw) {
+    v = win[nw]
+    for (i = 2; i <= nw; i++) { w = win[i]; for (k = i - 1; k >= 1 && win[k] > w; k--) win[k + 1] = win[k]; win[k + 1] = w }
+    # Median of an even count: the mean of the two middle windows.
+    emit("row", "fps median", sprintf("%.1f", (win[int((nw + 1) / 2)] + win[int(nw / 2) + 1]) / 2))
+    emit("row", "fps last", sprintf("%.1f", v))
+  } else { emit("row", "fps median", "-"); emit("row", "fps last", "-") }
+  emit("row", "first world frame", world == "" ? "-" : world)
+  emit("row", "first binds", nbind + 0)
+  emit("row", "prewarm shaders", pre_n + 0)
+  emit("row", "prewarm DXIL MB", pre_mb + 0)
+  u = 0; for (r in refc) { u += refc[r]; emit("cause", r, refc[r]) }
+  emit("row", "refused lines", nref + 0)
+  emit("row", "refused (unique reason+shader)", u)
+  emit("gpu", "Timeout", gk["Timeout"] + 0); emit("gpu", "OutOfMemory", gk["OutOfMemory"] + 0)
+  for (kd in gk) if (kd != "Timeout" && kd != "OutOfMemory") emit("gpu", kd, gk[kd])
+  for (d in drop) emit("drop", d, drop[d])
+  if (exc != "") { end = exc; sub(/.* at /, "", end); sub(/ .*/, "", end); end = "fault at " end }
+  else if (exitcode == 139) end = "SIGSEGV"
+  else if (timedout) end = "time limit"
+  else if (nend) end = "watchdog/kill line"
+  else if (exitcode != "") end = "exit code " exitcode
+  else end = "unknown (no exit line)"
+  emit("row", "ended", end)
+}
 END {
+  n = 0; for (f in ft) fr[++n] = f + 0
+  for (i = 2; i <= n; i++) { v = fr[i]; for (j = i - 1; j >= 1 && fr[j] > v; j--) fr[j + 1] = fr[j]; fr[j + 1] = v }
+  if (mode == "kv") { metrics(); exit }
+
   printf "== %s\n", file
   printf "lines %d, log span %.1fs, last frame %d\n\n", nlines, tlast - t0, curframe
 
   print "-- frame rate (per frame block)"
-  n = 0; for (f in ft) fr[++n] = f + 0
-  for (i = 2; i <= n; i++) { v = fr[i]; for (j = i - 1; j >= 1 && fr[j] > v; j--) fr[j + 1] = fr[j]; fr[j + 1] = v }
   if (n < 2) print "  (fewer than two frame counters)"
   step = (n > 41) ? int(n / 40) + 1 : 1
   pf = 0
@@ -188,6 +232,65 @@ END {
 }'
 }
 
+# A before/after table of two logs, joined from summarise's key/value rows. Plain text, no colour.
+compare() {
+  { summarise "$1" kv; echo "--"; summarise "$2" kv; } | awk -F'\t' -v before="$1" -v after="$2" '
+function isnum(s) { return s ~ /^-?[0-9]+(\.[0-9]+)?$/ }
+function change(b, a,   d) {
+  if (!isnum(b) || !isnum(a)) return b == a ? "same" : "changed"
+  d = a - b
+  if (d == 0) return "0"
+  return (b ~ /\./ || a ~ /\./) ? sprintf("%+.1f", d) : sprintf("%+d", d)
+}
+function get(s, k) { return ((s, k) in val) ? val[s, k] : (substr(k, 1, 3) == "row" ? "-" : 0) }
+function absd(k,   d) { d = get(2, k) - get(1, k); return d < 0 ? -d : d }
+function bysize(list, n,   i, j, t) { # largest absolute change first, then by name
+  for (i = 2; i <= n; i++) {
+    t = list[i]
+    for (j = i - 1; j >= 1 && (absd(list[j]) < absd(t) || (absd(list[j]) == absd(t) && list[j] > t)); j--) list[j + 1] = list[j]
+    list[j + 1] = t
+  }
+}
+function add(label, k) { nt++; c1[nt] = label; c2[nt] = get(1, k); c3[nt] = get(2, k); c4[nt] = change(c2[nt], c3[nt]) }
+$0 == "--" { side = 1; next }
+{ k = $1 SUBSEP $2; if (!(k in seen)) { seen[k] = 1; order[++no] = k }; val[side + 1, k] = $3 }
+END {
+  printf "== before: %s\n== after:  %s\n\n", before, after
+  nt = 0; c1[0] = "metric"; c2[0] = "before"; c3[0] = "after"; c4[0] = "change"
+  for (i = 1; i <= no; i++) {
+    split(order[i], p, SUBSEP)
+    if (p[1] == "drop") drops[++nd] = order[i]
+    else if (p[1] == "cause") causes[++nc] = order[i]
+    else if (p[1] == "gpu") add("GPU errors: " p[2], order[i])
+    else if (p[2] != "ended") add(p[2], order[i])
+  }
+  bysize(drops, nd)
+  for (i = 1; i <= nd; i++) {
+    split(drops[i], p, SUBSEP); sub(/^[a-z0-9_:]+: /, "", p[2]) # the module path, for display only
+    add("dropped: " (length(p[2]) > 60 ? substr(p[2], 1, 57) "..." : p[2]), drops[i])
+  }
+  add("ended", "row" SUBSEP "ended")
+  for (i = 0; i <= nt; i++) {
+    if (length(c1[i]) > w1) w1 = length(c1[i]); if (length(c2[i]) > w2) w2 = length(c2[i])
+    if (length(c3[i]) > w3) w3 = length(c3[i]); if (length(c4[i]) > w4) w4 = length(c4[i])
+  }
+  fmt = "%-" w1 "s  %" w2 "s  %" w3 "s  %" w4 "s\n"
+  for (i = 0; i <= nt; i++) {
+    printf fmt, c1[i], c2[i], c3[i], c4[i]
+    if (i == 0) { s = sprintf(fmt, "", "", "", ""); gsub(/ /, "-", s); print substr(s, 1, length(s) - 1) }
+  }
+
+  print "\n-- refusals by cause (unique reason+shader; code addresses as H)"
+  if (!nc) print "  none"
+  else printf "  %6s %6s %7s  %-4s  %s\n", "before", "after", "change", "", "reason"
+  bysize(causes, nc)
+  for (i = 1; i <= nc; i++) {
+    b = get(1, causes[i]); a = get(2, causes[i]); split(causes[i], p, SUBSEP)
+    printf "  %6s %6s %7s  %-4s  %s\n", b, a, change(b, a), (b == 0 ? "new" : a == 0 ? "gone" : ""), p[2]
+  }
+}'
+}
+
 self_test() {
   local f out ok=1 esc
   f=$(mktemp) || exit 1
@@ -227,7 +330,11 @@ LOG
 
 case "${1:-}" in
   --self-test) self_test; exit ;;
-  -h|--help) sed -n 2,4p "$0"; exit 0 ;;
+  -h|--help) sed -n 2,5p "$0"; exit 0 ;;
+  --compare)
+    [ $# -eq 3 ] || { echo "usage: $0 --compare <before.log> <after.log>" >&2; exit 2; }
+    for log in "$2" "$3"; do [ -f "$log" ] || { echo "not a file: $log" >&2; exit 2; }; done
+    compare "$2" "$3"; exit ;;
 esac
 log=${1:-}
 if [ -z "$log" ]; then

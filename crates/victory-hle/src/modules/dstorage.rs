@@ -179,9 +179,20 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         }
     };
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    // SAFETY: `path` is the title's NUL-terminated wide string, read above.
+    let cache = crate::host_posix::files::translate(unsafe {
+        std::slice::from_raw_parts(path, (0..).take_while(|&i| *path.add(i) != 0).count())
+    })
+    .and_then(|host| super::read_cache::open(&host));
     let file = Instance::create(
         Object::new("dstorage file", &FILE_VTABLE),
-        File { file, path: name },
+        File {
+            file,
+            path: name,
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            cache,
+        },
     );
     put(out, file)
 }
@@ -343,6 +354,18 @@ struct File {
     file: std::fs::File,
     /// As the title named it (diagnostics).
     path: String,
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    cache: Option<super::read_cache::BlockCache>,
+}
+
+impl File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if let Some(cache) = &self.cache {
+            return cache.read_at(&self.file, buf, offset);
+        }
+        read_at(&self.file, buf, offset)
+    }
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -1166,11 +1189,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> std::io::Result<()> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
-    let result = fill_at(out, request.offset, |buf, at| read_at(file, buf, at));
+    let result = fill_at(out, request.offset, |buf, at| file.read_at(buf, at));
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }

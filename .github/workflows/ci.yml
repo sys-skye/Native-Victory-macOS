@@ -23,8 +23,23 @@ jobs:
       - run: rustup toolchain install
       - name: Cargo target-directory script regressions (Bash 3.2)
         run: /bin/bash tools/macos/tests/target-directory.sh
+      - name: Default console model by RAM (Bash 3.2)
+        run: /bin/bash tools/macos/tests/console-default.sh
+      - name: verify.sh picks the host target off a Mac (Bash 3.2)
+        run: /bin/bash tools/macos/tests/verify-target.sh
+
+      - name: verify.sh fails fast without the Metal Shader Converter (Bash 3.2)
+        run: /bin/bash tools/macos/tests/verify-msc.sh
       - name: Run-log summary self-test (Bash 3.2)
         run: /bin/bash tools/macos/run-summary.sh --self-test
+      - name: Test-native converter fail-fast (Bash 3.2)
+        run: /bin/bash tools/macos/tests/msc-check.sh
+      - name: Tester report script regressions (Bash 3.2)
+        run: /bin/bash tools/macos/tests/tester-report.sh
+      - name: Run-log summary --compare (Bash 3.2)
+        run: /bin/bash tools/macos/tests/run-summary-compare.sh
+      - name: Corpus sweep comparison self-test (Bash 3.2)
+        run: /bin/bash tools/corpus/compare.sh --self-test
 
   check:
     runs-on: windows-latest

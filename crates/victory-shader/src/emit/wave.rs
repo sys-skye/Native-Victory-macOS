@@ -176,11 +176,13 @@ pub(super) fn register_only(inst: &Inst) -> bool {
     match &inst.fields {
         Fields::Valu(v) => v.dst.is_some(),
         Fields::Sop { .. } => {
-            matches!(
-                inst.name(),
-                "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64" | "s_bfm_b32" | "s_bfm_b64"
-            )
+            matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
                 || Op::salu_of(inst.name()).is_some()
+                // A constant lane set for EXEC (`simulate` follows it); other `s_bfm`s and
+                // `s_bitreplicate`s are data.
+                || ((inst.name().starts_with("s_bfm_") || inst.name() == "s_bitreplicate_b64_b32")
+                    && inst.write(Reg::S(EXEC)).is_some()
+                    && exec_constant(inst).is_some())
         }
         _ => false,
     }
@@ -203,6 +205,18 @@ pub(super) fn passthrough(inst: &Inst) -> bool {
         )
         && !inst.reads.iter().any(|(r, _)| lane_mask(r))
         && !inst.writes.iter().any(|(r, _)| lane_mask(r))
+}
+
+/// A scalar ALU step inside a section that only writes SGPRs (or SCC) and does
+/// not touch EXEC: it runs once for the wave whatever the lanes, so it is
+/// lowered as anywhere else. (`s_setreg` writes no register: still refused.)
+pub(super) fn scalar_alone(inst: &Inst) -> bool {
+    matches!(inst.fields, Fields::Sop { .. })
+        && !register_only(inst)
+        && !inst.writes.is_empty()
+        && [EXEC, EXEC + 1]
+            .iter()
+            .all(|&r| inst.read(Reg::S(r)).is_none() && inst.write(Reg::S(r)).is_none())
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -421,12 +435,11 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
             // the simulation can follow.
-            let lo = constant(inst);
-            let Some(k) = lo else {
+            let Some(k) = exec_constant(inst) else {
                 let (shapes, lane_shapes) = shapes(vec, uni, wave);
                 return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
-            exec = (if matches!(name, "s_mov_b64" | "s_bfm_b64") {
+            exec = (if matches!(name, "s_mov_b64" | "s_bfm_b64" | "s_bitreplicate_b64_b32") {
                 k
             } else {
                 (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
@@ -434,7 +447,7 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
-            let Some(k) = constant(inst) else {
+            let Some(k) = exec_constant(inst) else {
                 let (shapes, lane_shapes) = shapes(vec, uni, wave);
                 return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
@@ -769,6 +782,46 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
     }
     let (shapes, lane_shapes) = shapes(vec, uni, wave);
     Section { end, shapes, lane_shapes, why }
+}
+
+/// The constant lane set an EXEC write gives: a constant `s_mov`, an `s_bfm` of two constant
+/// counts (`((1 << S0) - 1) << S1`, RDNA2 ISA SOP2 opcodes 36 and 37, with counts of five and six
+/// bits), or an `s_bitreplicate_b64_b32` of a constant (bit `i` to bits `2i` and `2i + 1`, SOP1
+/// opcode 59). A wave32 prefix sum selects its upper sixteen lanes with `s_bfm_b32 exec_lo, 16,
+/// 16`; a wave64 one the upper row of each half with `s_bitreplicate_b64_b32 exec, 0xff00ff00`,
+/// then the upper half with `s_bfm_b64 exec, 32, 32`.
+fn exec_constant(inst: &Inst) -> Option<u64> {
+    let name = inst.name();
+    if name.starts_with("s_mov_b") {
+        return constant(inst);
+    }
+    if name == "s_bitreplicate_b64_b32" {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let x = match *src.first()? {
+            Operand::Const(c @ 128..=208) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        return Some((0..32).filter(|i| x >> i & 1 != 0).fold(0, |m, i| m | 3 << (2 * i)));
+    }
+    let bits = match name {
+        "s_bfm_b32" => 31,
+        "s_bfm_b64" => 63,
+        _ => return None,
+    };
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    let count = |o: Option<&Operand>| match *o? {
+        Operand::Const(c @ 128..=208) => crate::resource::inline(c).map(|x| u64::from(x) & bits),
+        Operand::Literal(x) => Some(u64::from(x) & bits),
+        _ => None,
+    };
+    let (width, offset) = (count(src.first())?, count(src.get(1))?);
+    let mask = if bits == 31 { u64::from(u32::MAX) } else { u64::MAX };
+    Some((((1u64 << width) - 1) << offset) & mask)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -1176,6 +1229,25 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
+    }
+
+    #[test]
+    fn s_bfm_gives_exec_its_field_of_constant_counts() {
+        let bfm = |op: u32, s0: u32, s1: u32| 0x8000_0000 | op << 23 | (EXEC as u32) << 16 | s1 << 8 | s0;
+        let k = |w: &[u32], wave64| exec_constant(&build(w, wave64).blocks[0].insts[0]);
+        // Counts are inline constants (128 + n) or literals; S0 is the width, S1 the offset.
+        assert_eq!(k(&[bfm(0x24, 128 + 16, 128 + 16)], false), Some(0xFFFF_0000));
+        assert_eq!(k(&[bfm(0x24, 128 + 8, 128 + 4)], false), Some(0x0000_0FF0));
+        // Five bits of each count in the 32-bit form: 33 & 31 = 1.
+        assert_eq!(k(&[bfm(0x24, 255, 128), 33], false), Some(1));
+        assert_eq!(k(&[bfm(0x25, 128 + 32, 128 + 32)], true), Some(0xFFFF_FFFF_0000_0000));
+        // A count in an SGPR is not a constant.
+        assert_eq!(k(&[bfm(0x24, 2, 128 + 16)], false), None);
+        // s_bitreplicate_b64_b32 exec, 0xff00ff00 (SOP1 opcode 59): the upper row of each half.
+        let rep = |s0: u8| 0xBE80_0000 | (EXEC as u32) << 16 | 59 << 8 | s0 as u32;
+        assert_eq!(k(&[rep(255), 0xFF00_FF00], true), Some(0xFFFF_0000_FFFF_0000));
+        assert_eq!(k(&[rep(128 + 5)], true), Some(0b11_0011));
+        assert_eq!(k(&[rep(2)], true), None);
     }
 
     #[test]

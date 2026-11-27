@@ -332,7 +332,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
-    (0x006, "v_mac_legacy_f32"),
+    (0x006, "v_fmac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
     (0x009, "v_mul_i32_i24"),
@@ -657,7 +657,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
-    (0x140, "v_mad_legacy_f32"),
+    (0x140, "v_fma_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
     (0x143, "v_mad_u32_u24"),
@@ -1170,6 +1170,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0bb, "image_sample_c_d_cl_o_g16"),
     (0x0e6, "image_bvh_intersect_ray"),
     (0x0e7, "image_bvh64_intersect_ray"),
+    (0x0e8, "image_sample_cd_g16"),
+    (0x0e9, "image_sample_cd_cl_g16"),
+    (0x0ea, "image_sample_c_cd_g16"),
+    (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[

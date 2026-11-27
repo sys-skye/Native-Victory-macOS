@@ -267,7 +267,11 @@ pub(crate) fn compile_compute(dev: &Dev, d: &MTLComputePipelineDescriptor, crash
     })
 }
 
-fn is_compiler_crash(error: &str) -> bool {
+/// Whether `error`, the text of a pipeline that would not compile, is Metal's compiler dying on
+/// the pipeline (its service crashed and the compile was retried, or it reported an internal
+/// error) rather than a shader or a pipeline state the host cannot run. The first kind is the
+/// pipeline's fault and worth remembering and retrying later; the second is the translation's.
+pub fn is_compiler_crash(error: &str) -> bool {
     error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
 }
 

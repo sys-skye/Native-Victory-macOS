@@ -156,7 +156,8 @@
 //!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//!   else. A program that can see a bit of a field the table gives as 0
+//!   is refused (`Lower::seen_bits`).
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -215,6 +216,8 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(test)]
+mod container_tests;
 pub mod graphics;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -288,6 +291,37 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The environment switches the translator reads while it translates, besides
+/// [`loop_limit`]'s: each one changes what a translation is, so a cache of
+/// translations must key on them too (`victory-gpu`'s does). Without that, a
+/// warm cache serves translations made without the switch, so a debug switch
+/// does nothing, and a translation made with one is served to later runs
+/// without it.
+pub const TRANSLATION_SWITCHES: &[&str] = &[
+    "VICTORY_DEBUG_PS",
+    "VICTORY_DEBUG_PS_RED",
+    "VICTORY_DEBUG_VS_PARAM",
+    "VICTORY_DEBUG_VS_POS",
+    "VICTORY_DEBUG_VS_TRI",
+    "VICTORY_NO_LOCKSTEP",
+];
+
+/// The [`TRANSLATION_SWITCHES`] that are set, as `NAME=value` lines in the
+/// list's order; empty when none is. Read once per process.
+pub fn translation_switches() -> &'static str {
+    static SET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SET.get_or_init(|| switches_from(|name| std::env::var_os(name)))
+}
+
+/// [`translation_switches`] from `get` instead of the environment. Pure, for
+/// testing.
+fn switches_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> String {
+    TRANSLATION_SWITCHES
+        .iter()
+        .filter_map(|name| get(name).map(|v| format!("{name}={}\n", v.to_string_lossy())))
+        .collect()
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -439,8 +473,10 @@ pub struct Options {
     pub zero_copy_memory: bool,
     /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
-    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being the sum of two corners
-    /// less the right-angle one, found from the first two-channel float fetch (the position).
+    /// rectangle), or when the program reads `SV_VertexID` directly its body runs for console
+    /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
+    /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
+    /// two-channel float fetch).
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
@@ -460,6 +496,10 @@ pub struct Options {
     /// it stores nothing and a count of EXEC leaves it out.
     /// Guess: that is what the console's lanes past the count do (`docs/native-host.md`).
     pub thread_counts: bool,
+    /// A pixel program's colour targets of integer formats (bit n: `SV_Target` n): their outputs
+    /// are declared uint and store the exported dwords' bits as they are. D3D12 wants a target's
+    /// output type to match its format, and the console exports integer bits in float registers.
+    pub integer_targets: u8,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -556,8 +596,14 @@ fn emit_fast(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
-    if pixel && options.uint_targets != 0 {
-        for e in outputs.iter_mut().filter(|e| e.kind == 16 && e.index < 8 && options.uint_targets >> e.index & 1 != 0) {
+    if pixel {
+        // `uint_targets` (a guessed pipeline's) or `integer_targets` (a described one's).
+        for e in outputs.iter_mut().filter(|e| {
+            e.kind == 16
+                && e.index < 8
+                && (options.uint_targets >> e.index & 1 != 0
+                    || e.comp == 9 && options.integer_targets >> e.index & 1 != 0)
+        }) {
             e.comp = 5;
         }
     }
@@ -812,6 +858,79 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_translation_switches_list_only_those_set() {
+        use super::switches_from;
+        assert_eq!(switches_from(|_| None), "");
+        let set = |name: &str| match name {
+            "VICTORY_DEBUG_PS_RED" => Some("1".into()),
+            "VICTORY_NO_LOCKSTEP" => Some("".into()),
+            "VICTORY_DEBUG_ELSEWHERE" => Some("1".into()),
+            _ => None,
+        };
+        assert_eq!(
+            switches_from(set),
+            "VICTORY_DEBUG_PS_RED=1\nVICTORY_NO_LOCKSTEP=\n"
+        );
+    }
+
+    /// Every switch the translator reads from the environment is a translation
+    /// switch (part of the cache key), or one of those that are keyed another
+    /// way or change no translation. A new environment read of a `VICTORY_`
+    /// switch in `emit` fails here until it is put in one of the two lists.
+    #[test]
+    fn every_environment_switch_the_translator_reads_is_keyed() {
+        // Keyed by `loop_limit`; a D3D12 device choice; paths of tools and
+        // test programs.
+        const NOT_TRANSLATION: &[&str] = &[
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_WARP",
+            "VICTORY_PC_DXC",
+            "VICTORY_DXIL",
+        ];
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.to_string_lossy().ends_with("_tests.rs")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/emit"),
+            &mut paths,
+        );
+        let mut read = Vec::new();
+        for path in &paths {
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                let Some(at) = line.find("env::var") else {
+                    continue;
+                };
+                let rest = &line[at..];
+                if let Some(start) = rest.find("\"VICTORY_") {
+                    let name = &rest[start + 1..];
+                    read.push(name[..name.find('"').unwrap()].to_string());
+                }
+            }
+        }
+        assert!(
+            read.iter().any(|n| n == "VICTORY_DEBUG_PS_RED"),
+            "the scan finds the reads: {read:?}"
+        );
+        for name in &read {
+            assert!(
+                TRANSLATION_SWITCHES.contains(&name.as_str())
+                    || NOT_TRANSLATION.contains(&name.as_str()),
+                "{name} is read while translating but is in neither list"
+            );
         }
     }
     use super::container::SigElement;

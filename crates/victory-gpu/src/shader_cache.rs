@@ -178,8 +178,10 @@ pub fn counts() -> (u64, u64) {
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// translation settings: the loop limit, which a diagnostics build can
+/// change at run time, and the translator's environment switches
+/// (`victory_shader::emit::TRANSLATION_SWITCHES`: `VICTORY_DEBUG_*`,
+/// `VICTORY_NO_LOCKSTEP`).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -190,18 +192,26 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let switches = victory_shader::emit::translation_switches();
+        if !switches.is_empty() {
+            tracing::warn!(
+                switches = switches.trim_end().replace('\n', " "),
+                "translation switches set: translations are cached apart from those made without them"
+            );
+        }
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, switches)
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, switches: &str) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(switches.as_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -304,6 +314,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         uint_targets: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,
+        // shortcut: this key has no options; integer targets are made on the native host only.
+        integer_targets: 0,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -709,21 +721,30 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the translation switches) makes
+    /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, "");
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, ""));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, ""));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, ""));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, ""));
+        // A debug switch's translations are not those of a run without it.
+        let with = |switches| key("0123456789abcdef", b"encoding", 1 << 20, switches);
+        assert_eq!(k, with(""));
+        assert_ne!(k, with("VICTORY_DEBUG_PS_RED=1\n"));
+        assert_ne!(
+            with("VICTORY_DEBUG_PS_RED=1\n"),
+            with("VICTORY_DEBUG_VS_TRI=1\n")
+        );
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::translation_switches()
             )
         );
         // The encoding part is this file as built.
@@ -760,6 +781,11 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
         assert_ne!(native_key(&settings()), native_key(&rect));
+        // A pixel shader's integer-target variants are entries of their own.
+        let int = |n| format!("{:?}", victory_shader::emit::Options { integer_targets: n, ..crate::native::shaders::options() });
+        assert_eq!(int(0), format!("{:?}", crate::native::shaders::options()));
+        assert_ne!(native_key(&int(0b10)), native_key(&int(0)));
+        assert_ne!(native_key(&int(0b10)), native_key(&int(0b11)));
     }
 
     /// The current build and the two used last stay; older ones, by their stamp, go. Other

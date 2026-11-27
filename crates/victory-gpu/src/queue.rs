@@ -527,21 +527,16 @@ pub(crate) fn read_bytes(at: usize, out: &mut [u8]) -> bool {
     return crate::native::safe_read(at as *const u8, out);
 }
 
-/// The plane to show on the native host: `VICTORY_PRESENT_PLANE` or the one whose first resource
-/// has the most pixels.
-#[cfg(target_os = "macos")]
-fn shown_plane(found: &[Vec<This>]) -> usize {
-    let want = std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok());
-    let areas: Vec<u64> = found
-        .iter()
-        .map(|plane| {
-            plane
-                .first()
-                .and_then(|&r| crate::resource::texture_info(r))
-                .map_or(0, |t| u64::from(t.width) * u64::from(t.height))
-        })
-        .collect();
-    pick_plane(want, &areas)
+/// The planes to show on the native host, bottom first: the one `VICTORY_PRESENT_PLANE` names, or
+/// all of them in the title's order. Guess (docs/macos.md, "Present planes"): the title lists its
+/// planes bottom first (on Series S the 1080p picture, then the 4K interface over it); their
+/// placement and alpha modes are not decoded, so each fills the window, blended by straight alpha.
+#[cfg(any(test, target_os = "macos"))]
+fn planes_shown(want: Option<usize>, planes: usize) -> Vec<usize> {
+    match want {
+        Some(w) if w < planes => vec![w],
+        _ => (0..planes).collect(),
+    }
 }
 
 /// Every plane's resources. Only the start of a plane description is
@@ -655,7 +650,7 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 
 /// The plane to show given an override and each plane's first resource
 /// area (0 when unknown): the override when in range, else the largest.
-#[cfg(any(windows, test, target_os = "macos"))]
+#[cfg(any(windows, test))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
         && w < areas.len()
@@ -774,10 +769,10 @@ extern "system" fn present(
     #[cfg(target_os = "macos")]
     {
         let found = plane_resources(planes, plane_parameters);
-        let shown = shown_plane(&found);
-        if let Some(&resource) = found.get(shown).and_then(|p| p.first()) {
-            crate::native::glue::present(this, resource);
-        }
+        let want = std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok());
+        let shown: Vec<This> =
+            planes_shown(want, found.len()).into_iter().filter_map(|i| found[i].first().copied()).collect();
+        crate::native::glue::present(this, &shown);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (planes, plane_parameters);
@@ -977,6 +972,18 @@ mod tests {
         assert_eq!(pick_plane(None, &[0, 0]), 0);
         assert_eq!(pick_plane(None, &[100, 100]), 0);
         assert_eq!(pick_plane(None, &[]), 0);
+    }
+
+    /// The native host shows every plane, bottom first, unless `VICTORY_PRESENT_PLANE` names one.
+    #[test]
+    fn every_plane_is_shown_in_order_unless_one_is_named() {
+        assert_eq!(planes_shown(None, 2), [0, 1]);
+        assert_eq!(planes_shown(Some(1), 2), [1]);
+        assert_eq!(planes_shown(Some(0), 2), [0]);
+        // An override past the planes found shows them all.
+        assert_eq!(planes_shown(Some(5), 2), [0, 1]);
+        assert_eq!(planes_shown(None, 1), [0]);
+        assert!(planes_shown(None, 0).is_empty());
     }
 
     /// Two planes 64 bytes apart (as a longer plane description would

@@ -208,7 +208,13 @@ pub(super) use {exports, exports64};
 /// Visual C++ runtimes (`vcruntime140`, `msvcp140`): the title ships those,
 /// with the C++ runtime and `__CxxFrameHandler`, and they are loaded from its folder.
 pub(super) fn serves(dll: &str) -> bool {
-    dll == "ucrtbase.dll" || dll.starts_with("api-ms-win-crt-")
+    dll == "ucrtbase.dll"
+        || dll.starts_with("api-ms-win-crt-")
+        // `vcruntime140.dll`'s memory and string functions are the ucrt's
+        // (its `memset` and `memcpy` came back as no-op stubs in a failed
+        // load, #104); a title's own DLL of that name still wins.
+        || (dll.starts_with("vcruntime140")
+            && victory_loader::native::dll::find(dll).is_none())
 }
 
 pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
@@ -278,6 +284,22 @@ mod tests {
     /// With `VICTORY_UCRT_IMPORTS` naming a `--list-imports` dry-run output,
     /// every UCRT import in it must resolve (the HLE registry's own `exit`
     /// and `abort` are served there first, not here).
+    /// `vcruntime140.dll`'s memory functions came back as no-op stubs in a
+    /// failed load (#104): no title DLL of that name is loaded in a test,
+    /// so the host serves the ucrt's implementations.
+    #[test]
+    fn vcruntime140s_memory_and_string_imports_are_served() {
+        assert!(serves("vcruntime140.dll"));
+        assert!(serves("vcruntime140_1.dll"));
+        assert!(lookup("vcruntime140.dll", "memset").is_some());
+        assert!(lookup("vcruntime140.dll", "memcpy").is_some());
+        assert!(lookup("vcruntime140.dll", "memmove").is_some());
+        assert!(lookup("vcruntime140.dll", "memcmp").is_some());
+        assert!(lookup("vcruntime140.dll", "strlen").is_some());
+        assert!(!serves("msvcp140.dll"));
+        assert!(!serves("kernel32.dll"));
+    }
+
     #[test]
     fn every_ucrt_import_of_a_dry_run_is_served() {
         let Some(list) = std::env::var_os("VICTORY_UCRT_IMPORTS") else {
@@ -303,14 +325,20 @@ mod tests {
     }
 
     #[test]
-    fn dlls_that_are_not_the_c_runtime_are_left_alone() {
+    fn only_the_ucrt_and_an_unloaded_vcruntime_are_served() {
         assert!(lookup("kernel32.dll", "strlen").is_none());
         assert!(lookup("ucrtbase.dll", "strlen").is_some());
         assert!(lookup("api-ms-win-crt-string-l1-1-0.dll", "strlen").is_some());
         assert!(lookup("ucrtbase.dll", "NoSuchFunction").is_none());
-        // The title's own C++ runtime DLLs are not ours to serve.
-        assert!(lookup("vcruntime140.dll", "memcpy").is_none());
-        assert!(lookup("vcruntime140_1.dll", "strlen").is_none());
+        // `vcruntime140.dll`'s memory and string functions are the ucrt's
+        // (its `memset` and `memcpy` came back as no-op stubs in a failed
+        // load, #104), so they are served while the title has not mapped
+        // its own DLL of that name. A bare test process has an empty
+        // loader registry, so `serves` answers yes; a title that did map
+        // its own copy would make `find` answer and the ucrt step aside.
+        assert!(lookup("vcruntime140.dll", "memcpy").is_some());
+        assert!(lookup("vcruntime140_1.dll", "strlen").is_some());
+        // `msvcp140.dll` is not the C runtime and is never ours to serve.
         assert!(lookup("msvcp140.dll", "strlen").is_none());
     }
 }

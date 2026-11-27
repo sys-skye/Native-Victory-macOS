@@ -14,11 +14,13 @@ Always start from evidence: dump what was drawn, then form one hypothesis. Keep 
 | `VICTORY_GUESS_GRAPHICS=1` | Builds Metal pipelines for draws (needed for anything to draw) |
 | `VICTORY_TRACE_TARGETS=1` | Logs per present which textures were drawn to, cleared or lost draws (`dropped`), which was presented, the work dropped since the last present by reason (`reasons=`), and each pipeline whose draws, dispatches or indirect executions were dropped (`draws dropped (no host pipeline, or an indirect execution)`, with its shaders and targets, or for a dispatch its group counts or `indirect`: 160x90 groups is a 1280x720 pass of 8x8 threads). Needed for the dumps below. |
 | `VICTORY_DUMP_TARGETS=<dir>,<seconds>[,<every>]` | Writes the 8-bit colour targets as PPM files from that second (repeating every N s): `t<n>_<second>_<address>.ppm`. The presented image is the swapchain address. HDR and 10-bit targets (DXGI 2, 10, 24, 26) are tone-mapped into `..._f<format>.ppm`, with their maximum, mean and lit fraction logged (`target dumped`), so a black pass shows in the log without opening an image. |
+| `VICTORY_TRACE_PASSES=<dir>,<skip>,<presents>` | After `<skip>` world presents, every draw, dispatch, clear and copy of the next `<presents>` frames in queue order (`PASS`: shaders, targets, views read and written, `ran` or why dropped), commands the submission could not prepare (`PASSFAIL`), uploads over GPU-written textures (`PASSUPLOAD`), and at the last present each named texture's statistics (`PASSTEX`) with a `.ppm` in `<dir>`. Walk backwards from the swapchain to the first pass that writes nothing. Details in docs/native-host.md. |
 | `VICTORY_TRACE_CONTENT=<dir>,<seconds>,<format>` | Traces only draws into targets of one format, and dumps A8/R8 textures as grey images |
 | `VICTORY_TRACE_RECORD_WRITERS=1` | Logs per present how many indirect mesh records were 0, which compute programs (ran or dropped) hold the record buffers, what they read and who writes that (are culling passes dropped?) |
 | `VICTORY_TRACE_PIPES=1` | Logs each guessed pipeline's depth, stencil and blend state |
 | `VICTORY_DUMP_DESC_DIR=<dir>` | Writes each pipeline's register image (device slot 0x1c8) to a file |
-| `VICTORY_DEBUG_PS_RED=1` | Every translated pixel shader writes red (does geometry land at all?) |
+| `VICTORY_DEBUG_PS_RED=1` | Every translated pixel shader writes red (does geometry land at all?). Like the other `VICTORY_DEBUG_*` translation switches, it is part of the shader cache key, so it works on a warm cache |
+| `VICTORY_DEBUG_PS=id` | Every translated pixel shader writes a colour from a hash of its code (which shader drew this pixel?). Read a UNORM target; details in docs/native-host.md |
 | `VICTORY_DEBUG_VS_TRI=1` | Every vertex shader draws a full-target triangle (is the pixel shader right?) |
 | `VICTORY_DEBUG_NO_DEPTH=1` | Disables the depth test |
 

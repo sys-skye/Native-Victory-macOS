@@ -28,15 +28,22 @@ cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D 
 cargo xtask policy
 ```
 
-Known flaky under load: `victory-gpu` `memory::tests::a_submission_that_missed_leaves_the_copies_at_once` (being fixed). The victory-gpu tests also crash when run as x86_64 under Rosetta, so run them on the native arm64 host (no `--target`).
+The victory-gpu tests crash when run as x86_64 under Rosetta, so run them on the native arm64 host (no `--target`).
 
 ## Running the game
 
-You need your own copy of the game. Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Headless, for agents and scripts: `--headless --seconds N`. Logs go to `runs/<date>/victory.log`. `tools/macos/run-summary.sh [log]` summarises a run log (fps per 64 frames, shader stalls and refusals, dropped work, audio, GPU errors, how it ended). Details and diagnostics are in the `run-game` and `debug-graphics` skills (`.claude/skills/`).
+You need your own copy of the game. Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Headless, for agents and scripts: `--headless --seconds N`. Logs go to `runs/<date>/victory.log`. `tools/macos/run-summary.sh [log]` summarises a run log (fps per 64 frames, shader stalls and refusals, dropped work, audio, GPU errors, how it ended). `run-summary.sh --compare <before.log> <after.log>` prints a before/after table of two runs for an issue. Details and diagnostics are in the `run-game` and `debug-graphics` skills (`.claude/skills/`).
 
 - Run one game at a time. If several agents share a machine, serialise runs with a lock: `/usr/bin/lockf -k <some>/game.lock timeout 150 nice <command>`.
 - Keep builds polite: `-j6` or fewer, under `nice`.
 - The game saves its setup choices in `~/.cache/victory/data/7952987A/storage`. Once setup has been completed, runs skip the setup screens; delete that folder to see them again.
+
+## Checking a translator change on a shader corpus
+
+A change under `crates/victory-shader` can be checked against every shader the game registers, without running it. In the tree before the change and in the tree after it: `cargo run --release -p victory-shader --example sweep -- <corpus folder> -j 4 > <outside the repo>/<name>.tsv`. Then `tools/corpus/compare.sh <before>.tsv <after>.tsv` lists the shaders newly translated, the regressions, those whose output changed and those refused for another reason (`--self-test` checks the script). No regression is the bar; explain every changed output.
+
+- The corpus is your own dump (`VICTORY_DUMP_ALL_SHADERS=1 VICTORY_DUMP_REFUSED=<folder>` on a run): game data. It and the sweep files stay outside the repo and are never committed, attached or sent anywhere; quote counts, shader hashes and refusal messages.
+- One target directory per tree, and `-j 4` or fewer for a whole corpus on a shared machine. Details: `docs/native-host.md`, "Sweeping a shader corpus".
 
 ## Where things are
 
@@ -51,6 +58,8 @@ You need your own copy of the game. Windowed, for a person: `tools/macos/run-nat
 | Setup and run scripts | `tools/macos/` |
 
 ## How to work
+
+0. If several agents share this machine or repository, read [docs/multi-agent.md](docs/multi-agent.md) first (branch naming, claiming issues, the game-run lock).
 
 Before any work, book it (details in `CONTRIBUTING.md`, "Claim it before you start"):
 

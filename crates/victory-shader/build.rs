@@ -1,19 +1,19 @@
 //! `VICTORY_SHADER_SOURCE_HASH`: what the translator is built from (this
 //! crate's sources but its `*_tests.rs` test modules, manifest and build
-//! script, the workspace's lock file and the compiler's version), for caches
-//! of translations
-//! (`victory_shader::SOURCE_HASH`).
+//! script, the lock file's entries of the packages it depends on and the
+//! compiler's version), for caches of translations
+//! (`victory_shader::SOURCE_HASH`). The rest of the lock file is left out: a
+//! dependency of another crate does not change a translation, and hashing the
+//! whole file made every such change cost every cached translation (#334).
 
 use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
 
+include!("lock.rs");
+
 fn main() {
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
-    let mut files = vec![
-        dir.join("Cargo.toml"),
-        dir.join("build.rs"),
-        dir.join("../../Cargo.lock"),
-    ];
+    let mut files = vec![dir.join("Cargo.toml"), dir.join("build.rs"), dir.join("lock.rs")];
     sources(&dir.join("src"), &mut files);
     files.sort();
     // SipHash with fixed keys: stable for one compiler, whose version is
@@ -31,7 +31,11 @@ fn main() {
         h.write(name.as_bytes());
         h.write(&std::fs::read(f).unwrap_or_default());
     }
-    for watched in ["src", "Cargo.toml", "build.rs", "../../Cargo.lock"] {
+    let lock = std::fs::read_to_string(dir.join("../../Cargo.lock")).unwrap_or_default();
+    for entry in dependency_entries(&lock, "victory-shader") {
+        h.write(entry.as_bytes());
+    }
+    for watched in ["src", "Cargo.toml", "build.rs", "lock.rs", "../../Cargo.lock"] {
         println!("cargo:rerun-if-changed={watched}");
     }
     println!(

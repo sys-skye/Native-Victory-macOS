@@ -68,6 +68,12 @@ pub enum Format {
     Abgr4Unorm,
     /// BC6H of signed half floats (DXGI `BC6H_SF16`).
     Bc6hSigned,
+    Rgba16Uint,
+    Rgba8Snorm,
+    Rg16Snorm,
+    R16Snorm,
+    R8Snorm,
+    Rgb10a2Uint,
 }
 
 impl Format {
@@ -77,13 +83,13 @@ impl Format {
         match self {
             Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Bgra8UnormSrgb | R32Float | D32Float => (1, 4),
             Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
-            Rg16Uint => (1, 4),
+            Rg16Uint | Rgba8Snorm | Rg16Snorm | Rgb10a2Uint => (1, 4),
             D32FloatS8 => (1, 8),
-            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
+            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint | Rgba16Uint => (1, 8),
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc6hSigned | Bc7 | Bc7Srgb => (4, 16),
-            R8Unorm | A8Unorm | R8Uint => (1, 1),
-            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
+            R8Unorm | A8Unorm | R8Uint | R8Snorm => (1, 1),
+            R16Unorm | R16Float | R16Uint | R16Snorm | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),
         }
     }
@@ -91,7 +97,19 @@ impl Format {
     /// An integer format: its render targets cannot blend.
     pub fn is_integer(self) -> bool {
         use Format::*;
-        matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
+        matches!(
+            self,
+            Rgba8Uint
+                | R32Uint
+                | R8Uint
+                | Rgba32Uint
+                | Rg32Uint
+                | Rg16Uint
+                | Rg8Uint
+                | R16Uint
+                | Rgba16Uint
+                | Rgb10a2Uint
+        )
     }
 
     /// A depth or depth-stencil format.
@@ -197,6 +215,16 @@ pub enum Compare {
     Always,
 }
 
+/// An allocation a heap keeps resident ([`ResourceBackend::heap_allocations`]): its identity (for
+/// counting it once over several heaps), bytes, latest use of an entry naming it, and kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapAllocation {
+    pub id: usize,
+    pub bytes: u64,
+    pub latest: u32,
+    pub texture: bool,
+}
+
 /// Descriptor heaps, textures and samplers. Heap entries are the converter's 24-byte
 /// `IRDescriptorTableEntry`; a root descriptor table is the address of its first entry
 /// (`heap_address`), pushed into `RootArgs` like a root view. Resources a heap entry names are kept
@@ -218,12 +246,41 @@ pub trait ResourceBackend: ComputeBackend {
         title: *const u8,
         size: u32,
     );
+    /// A buffer SRV or UAV that also carries a typed `texture_buffer` view (`format`) when the
+    /// backend supports one, so both raw/structured accesses (`gpuVA`) and typed `bufferLoad` /
+    /// `bufferStore` (`textureViewID`) work through the same heap entry. Returns whether a typed
+    /// `texture_buffer` view now lives in `index` (`false` when falling back to `write_buffer`).
+    #[allow(clippy::too_many_arguments)]
+    fn write_typed_buffer(
+        &self,
+        heap: &Self::Heap,
+        index: usize,
+        buffer: &Self::Buffer,
+        title: *const u8,
+        size: u32,
+        format: Format,
+        writable: bool,
+    ) -> bool {
+        let _ = (format, writable);
+        self.write_buffer(heap, index, buffer, title, size);
+        false
+    }
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);
     /// Entry `index` names nothing any more: it reads as one never written, and what it kept
     /// alive and resident is let go.
     fn clear_entry(&self, heap: &Self::Heap, index: usize);
+    /// Entries in `heap` that currently hold a live `texture_buffer` view.
+    fn heap_typed_views(&self, _heap: &Self::Heap) -> usize {
+        0
+    }
+    /// Diagnostics: the distinct allocations `heap` keeps resident, each with its bytes, the latest
+    /// use of the entries naming it (`last_used[index]`, a frame number; 0: never) and whether it
+    /// is a texture. `None` where the backend keeps nothing resident for its heaps.
+    fn heap_allocations(&self, _heap: &Self::Heap, _last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
+        None
+    }
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(
@@ -538,6 +595,10 @@ pub enum DrawCall {
     },
     /// `DispatchMesh` of a mesh pipeline: thread groups in x, y, z.
     Mesh { groups: [u32; 3] },
+    /// `ExecuteIndirect` of a rectangle list (indirect only): the record (`D3D12_DRAW_ARGUMENTS`)
+    /// counts the vertices of three-corner rectangles, and is drawn as a direct rectangle list is,
+    /// one four-vertex strip instance a rectangle (`victory_shader::emit::Options::rect_list`).
+    Rects,
 }
 
 /// A viewport as `RSSetViewports` takes it: top left, size, depth range.
@@ -663,6 +724,44 @@ pub struct PassSubmission<'a, B: GraphicsBackend + ?Sized> {
     pub signals: &'a [(&'a B::Fence, u64)],
 }
 
+/// Why a submission was not made as submitted, and what of it did not run: the caller pays for
+/// the lost work (a dropped pass's value writes never happen, and a queue waiting on one has no
+/// other way to go on).
+#[derive(Debug)]
+pub struct SubmitFailure {
+    /// The command buffer committed without the passes in `refused`. `false` when nothing was
+    /// committed at all, so every pass of the submission was lost.
+    pub committed: bool,
+    /// Indices into `PassSubmission::passes` dropped from a committed command buffer (a pass the
+    /// backend could not encode).
+    pub refused: Vec<usize>,
+    /// What failed: the first refusal's message, or why nothing was committed.
+    pub error: String,
+}
+
+impl SubmitFailure {
+    /// Nothing was committed: every pass of the submission was lost.
+    pub fn uncommitted(error: impl Into<String>) -> Self {
+        Self {
+            committed: false,
+            refused: Vec::new(),
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.committed {
+            write!(f, "passes {:?} were refused: {}", self.refused, self.error)
+        } else {
+            write!(f, "nothing was committed: {}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for SubmitFailure {}
+
 pub trait GraphicsBackend: ResourceBackend {
     type RenderPipeline;
 
@@ -684,7 +783,9 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         queue: &Self::Queue,
         work: &PassSubmission<'_, Self>,
-    ) -> Result<(), String>;
+    ) -> Result<(), SubmitFailure>;
+    /// Names a render pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_render_pipeline(&self, _p: &Self::RenderPipeline, _name: &str) {}
 }
 
 /// Showing a texture of the title in a window.
@@ -697,16 +798,17 @@ pub trait PresentBackend: GraphicsBackend {
     fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
     /// Attempts presentation without blocking drawable acquisition. False keeps the FIFO head
     /// pending; callers must retry before submitting later work on this queue.
-    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, source: &Self::Texture) -> Result<bool, String> {
-        self.present(queue, surface, source).map(|()| true)
+    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, sources: &[&Self::Texture]) -> Result<bool, String> {
+        self.present(queue, surface, sources).map(|()| true)
     }
 
-    /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
-    /// presents it after the work already submitted to `queue`. Never waits for the GPU.
+    /// Draws `sources` over the surface's next drawable (each scaled to it, whatever the formats)
+    /// and presents it after the work already submitted to `queue`: the first as it is, each
+    /// later one blended over by its alpha (straight). Never waits for the GPU.
     fn present(
         &self,
         queue: &Self::Queue,
         surface: &Self::Surface,
-        source: &Self::Texture,
+        sources: &[&Self::Texture],
     ) -> Result<(), String>;
 }

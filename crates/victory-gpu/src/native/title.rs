@@ -113,7 +113,10 @@ impl<B: GraphicsBackend> TitleList<B> {
     }
 
     /// The segments a submission runs, in order (copies: the title may reset and re-record).
-    pub fn segments(&self) -> Vec<(NativeList<B>, Vec<Wait>)> {
+    /// The copies clone `Rc`s that the title's recording threads clone and drop under the title's
+    /// lock, and `Rc` counts are not atomic: `_locked` is there so that only a holder of the title
+    /// (inside `glue::with_title`) can take them.
+    pub fn segments<P: PresentBackend>(&self, _locked: &Title<P>) -> Vec<(NativeList<B>, Vec<Wait>)> {
         self.done
             .iter()
             .map(|(l, w)| (l.snapshot(), w.clone()))
@@ -188,7 +191,7 @@ pub struct Guessed<B: GraphicsBackend> {
 /// An operation that must keep its place between list submissions in the held FIFO.
 enum QueuedAction<B: PresentBackend> {
     Signal(Rc<B::Queue>, Rc<B::Fence>, u64),
-    Present(Rc<B::Queue>, Rc<B::Surface>, Rc<B::Texture>),
+    Present(Rc<B::Queue>, Rc<B::Surface>, Vec<Rc<B::Texture>>),
 }
 
 pub struct Title<B: PresentBackend> {
@@ -208,11 +211,16 @@ pub struct Title<B: PresentBackend> {
     pub compile_wait: std::time::Duration,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
+    /// The byte budget of host texture copies ([`Self::keep_to_budget`]).
+    pub(super) budget: super::textures::Budget,
     /// GPU-written textures waiting to be copied back into title memory.
     pub(super) back: super::textures::Back<B>,
     /// Sampled textures realized but not yet uploaded once.
     pub(super) unloaded: std::collections::HashSet<usize>,
-    /// Keys of textures currently in the fast per-submission probe set (`hot > 0`).
+    /// Submission sync serial advanced by `Title::sync_jobs_within`, used to expire `hot_keys`
+    /// after `HOT` submissions even when a round-robin probe budget cannot visit all of them.
+    pub(super) sync_serial: u64,
+    /// Keys of textures currently in the fast per-submission probe set (`hot_until > 0`).
     pub(super) hot_keys: Vec<usize>,
     /// Round-robin cursor into `hot_keys` when the time budget ends before all are probed.
     pub(super) hot_cursor: usize,
@@ -226,10 +234,23 @@ pub struct Title<B: PresentBackend> {
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     /// Textures placed in title memory (no resource object), by address: their key and pool.
-    pub(super) placed: HashMap<u64, (usize, usize)>,
+    pub(super) placed: std::collections::BTreeMap<u64, (usize, usize)>,
+    /// The largest placed texture's size: how far before an address a placed texture over it can
+    /// start ([`Self::texture_placed`]).
+    pub(super) placed_reach: u64,
+    /// Title textures whose host texture is another's, laid out identically over the same memory
+    /// ([`Self::realize`]): that other key (in `textures`), and their own description.
+    pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
+    /// Keys in `textures` by the title memory they start at.
+    pub(super) at_memory: HashMap<usize, Vec<usize>>,
+    /// Placed copies another placement covered, given up once nothing uses them
+    /// ([`Self::give_up_covered`]).
+    pub(super) covered: std::collections::HashSet<usize>,
+    /// Resource objects whose host texture a placed view names too: its address and key.
+    pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
-    held: Held<Rc<NativeList<B>>>,
+    pub(super) held: Held<Rc<NativeList<B>>>,
     /// Operations held behind work, indexed by the token in a FIFO Signal item.
     actions: HashMap<usize, QueuedAction<B>>,
     next_action: usize,
@@ -253,8 +274,10 @@ impl<B: PresentBackend> Title<B> {
             compile_wait: std::time::Duration::MAX,
             libraries: Default::default(),
             textures: Default::default(),
+            budget: Default::default(),
             back: Default::default(),
             unloaded: std::collections::HashSet::new(),
+            sync_serial: 0,
             hot_keys: Vec::new(),
             hot_cursor: 0,
             blank_keys: Vec::new(),
@@ -262,7 +285,12 @@ impl<B: PresentBackend> Title<B> {
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
-            placed: HashMap::new(),
+            placed: Default::default(),
+            shared: HashMap::new(),
+            placed_reach: 0,
+            copies_of: HashMap::new(),
+            at_memory: HashMap::new(),
+            covered: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
@@ -347,8 +375,10 @@ impl<B: PresentBackend> Title<B> {
     /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
+        let named = self.keep_named(segments.iter().map(|(l, _)| l));
         self.sync_dirty();
         self.submit_synced(queue, segments);
+        self.let_named_go(named);
     }
 
     /// [`Self::submit`] once the textures are in step with title memory ([`Self::sync_dirty`]).
@@ -444,8 +474,9 @@ impl<B: PresentBackend> Title<B> {
                         tracing::warn!(error = %e, "a held fence signal was not queued");
                     }
                 }
-                Some(QueuedAction::Present(queue, surface, texture)) => {
-                    match host.backend.try_present(queue, surface, texture) {
+                Some(QueuedAction::Present(queue, surface, planes)) => {
+                    let planes: Vec<&B::Texture> = planes.iter().map(|t| &**t).collect();
+                    match host.backend.try_present(queue, surface, &planes) {
                         Ok(false) => return false,
                         Ok(true) => {}
                         Err(e) => tracing::warn!(error = %e, "a held present was not queued"),
@@ -519,17 +550,19 @@ impl<B: PresentBackend> Title<B> {
         Ok(())
     }
 
-    /// `PresentX`: show title texture `key` after all earlier work on `queue`, including held
-    /// work. `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
-    /// `Ok(false)` when there is no surface or the title has no such texture.
-    pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
+    /// `PresentX`: show title textures `keys` after all earlier work on `queue`, including held
+    /// work: the first under the others, each later one blended over by its alpha.
+    /// `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
+    /// `Ok(false)` when there is no surface or the title has none of these textures.
+    pub fn present(&mut self, queue: usize, keys: &[usize]) -> Result<bool, String> {
         self.pump();
         if self.surface.is_none() {
             return Ok(false);
         }
-        let Some(tex) = self.texture_of(key) else {
+        let tex: Vec<_> = keys.iter().filter_map(|&k| self.texture_of(k)).collect();
+        if tex.is_empty() {
             return Ok(false);
-        };
+        }
         let q = self.queue(queue)?;
         if let Some(surface) = &self.surface {
             let n = self.next_action;

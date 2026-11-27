@@ -813,3 +813,85 @@ fn pixel_and_other_width_mask_number_negatives_stay_refused() {
         "{err_b64_in_w32:?}"
     );
 }
+
+/// Two nested loops of that shape, each with an SGPR for the lanes still looping and one for
+/// the lanes that broke out.
+const NESTED: &[u32] = &[
+    0x7DA8_00A8, // v_cmpx_gt_u32 40, v0 (lanes 40 and up leave first)
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec (the outer loop's lanes still looping)
+    0xBE8E_0480, // s_mov_b64 s[14:15], 0 (the outer loop's lanes that broke out)
+    0x7E08_0300, // v_mov_b32 v4, v0
+    0x7DA4_0880, // O: v_cmpx_eq_u32 0, v4
+    0x8A8A_7E0A, // s_andn2_b64 s[10:11], s[10:11], exec
+    0xBF84_001E, // s_cbranch_scc0 OEND
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xBE84_047E, // s_mov_b64 s[4:5], exec (the inner loop's lanes still looping)
+    0xBE86_047E, // s_mov_b64 s[6:7], exec (EXEC to restore)
+    0xBE88_0480, // s_mov_b64 s[8:9], 0 (the inner loop's lanes that broke out)
+    0x7E06_0304, // v_mov_b32 v3, v4
+    0x7DA4_0680, // L: v_cmpx_eq_u32 0, v3 (the lanes whose count ran out leave)
+    0x8A84_7E04, // s_andn2_b64 s[4:5], s[4:5], exec (SCC: does any lane loop on?)
+    0xBF84_000A, // s_cbranch_scc0 END
+    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x4A06_06C1, // v_add_nc_u32 v3, -1, v3
+    0xD4C2_000C, // v_cmp_eq_u32 s[12:13], 5, v3
+    0x0202_0685,
+    0xBE8C_080C, // s_not_b64 s[12:13], s[12:13] (the lanes not at 5 break out)
+    0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+    0x8888_7E08, // s_or_b64 s[8:9], s[8:9], exec
+    0xBE84_3A04, // s_andn2_wrexec_b64 s[4:5], s[4:5]
+    0xBF85_FFF3, // s_cbranch_scc1 L
+    0xBEFE_0406, // END: s_mov_b64 exec, s[6:7]
+    0x87FE_7E08, // s_and_b64 exec, s[8:9], exec
+    0x4A04_0487, // v_add_nc_u32 v2, 7, v2 (in the lanes that broke out)
+    0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+    0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+    0xD4C2_0010, // v_cmp_eq_u32 s[16:17], 9, v4
+    0x0202_0889,
+    0xBE90_0810, // s_not_b64 s[16:17], s[16:17]
+    0x87FE_7E10, // s_and_b64 exec, s[16:17], exec
+    0x888E_7E0E, // s_or_b64 s[14:15], s[14:15], exec
+    0xBE8A_3A0A, // s_andn2_wrexec_b64 s[10:11], s[10:11]
+    0xBF85_FFDF, // s_cbranch_scc1 O
+    0xBEFE_04C1, // OEND: s_mov_b64 exec, -1
+];
+
+/// A structurized loop keeps the lanes still looping in an SGPR beside EXEC: a copy of EXEC
+/// before the loop, `s_andn2_b64 s, s, exec` for the exit test at the head (its SCC: does any
+/// lane loop on?), and `s_andn2_wrexec_b64 s, s` at the back edge, which writes the same result
+/// to both. At the head that SGPR is EXEC itself, so a ballot there gives it. Where the arrivals
+/// at the head were unprovable (an outer loop with lanes that broke out), it was refused as "a
+/// lane mask holding lanes elsewhere read as data: a program input": a world lighting compute
+/// program of #258.
+#[test]
+fn a_loop_register_that_is_exec_on_every_edge_is_exec_at_the_head() {
+    // The inner loop's register is EXEC where its head joins it, a mask a ballot there gives.
+    let words: Vec<u32> = [PRELUDE, NESTED, EPILOGUE].concat();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let joins: Vec<_> = p.blocks.iter().flat_map(|b| &b.phis).filter(|ph| ph.reg == ir::Reg::S(4)).collect();
+    assert!(!joins.is_empty());
+    assert!(joins.iter().all(|ph| st.active.contains(&ph.value)), "s4 at its loop's head is not EXEC");
+    for host32 in [false, true] {
+        let r = lowered(NESTED, 64, host32);
+        assert!(r.is_ok(), "{host32}: {:?}", r.err());
+    }
+}
+
+/// The same loops with the inner back edge's `s_andn2_wrexec_b64 s[4:5], s[4:5]` made
+/// `s_andn2_b64 s[4:5], s[4:5], exec`: there `s4` is no longer the EXEC that edge brings, so its
+/// join at the head is not EXEC's mask.
+#[test]
+fn a_loop_register_that_is_not_exec_on_one_edge_is_not_exec_at_the_head() {
+    let body: Vec<u32> = NESTED.iter().map(|&w| if w == 0xBE84_3A04 { 0x8A84_7E04 } else { w }).collect();
+    assert_ne!(body, NESTED);
+    let words: Vec<u32> = [PRELUDE, &body, EPILOGUE].concat();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let joins: Vec<_> = p.blocks.iter().flat_map(|b| &b.phis).filter(|ph| ph.reg == ir::Reg::S(4)).collect();
+    assert!(!joins.is_empty());
+    assert!(joins.iter().all(|ph| !st.active.contains(&ph.value)), "s4 taken as EXEC at its loop's head");
+}

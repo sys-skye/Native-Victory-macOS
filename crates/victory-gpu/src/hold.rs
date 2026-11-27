@@ -225,6 +225,14 @@ impl<S> Held<S> {
         self.queues.is_empty()
     }
 
+    /// The segments held, on every queue.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = &S> {
+        self.queues.iter().flat_map(|(_, items)| items.iter()).filter_map(|(item, ..)| match item {
+            Item::Segment(s, _) => Some(s),
+            _ => None,
+        })
+    }
+
     /// Whether `queue` holds anything.
     pub(crate) fn holds_work(&self, queue: usize) -> bool {
         self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())

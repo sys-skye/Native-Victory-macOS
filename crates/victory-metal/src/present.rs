@@ -40,6 +40,19 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+/// Whether the window showing the surfaces is minimised or wholly covered (its event loop says,
+/// [`set_window_hidden`]). macOS then hands out few drawables or none, and a present that waited
+/// for one held the title's presents back until the title stopped (#333). A hidden window's
+/// presents count as shown with nothing drawn, as a headless run's do.
+static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the presents whether their window can be seen (see [`HIDDEN`]).
+pub fn set_window_hidden(hidden: bool) {
+    if HIDDEN.swap(hidden, std::sync::atomic::Ordering::Relaxed) != hidden {
+        tracing::info!(hidden, "present: the window's visibility changed");
+    }
+}
+
 // CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
 // worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
 struct AcquisitionLayer(Retained<CAMetalLayer>);
@@ -61,8 +74,8 @@ pub struct Surface {
     drawables: std::sync::mpsc::Receiver<Option<Drawable>>,
     acquiring: std::cell::Cell<bool>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    /// The copy pipeline for each drawable format seen.
-    pipelines: RefCell<HashMap<usize, Pipeline>>,
+    /// The copy pipeline for each drawable format seen, and whether it blends.
+    pipelines: RefCell<HashMap<(usize, bool), Pipeline>>,
     /// The texture of the last drawable presented, readable when the layer is not frame-buffer
     /// only (the tests read their pixels from it).
     last: RefCell<Option<Retained<ProtocolObject<dyn MTLTexture>>>>,
@@ -218,8 +231,9 @@ fn pipeline(
     m: &Metal,
     surface: &Surface,
     format: MTLPixelFormat,
+    blend: bool,
 ) -> Result<Pipeline, String> {
-    if let Some(p) = surface.pipelines.borrow().get(&format.0) {
+    if let Some(p) = surface.pipelines.borrow().get(&(format.0, blend)) {
         return Ok(p.clone());
     }
     let d = MTLRenderPipelineDescriptor::new();
@@ -232,12 +246,21 @@ fn pipeline(
             .as_deref(),
     );
     // SAFETY: colour attachment 0 always exists.
-    unsafe { d.colorAttachments().objectAtIndexedSubscript(0) }.setPixelFormat(format);
+    let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(0) };
+    a.setPixelFormat(format);
+    if blend {
+        // Straight alpha: an overlay plane over the planes under it.
+        a.setBlendingEnabled(true);
+        a.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+        a.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        a.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+        a.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    }
     let p = m
         .dev
         .newRenderPipelineStateWithDescriptor_error(&d)
         .map_err(|e| e.localizedDescription().to_string())?;
-    surface.pipelines.borrow_mut().insert(format.0, p.clone());
+    surface.pipelines.borrow_mut().insert((format.0, blend), p.clone());
     Ok(p)
 }
 
@@ -284,13 +307,13 @@ impl PresentBackend for Metal {
         &self,
         queue: &Queue,
         surface: &Surface,
-        source: &Texture,
+        sources: &[&Texture],
     ) -> Result<(), String> {
         // Standalone backend callers may block, but an unavailable drawable must not keep
         // them here forever. The title pump uses try_present instead and never sleeps.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if self.try_present(queue, surface, source)? {
+            if self.try_present(queue, surface, sources)? {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -300,7 +323,16 @@ impl PresentBackend for Metal {
         }
     }
 
-    fn try_present(&self, queue: &Queue, surface: &Surface, source: &Texture) -> Result<bool, String> {
+    fn try_present(&self, queue: &Queue, surface: &Surface, sources: &[&Texture]) -> Result<bool, String> {
+        let Some(first) = sources.first() else { return Err("nothing to present".into()) };
+        // A hidden window shows nothing; a drawable asked for already is still taken below.
+        if HIDDEN.load(std::sync::atomic::Ordering::Relaxed) && !surface.acquiring.get() {
+            surface.frames.set(surface.frames.get() + 1);
+            if counting_green() {
+                surface.green.borrow_mut().presented();
+            }
+            return Ok(true);
+        }
         if !surface.acquiring.replace(true) {
             surface.acquisition.send(()).map_err(|_| "drawable worker stopped")?;
         }
@@ -316,7 +348,7 @@ impl PresentBackend for Metal {
             let target = drawable.texture();
             // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
             // swap chain holds display values).
-            let src = source.view_without_srgb(self);
+            let src = first.view_without_srgb(self);
             let pass = MTLRenderPassDescriptor::new();
             // SAFETY: colour attachment 0 always exists.
             let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
@@ -327,14 +359,17 @@ impl PresentBackend for Metal {
             let e = cb
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or("no render encoder")?;
-            let state = pipeline(self, surface, target.pixelFormat())?;
-            e.setRenderPipelineState(&state);
-            // SAFETY: slot 0 of the fragment stage takes the source texture.
-            unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
-            // SAFETY: three vertices, no buffers.
-            unsafe {
-                e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
-            };
+            for (i, source) in sources.iter().enumerate() {
+                let view = if i == 0 { src.clone() } else { source.view_without_srgb(self) };
+                let state = pipeline(self, surface, target.pixelFormat(), i > 0)?;
+                e.setRenderPipelineState(&state);
+                // SAFETY: slot 0 of the fragment stage takes the source texture.
+                unsafe { e.setFragmentTexture_atIndex(Some(&view), 0) };
+                // SAFETY: three vertices, no buffers.
+                unsafe {
+                    e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+                };
+            }
             e.endEncoding();
             let probe = if counting_green() { probe_pixels(self, &cb, &src) } else { None };
             cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
@@ -401,8 +436,64 @@ mod tests {
         assert_eq!(green_pixels(&bgra, true), (true, 9));
     }
 
+    /// Two planes: the first (a smaller picture) scaled to the drawable, the second blended over
+    /// it by its alpha: clear where alpha is 0, its own colour where alpha is 1.
+    #[test]
+    fn a_second_plane_is_blended_over_the_first_by_its_alpha() {
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::backend::Submission;
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(4, 4);
+        let surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let picture = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        metal.upload_texture(&picture, 0, 0, &[255, 0, 0, 255].repeat(4), 8, 16);
+        // The overlay: transparent on the left half, opaque blue on the right half.
+        let overlay = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        let row: Vec<u8> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 255, 255], [0, 0, 255, 255]].concat();
+        metal.upload_texture(&overlay, 0, 0, &row.repeat(4), 16, 64);
+        metal.present(&queue, &surface, &[&picture, &overlay]).unwrap();
+        let fence = metal.create_fence(0).unwrap();
+        metal.submit(&queue, &Submission { waits: &[], dispatches: &[], signals: &[(&fence, 1)] }).unwrap();
+        assert!(metal.wait(&fence, 1, 5000));
+        let (w, h, bgra) = surface.read_last().unwrap();
+        assert_eq!((w, h), (4, 4));
+        for y in 0..4 {
+            let px = |x: usize| &bgra[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+            assert_eq!(px(0), [0, 0, 255, 255], "red picture at x 0, row {y}");
+            assert_eq!(px(3), [255, 0, 0, 255], "blue overlay at x 3, row {y}");
+        }
+    }
+
+    /// [`HIDDEN`] is the process's: the tests that present take turns.
+    static PRESENTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_hidden_window_presents_without_a_drawable() {
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(4, 4);
+        let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        // A worker that never hands out a drawable, as macOS does for a minimised window.
+        let (requests, _requests_rx) = std::sync::mpsc::channel();
+        let (_results, drawables) = std::sync::mpsc::channel();
+        surface.acquisition = requests;
+        surface.drawables = drawables;
+        set_window_hidden(true);
+        let shown = (0..3).map(|_| metal.try_present(&queue, &surface, &[&source])).collect::<Vec<_>>();
+        set_window_hidden(false);
+        assert_eq!(shown, vec![Ok(true), Ok(true), Ok(true)]);
+        assert_eq!(surface.frames(), 3);
+        // Seen again: the present waits for a drawable as before.
+        assert_eq!(metal.try_present(&queue, &surface, &[&source]), Ok(false));
+        assert_eq!(surface.frames(), 3);
+    }
+
     #[test]
     fn blocking_present_times_out_when_acquisition_never_returns() {
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
         let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
@@ -419,7 +510,7 @@ mod tests {
             drop(results);
         });
         let started = std::time::Instant::now();
-        assert_eq!(metal.present(&queue, &surface, &source).unwrap_err(), "timed out waiting for a drawable");
+        assert_eq!(metal.present(&queue, &surface, &[&source]).unwrap_err(), "timed out waiting for a drawable");
         assert!(started.elapsed() >= std::time::Duration::from_secs(2));
         assert_eq!(surface.frames(), 0);
     }

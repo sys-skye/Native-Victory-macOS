@@ -12,8 +12,12 @@ pub mod emit;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
+#[cfg(test)]
+mod ir_tests;
 pub mod native;
 pub mod range;
+#[cfg(test)]
+mod range_tests;
 pub mod resource;
 pub mod structure;
 
@@ -24,7 +28,8 @@ pub use native::{
 };
 
 /// A hash of what this translator is built from: its sources, manifest and
-/// build script, the workspace's lock file and the compiler's version. Caches
+/// build script, the lock file's entries of the packages it depends on and the
+/// compiler's version. Caches
 /// of translations key on it, so a changed translator never serves an old
 /// translation.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
@@ -44,6 +49,9 @@ pub enum ShaderError {
     #[error("FSPX metadata resource of root type {root}: {what}")]
     FspxRoot { root: u8, what: &'static str },
 }
+
+#[cfg(test)]
+mod lock_tests;
 
 #[cfg(test)]
 mod tests {

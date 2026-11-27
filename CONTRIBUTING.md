@@ -24,6 +24,12 @@ rustup run 1.98.1 cargo test --target x86_64-apple-darwin -p victory-hle -p vict
 rustup run 1.98.1 cargo test -p victory-shader -p victory-hle
 ```
 
+The native host tests translate shaders and need Apple's Metal Shader Converter; this wrapper fails fast with the install steps when it is missing, instead of letting the tests panic inside the converter's `dlopen` (#379):
+
+```bash
+tools/macos/test-native.sh -p victory-hle -p victory -p victory-gpu -p xtask
+```
+
 The CI gate is a strict clippy run for Windows, which you can run on a Mac:
 
 ```bash

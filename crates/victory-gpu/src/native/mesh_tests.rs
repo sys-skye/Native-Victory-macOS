@@ -39,14 +39,14 @@ pub(super) const TRIANGLE: &[u32] = &[
 ];
 
 /// Writes (1.0, 0.5, 0.5, 1.0) to mrt0.
-const RED: &[u32] = &[
+pub(super) const RED: &[u32] = &[
     0x7E00_02F2, // v_mov_b32 v0, 1.0
     0x7E02_02F0, // v_mov_b32 v1, 0.5
     0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
     0xBF81_0000, // s_endpgm
 ];
 
-fn translate(stage: HwStage, words: &[u32]) -> HostShader {
+pub(super) fn translate(stage: HwStage, words: &[u32]) -> HostShader {
     let mut meta = [0; 0x10];
     meta[12] = 0x40;
     translate_with(stage, words, &meta)
@@ -162,6 +162,28 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
             .unwrap();
         super::run(&t.host, &[&list]);
         assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {i}: {:?}", pixels(&t, &color));
+    }
+}
+
+/// A mesh dispatch record that asks for more than 2^22 groups in all (D3D12's most for
+/// `DispatchMesh`) is what a culling pass left unfinished in title memory: it draws nothing
+/// (Metal would run it, for as long as it takes), and one below that still draws.
+#[test]
+fn an_indirect_mesh_dispatch_past_the_most_groups_draws_nothing() {
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let red = [255, 128, 128, 255];
+    for (record, want) in [([1u32, 1, 1], red), ([256, 256, 65], [0; 4]), ([1, 1_182_027_346, 1_314_076_063], [0; 4]), ([1, 1, 64], red)] {
+        pool.write(0, &record);
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.dispatch_mesh_indirect(pool.va(0), None).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {record:?}: {:?}", pixels(&t, &color));
     }
 }
 
@@ -469,4 +491,366 @@ fn a_converted_mesh_program_with_run_time_parameters_is_valid_ir() {
     std::fs::write(path("mesh.ll"), module).unwrap();
     let assembled = Command::new(assembler).arg(path("mesh.ll")).arg("-o").arg(path("mesh.air")).output().unwrap();
     assert!(assembled.status.success(), "{}", String::from_utf8_lossy(&assembled.stderr));
+}
+
+/// A legacy vertex program that takes its position from the vertex id alone (no vertex fetch):
+/// id 1 is (1, -1), id 2 (-1, 1), any other (-1, -1). As a rectangle list's three corners
+/// (0, 1, 2), the rectangle is the whole target.
+const RECT_BY_ID: &[u32] = &[
+    0x7E14_02F3, // v_mov_b32 v10, -1.0
+    0x7E16_02F2, // v_mov_b32 v11, 1.0
+    0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+    0x0204_170A, // v_cndmask_b32 v2, v10, v11, vcc
+    0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+    0x0206_170A, // v_cndmask_b32 v3, v10, v11, vcc
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0x7E0C_02F2, // v_mov_b32 v6, 1.0
+    0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+    0xBF81_0000, // s_endpgm
+];
+
+/// A rectangle-list pipeline of [`RECT_BY_ID`] translated as `guess` does (`Options::rect_list`),
+/// and a list into a black 8x8 target with it set as a strip.
+fn rect_list_into(t: &mut Title<Metal>) -> (Rc<Texture>, NativeList<Metal>) {
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = RECT_BY_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let vs = shaders::translate_rect(&c).unwrap();
+    assert_eq!(vs.stage, HwStage::Vs);
+    let ps = translate(HwStage::Ps, RED);
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], true);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "rect") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(t, &pso, binding);
+    list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+    (color, list)
+}
+
+fn lit(t: &Title<Metal>, color: &Texture) -> usize {
+    pixels(t, color).iter().filter(|p| **p == [255, 128, 128, 255]).count()
+}
+
+/// A rectangle-list pipeline whose vertex program takes its corners from `SV_VertexID` alone runs
+/// the program for console vertex ids `3 * instance + 0..2`, finds the right-angle corner from
+/// `SV_Position.xy`, and extrapolates the fourth corner `p + q - r`, covering all 64 texels of the
+/// 8x8 target instead of only the lower-left 28 texels.
+#[test]
+fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
+    let Some(mut t) = title() else { return };
+    let (color, mut list) = rect_list_into(&mut t);
+    list.draw_instanced(4, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let n = lit(&t, &color);
+    assert_eq!(n, 64, "{n} of 64 lit");
+}
+
+/// Multi-rectangle `SV_VertexID` draws (`vertices = 3 * N`, direct and `ExecuteIndirect`) advance
+/// `v0` by `3 * instance + corner`, handle half-size and quarter-size tiles regardless of which
+/// corner holds the right angle, and extrapolate `TEXCOORD` varyings linearly across the fourth
+/// corner.
+#[test]
+fn vertex_id_rectangle_lists_draw_half_tiles_multiple_rects_and_interpolated_params() {
+    // Rectangle 0 (`v0 = 0..2`, right angle at corner 0): left half `x in [-1, 0], y in [-1, 1]`,
+    // `param0 = (u, v)` in `[0, 0.5] x [0.5, 1.0]` (32 of 64 texels).
+    // Rectangle 1 (`v0 = 3..5`, right angle at corner 1): top-right quarter `x in [0, 1], y in [0, 1]`,
+    // `param0 = (u, v)` in `[0.5, 1.0] x [0.0, 0.5]` (16 of 64 texels).
+    const TILE_RECTS_BY_ID: &[u32] = &[
+        0x7E10_0280, // v_mov_b32 v8, 0.0
+        0x7E12_02F0, // v_mov_b32 v9, 0.5
+        0x7E14_02F3, // v_mov_b32 v10, -1.0
+        0x7E16_02F2, // v_mov_b32 v11, 1.0
+        0x7E04_030A, // v_mov_b32 v2, v10 (-1.0)
+        0x7E06_030A, // v_mov_b32 v3, v10 (-1.0)
+        0x7E0E_0308, // v_mov_b32 v7, v8  (0.0)
+        0x7E18_0309, // v_mov_b32 v12, v9 (0.5)
+        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+        0x0204_1102, // v_cndmask_b32 v2, v2, v8, vcc
+        0x020E_1307, // v_cndmask_b32 v7, v7, v9, vcc
+        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x0218_170C, // v_cndmask_b32 v12, v12, v11, vcc
+        0x7D84_0083, // v_cmp_eq_u32 vcc, 3, v0
+        0x0204_1102, // v_cndmask_b32 v2, v2, v8, vcc
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x020E_1307, // v_cndmask_b32 v7, v7, v9, vcc
+        0x0218_110C, // v_cndmask_b32 v12, v12, v8, vcc
+        0x7D84_0084, // v_cmp_eq_u32 vcc, 4, v0
+        0x0204_1702, // v_cndmask_b32 v2, v2, v11, vcc
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x020E_1707, // v_cndmask_b32 v7, v7, v11, vcc
+        0x0218_110C, // v_cndmask_b32 v12, v12, v8, vcc
+        0x7D84_0085, // v_cmp_eq_u32 vcc, 5, v0
+        0x0204_1702, // v_cndmask_b32 v2, v2, v11, vcc
+        0x0206_1103, // v_cndmask_b32 v3, v3, v8, vcc
+        0x020E_1707, // v_cndmask_b32 v7, v7, v11, vcc
+        0x0218_130C, // v_cndmask_b32 v12, v12, v9, vcc
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0C_02F2, // v_mov_b32 v6, 1.0
+        0xF800_0203, 0x0000_0C07, // exp param0 v7, v12
+        0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+        0xBF81_0000, // s_endpgm
+    ];
+    const INTERP_UV_PS: &[u32] = &[
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+        0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+        0x7E08_02F0, // v_mov_b32 v4, 0.5
+        0x7E0A_02F2, // v_mov_b32 v5, 1.0
+        0xF800_180F, 0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let Some(mut t) = title() else { return };
+    let mut meta = [0u8; 0x10];
+    meta[12] = 0x40;
+    let vs_bytes: Vec<_> = TILE_RECTS_BY_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let vs_c = victory_shader::emit::graphics::container(HwStage::Vs, &vs_bytes, &meta).unwrap();
+    let vs = shaders::translate_rect(&vs_c).unwrap();
+    let ps = translate(HwStage::Ps, INTERP_UV_PS);
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], true);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "tile_rect") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+
+    // 1. Half-size tile alone (`1` instance = 3 console vertices): exact 32 of 64 texels (`x < 4`).
+    let (color, mut list) = list_into(&t, &pso, binding.clone());
+    list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+    list.draw_instanced(4, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let half = pixels(&t, &color);
+    let half_lit = half.iter().filter(|p| p[3] == 255).count();
+    assert_eq!(half_lit, 32, "half-size tile must light 32 of 64 texels, got {half_lit}");
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let p = half[y * 8 + x];
+            if x < 4 {
+                let want_u = ((x as f32 + 0.5) / 8.0 * 255.0).round() as i32;
+                let want_v = ((1.0 - (y as f32 + 0.5) / 16.0) * 255.0).round() as i32;
+                assert!((p[0] as i32 - want_u).abs() <= 2 && (p[1] as i32 - want_v).abs() <= 2 && p[3] == 255, "half ({x},{y})={p:?}");
+            } else {
+                assert_eq!(p, [0; 4], "half outside ({x},{y})={p:?}");
+            }
+        }
+    }
+
+    // 2. Both tiles (`2` instances = 6 console vertices), checked for both direct and indirect draws:
+    //    32 + 16 = 48 texels lit, with the bottom-right 4x4 untouched.
+    let pool = super::Pool::new(&t.host, 1);
+    pool.write(0, &[6u32, 1, 0, 0]);
+    for indirect in [false, true] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+        if indirect {
+            list.draw_rects_indirect(pool.va(0), None).unwrap();
+        } else {
+            list.draw_instanced(4, 2, 0, 0).unwrap();
+        }
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        let count_lit = got.iter().filter(|p| p[3] == 255).count();
+        assert_eq!(count_lit, 48, "indirect={indirect}: expected 48 of 64 texels, got {count_lit}");
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let p = got[y * 8 + x];
+                if x < 4 {
+                    assert_eq!(p, half[y * 8 + x], "indirect={indirect} rect0 ({x},{y})");
+                } else if y < 4 {
+                    // Top-right quarter: `u` in `[0.5, 1.0]` across `x = 4..8`, `v` in `[0.0, 0.5]`
+                    // top-to-bottom across `y = 0..4`.
+                    let want_u = ((0.5 + (x as f32 - 3.5) / 8.0) * 255.0).round() as i32;
+                    let want_v = (((y as f32 + 0.5) / 8.0) * 255.0).round() as i32;
+                    assert!(
+                        (p[0] as i32 - want_u).abs() <= 2 && (p[1] as i32 - want_v).abs() <= 2 && p[3] == 255,
+                        "indirect={indirect} rect1 ({x},{y})={p:?} want=({want_u},{want_v})"
+                    );
+                } else {
+                    assert_eq!(p, [0; 4], "indirect={indirect} unlit ({x},{y})={p:?}");
+                }
+            }
+        }
+    }
+}
+
+/// `ExecuteIndirect` of a rectangle list draws each record as the direct path draws its arguments
+/// (the record rewritten on the GPU to four-vertex instances): a record of 3 vertices lights what
+/// the direct draw does, one of 0 vertices, an instanced one, or one past the count, nothing.
+#[test]
+fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
+    let Some(mut t) = title() else { return };
+    let direct = {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_instanced(4, 1, 0, 0).unwrap();
+        super::run(&t.host, &[&list]);
+        pixels(&t, &color)
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let count = 64;
+    // Records: 3 vertices; 0 vertices; 3 vertices of 2 instances.
+    pool.write(0, &[3u32, 1, 0, 0, 0, 1, 0, 0, 3, 2, 0, 0]);
+    pool.write(count, &[1u32]);
+    for (record, counted, draws) in [(0, None, true), (1, None, false), (2, None, false), (0, Some(0), true), (0, Some(1), false)] {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_rects_indirect(pool.va(16 * record), counted.map(|i| (pool.va(count), i))).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        if draws {
+            assert_eq!(got, direct, "record {record} {counted:?}");
+        } else {
+            assert!(got.iter().all(|p| *p == [0; 4]), "record {record} {counted:?}");
+        }
+    }
+}
+
+/// The deferred-lighting shape: a pixel program writing a float colour to mrt0 and, in mrt1.x,
+/// the bits of a float it made (pi, 0x40490fdb) into an R32Uint target. Translated for the
+/// integer target (`Options::integer_targets`, the mask `glue::make_host_pipe` computes from the
+/// formats), Metal makes the pipeline and the target holds the bits, not 3 (a conversion).
+#[test]
+fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
+    const BITS: &[u32] = &[
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0x7E06_02FF, 0x4049_0FDB, // v_mov_b32 v3, pi
+        0x0604_0680, // v_add_f32 v2, 0, v3
+        0xF800_100F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 vm
+        0xF800_1811, 0x0000_0002, // exp mrt1 v2, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let formats = [Format::Rgba16Float, Format::R32Uint];
+    let integer = shaders::integer_targets(&formats);
+    assert_eq!(integer, 0b10);
+    let bytes: Vec<_> = BITS.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let c = victory_shader::emit::graphics::container(HwStage::Ps, &bytes, &meta).unwrap();
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(formats.to_vec(), None, vec![], &[], false);
+    // Translated as today (float outputs), Metal refuses it.
+    let float = shaders::translate(&c).unwrap();
+    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"), Pipe::Refused));
+    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("color attachment")), "{:?}", t.shaders.refused);
+    let ps = shaders::translate_targets(&c, integer).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "integer") else {
+        panic!("{:?}", t.shaders);
+    };
+    let target = |f| {
+        let mut desc = TextureDesc::d2(f, 8, 8);
+        desc.render_target = true;
+        t.host.texture(&desc).unwrap()
+    };
+    let (color, ids) = (target(Format::Rgba16Float), target(Format::R32Uint));
+    let mut list = NativeList::default();
+    list.set_render_targets(&[color.clone(), ids.clone()], None);
+    list.clear_render_target(&color, [0.0; 4]);
+    list.clear_render_target(&ids, [0.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut p = [0u8; 8 * 8 * 4];
+    t.host.backend.read_texture(&ids, 0, 0, &mut p, 8 * 4, 0);
+    let words: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(words.iter().all(|&w| w == 0x4049_0FDB), "{words:x?}");
+    let mut h = [0u8; 8 * 8 * 8];
+    t.host.backend.read_texture(&color, 0, 0, &mut h, 8 * 8, 0);
+    // 1.0, 0.5, 0.5, 1.0 as halves.
+    assert_eq!(&h[..8], &[0x00, 0x3c, 0x00, 0x38, 0x00, 0x38, 0x00, 0x3c]);
+}
+
+/// The bits of input VGPR `v` an R32Uint target gets, per texel of an 8x8 target, from a pixel
+/// program whose register image gives input enables `ena`.
+fn exported_input(ena: u32, v: u32) -> Option<Vec<u32>> {
+    let code = [
+        0xF800_1801, v, // exp mrt0 v<v>, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let bytes: Vec<_> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena)).unwrap();
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let mut t = title()?;
+    let state = Graphics::guess_base().for_draw(vec![Format::R32Uint], None, vec![], &[], false);
+    let ps = shaders::translate_targets(&c, 1).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "pixel input") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::R32Uint, 8, 8);
+    desc.render_target = true;
+    let ids = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&ids), None);
+    list.clear_render_target(&ids, [1.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut p = [0u8; 8 * 8 * 4];
+    t.host.backend.read_texture(&ids, 0, 0, &mut p, 8 * 4, 0);
+    Some(p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// A pixel program whose register image enables the fixed-point position (`SPI_PS_INPUT_ENA`
+/// 0x8080: line stipple in v0, unread, the fixed-point position in v1) gets the pixel's x | y << 16
+/// in v1: each texel holds its own coordinates. Guessed from the VGPRs it reads, v1 was the float y
+/// position.
+#[test]
+fn a_pixel_program_reads_its_fixed_point_position_where_the_register_image_says() {
+    let Some(words) = exported_input(0x8080, 1) else { return };
+    let want: Vec<u32> = (0..64u32).map(|i| i % 8 | (i / 8) << 16).collect();
+    assert_eq!(words, want);
+}
+
+/// Line stipple alone enabled (0x80): v0 is its coordinate, 0 for a triangle (a guess).
+#[test]
+fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
+    let Some(words) = exported_input(0x80, 0) else { return };
+    assert_eq!(words, vec![0; 64]);
+}
+
+/// A pixel program that packs its colour as the title's do. It interpolates param0 with the
+/// barycentric inputs v0 and v1. Then `v_fma_mixlo_f16` writes the low half of v1 and keeps the
+/// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half
+/// (the test also runs the two in the other order).
+/// `exp ... compr` writes the pairs. The barycentric is never read for the colour, so the program
+/// translates (it was refused as "barycentrics read directly") and draws (1.0, 0.5, 1.0, 1.0).
+const PACKED_BY_MIX: &[u32] = &[
+    0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+    0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+    0xCC21_0001, 0x0201_E4F2, // v_fma_mixlo_f16 v1, 1.0, 1.0, 0
+    0xCC22_0001, 0x0201_E4F0, // v_fma_mixhi_f16 v1, 0.5, 1.0, 0
+    0x7E04_02FF, 0x3C00_3C00, // v_mov_b32 v2, 0x3c003c00 (two f16 1.0)
+    0xF800_1C0F, 0x0000_0201, // exp mrt0 v1, v1, v2, v2 done compr vm (vsrc0 v1, vsrc1 v2)
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
+    // The triangle program, exporting param0 for the pixel program's interpolation.
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
+    // Also in the other order: `mixhi` first keeps the low half, `mixlo` replaces it.
+    let mut swapped = PACKED_BY_MIX.to_vec();
+    let at = swapped.iter().position(|&w| w == 0xCC21_0001).unwrap();
+    let (lo, hi) = (swapped[at..at + 2].to_vec(), swapped[at + 2..at + 4].to_vec());
+    swapped.splice(at..at + 4, hi.into_iter().chain(lo));
+    let ms = translate(HwStage::Vs, &words);
+    let Some(mut t) = title() else { return };
+    for (order, ps_words) in [("mixlo, mixhi", PACKED_BY_MIX), ("mixhi, mixlo", &swapped[..])] {
+        let ps = translate(HwStage::Ps, ps_words);
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+        let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mix") else {
+            panic!("{order}: {:?}", t.shaders);
+        };
+        let (color, mut list) = list_into(&t, &pso, binding);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        assert!(got.iter().all(|p| *p == [255, 128, 255, 255]), "{order}: {got:?}");
+    }
 }

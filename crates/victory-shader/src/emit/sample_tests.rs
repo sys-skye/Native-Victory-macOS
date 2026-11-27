@@ -238,6 +238,32 @@ fn offset_samples_with_gradients_read_them_before_the_coordinates() {
 }
 
 #[test]
+fn gradients_stay_32_bit_with_16_bit_coordinates() {
+    // image_sample_d v[10:13], v[2:6], s[8:15], s[16:19] dmask:0xf dim:2D a16: a16 packs the
+    // coordinates (v6), not the gradients: dx/dh v2, dy/dh v3, dx/dv v4, dy/dv v5, as LLVM sizes
+    // the address (#320). They used to be read as f16 halves of v2 and v3.
+    let (name, args) = call(CS, [0xF088_0F08, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, QUARTER, U, THREE_QUARTERS, HALF, U]);
+
+    // image_sample_d v[10:13], v[2:4], ... dim:1D a16: dx/dh v2, dx/dv v3, then the coordinate
+    // in v4's low half (was refused as "16-bit gradients of a 1D or 3D image").
+    let (name, args) = call(CS, [0xF088_0F00, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, U, U, QUARTER, U, U]);
+
+    // Arrays: `dim` 4 (1D array) is `kind` 6 with two coordinates and `dim` 5 (2D array) `kind`
+    // 7 with three; the slice is no spatial coordinate, so there are 2 and 4 gradients, as
+    // `image_addr_dwords` sizes them (one and two a direction): v[2:4] and v[2:7] with a16.
+    let (name, args) = call(CS, [0xF088_0F20, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, U, U, QUARTER, U, U]);
+    let (name, args) = call(CS, [0xF088_0F28, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, QUARTER, U, THREE_QUARTERS, HALF, U]);
+}
+
+#[test]
 fn comparison_gathers_at_level_0_compare_red() {
     // image_gather4_c_lz v[10:13], v[2:4], s[8:15], s[16:19] dmask:0x1 dim:2D
     let (name, args) = call(CS, [0xF13C_0108, 0x0082_0A02]);

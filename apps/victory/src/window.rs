@@ -430,6 +430,9 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
                 let _: () = msg_send![app, updateWindows];
                 let shown: Bool = msg_send![window, isVisible];
                 let minimized: Bool = msg_send![window, isMiniaturized];
+                // NSWindowOcclusionStateVisible (1 << 1): some of the window can be seen.
+                let occlusion: usize = msg_send![window, occlusionState];
+                victory_gpu::set_window_hidden(minimized.as_bool() || occlusion & 2 == 0);
                 (shown.as_bool() || minimized.as_bool()) && !finished()
             }
         });

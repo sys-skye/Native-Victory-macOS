@@ -67,6 +67,12 @@ struct Grid<'a> {
 
 impl Grid<'_> {
     fn run(&self, tex: &<Metal as ResourceBackend>::Texture) -> Vec<[f32; 4]> {
+        self.sample(tex, false)
+    }
+
+    /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
+    /// `cleared`.
+    fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -80,6 +86,9 @@ impl Grid<'_> {
         let res = m.create_heap(HeapKind::Resource, 4).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
         m.write_texture(&res, 0, tex, 0.0);
+        if cleared {
+            m.clear_entry(&res, 0);
+        }
         m.write_buffer(&res, 1, &a.buf, a.at(0), (cells * 16) as u32);
         let s = m
             .create_sampler(&SamplerDesc {
@@ -361,6 +370,25 @@ fn sample_2d_array_and_3d() {
     }
 }
 
+/// What a shader samples through an entry `clear_entry` emptied (as the host does for a texture
+/// given up under the texture budget, or released): zeros, a transparent black texel, not the
+/// texture it showed and not a fault.
+#[test]
+fn sampling_a_cleared_entry_reads_transparent_black() {
+    let Some(m) = backend() else { return };
+    let t = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+    m.upload_texture(&t, 0, 0, &[200u8; 16], 8, 0);
+    let g = Grid {
+        m: &m,
+        dxil: &fixture("sample2d"),
+        g: [2, 2],
+        z: 1,
+        filter: Filter::Nearest,
+    };
+    assert!(g.run(&t).iter().all(|c| near(c[0], 200.0 / 255.0)), "shown");
+    assert_eq!(g.sample(&t, true), vec![[0.0; 4]; 4], "cleared");
+}
+
 #[test]
 fn texture_views_and_sampler_filters() {
     let Some(m) = backend() else { return };
@@ -573,79 +601,44 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
     }
 }
 
-/// A record of over 2^24 groups (a count written wrong) runs no groups instead of keeping the GPU
-/// busy until Metal's watchdog fails the queue. A record within the limit in the same encoder
-/// still runs, as does one past D3D12's 65535 a dimension (the title dispatches 100000 in x).
-#[test]
-fn an_indirect_dispatch_past_the_group_limit_runs_nothing() {
-    for m in backends() {
-        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
-        let (dst, records) = (a.region.len / 2, N * 4);
-        a.write(0, &(0..N as u32).collect::<Vec<_>>());
-        // Half the groups, then 2^24 + 1 groups (the heap view stops each past the first N).
-        a.write(records, &[(N / 128) as u32, 1, 1, 4097, 4096, 1]);
-        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
-        m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
-        m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
-        let w: Vec<_> = (0..2usize)
-            .map(|i| Dispatch {
-                pipeline: &p,
-                root: RootArgs::default()
-                    .constants(&[5, 7])
-                    .address(m.heap_address(&heap, 5)),
-                resources: vec![],
-                heaps: victory_metal::backend::Heaps {
-                    resource: Some(&heap),
-                    sampler: None,
-                },
-                groups: [0, 0, 0],
-                threads_per_group: [64, 1, 1],
-                indirect: Some((&a.buf, a.at(records + 12 * i) as *const u8)),
-                count: None,
-            })
-            .collect();
-        run(&m, &w);
-        let out: Vec<u32> = a.read(dst, N);
-        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
-        assert!(out[N / 2..].iter().all(|v| *v == 0), "the record past the limit ran groups");
-    }
+/// One indirect dispatch of `heap_rw` with `record`; returns the destination.
+fn indirect(m: &Metal, record: [u32; 3]) -> Vec<u32> {
+    let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+    let a = Arena::new(m, INDIRECT_ARENA.div_ceil(page_size()));
+    let (dst, at) = (a.region.len / 2, N * 4);
+    a.write(0, &(0..N as u32).collect::<Vec<_>>());
+    a.write(at, &record);
+    let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+    m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
+    m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
+    let w = [Dispatch {
+        pipeline: &p,
+        root: RootArgs::default().constants(&[5, 7]).address(m.heap_address(&heap, 5)),
+        resources: vec![],
+        heaps: victory_metal::backend::Heaps { resource: Some(&heap), sampler: None },
+        groups: [0, 0, 0],
+        threads_per_group: [64, 1, 1],
+        indirect: Some((&a.buf, a.at(at) as *const u8)),
+        count: None,
+    }];
+    run(m, &w);
+    a.read(dst, N)
 }
 
-/// D3D12's limit is 65535 groups a dimension, but the title dispatches over 100000 groups in x
-/// indirectly, which the console and Metal run: those run.
+/// A record that asks for more than 2^22 groups in all is what its writer left unfinished there:
+/// it dispatches nothing (Metal would run it, for as long as it takes).
 #[test]
-fn an_indirect_dispatch_past_65535_groups_in_x_runs() {
+fn an_indirect_dispatch_past_the_most_groups_runs_nothing() {
     for m in backends() {
-        // One thread a group, so every thread has an element of its own (Metal does not stop
-        // writes past a view, which would land in other tests' memory).
-        const G: usize = 70_000;
-        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, (2 * G * 4 + 4096).div_ceil(page_size()));
-        let (src, dst, record) = (0, G * 4, 2 * G * 4);
-        a.write(src, &(0..G as u32).collect::<Vec<_>>());
-        a.write(record, &[G as u32, 1, 1]);
-        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
-        m.write_buffer(&heap, 5, &a.buf, a.at(src), (G * 4) as u32);
-        m.write_buffer(&heap, 6, &a.buf, a.at(dst), (G * 4) as u32);
-        let w = [Dispatch {
-            pipeline: &p,
-            root: RootArgs::default()
-                .constants(&[5, 7])
-                .address(m.heap_address(&heap, 5)),
-            resources: vec![],
-            heaps: victory_metal::backend::Heaps {
-                resource: Some(&heap),
-                sampler: None,
-            },
-            groups: [0, 0, 0],
-            threads_per_group: [1, 1, 1],
-            indirect: Some((&a.buf, a.at(record) as *const u8)),
-            count: None,
-        }];
-        run(&m, &w);
-        let out: Vec<u32> = a.read(dst, G);
-        assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
+        let half = (N / 128) as u32;
+        for record in [[half, 1 << 20, 1], [half, 1_182_027_346, 1_314_076_063], [1 << 16, 1 << 16, 1 << 16]] {
+            let out = indirect(&m, record);
+            assert!(out.iter().all(|v| *v == 0), "{record:?}: {:?}", &out[..4]);
+        }
+        // More than D3D12's 65,535 groups in one dimension still runs: the title asks for that.
+        let out = indirect(&m, [half, 1, 70_000]);
+        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..4]);
+        assert!(out[N / 2..].iter().all(|v| *v == 0));
     }
 }
 
@@ -810,4 +803,73 @@ fn texture_blit_ops_copy_between_textures_and_buffers() {
             );
         }
     }
+}
+
+/// One dispatch of `dxil` writing `tex` through a UAV (table entry 0) over a `w` x `h` grid of
+/// 4x4 groups, `k` its root constants.
+fn fill(m: &Metal, dxil: &[u8], tex: &<Metal as ResourceBackend>::Texture, k: &[u32], g: [usize; 3], w: usize, h: usize) {
+    let p = m.create_compute_pipeline(dxil).unwrap();
+    let res = m.create_heap(HeapKind::Resource, 2).unwrap();
+    m.write_texture(&res, 0, tex, 0.0);
+    let mut root = RootArgs::default();
+    if !k.is_empty() {
+        root = root.constants(k);
+    }
+    run(
+        m,
+        &[Dispatch {
+            pipeline: &p,
+            root: root.address(m.heap_address(&res, 0)),
+            resources: vec![],
+            heaps: victory_metal::backend::Heaps { resource: Some(&res), sampler: None },
+            groups: [w.div_ceil(g[0]), h.div_ceil(g[1]), 1],
+            threads_per_group: g,
+            indirect: None,
+            count: None,
+        }],
+    );
+}
+
+/// A title's R9G9B9E5 view over an R32_UINT texture compute writes (fix 5): Metal casts the
+/// integer texture to `RGB9E5Float`, and a sample of the view decodes the bits the dispatch stored.
+#[test]
+fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::R32Uint, 4, 4);
+    d.unordered_access = true;
+    let t = m.create_texture(&d).unwrap();
+    // Exponent 16 (scale 2^-8), red mantissa 256 (1.0, plus the shader's x + 4y), green 128
+    // (0.5), blue 64 (0.25).
+    let k = 256 | 128 << 9 | 64 << 18 | 16 << 27;
+    fill(&m, &fixture("uint_fill"), &t, &[k], [4, 4, 1], 4, 4);
+    let view = m
+        .create_texture_view(&t, &ViewDesc { format: Format::Rgb9e5Float, mips: (0, 1), slices: (0, 1) })
+        .expect("an RGB9E5 view of an R32Uint texture");
+    let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [4, 4], z: 1, filter: Filter::Nearest };
+    for (i, c) in g.run(&view).iter().enumerate() {
+        assert_eq!(*c, [(256 + i) as f32 / 256.0, 0.5, 0.25, 1.0], "texel {i}");
+    }
+}
+
+/// The B5G5R5A1 sun-mask lead: a compute store into a `BGR5A1Unorm` texture through a converted
+/// shader lands, quantized to 5 bits a channel.
+#[test]
+fn a_compute_store_into_bgr5a1() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Bgr5a1Unorm, 8, 8);
+    d.unordered_access = true;
+    let t = m.create_texture(&d).unwrap();
+    m.upload_texture(&t, 0, 0, &[0u8; 128], 16, 0);
+    fill(&m, &fixture("tex_fill"), &t, &[], [8, 8, 1], 8, 8);
+    let mut bytes = [0u8; 128];
+    m.read_texture(&t, 0, 0, &mut bytes, 16, 0);
+    let out: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    // (x, y, 64, 255) / 255 in 5 bits: blue = 64 * 31 / 255 = 8 (rounded), alpha 1.
+    let want: Vec<u16> = (0..64u32)
+        .map(|i| {
+            let five = |v: u32| (v * 31 + 127) / 255;
+            (8 | five(i / 8) << 5 | five(i % 8) << 10 | 1 << 15) as u16
+        })
+        .collect();
+    assert_eq!(out, want);
 }

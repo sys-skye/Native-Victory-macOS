@@ -881,7 +881,58 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(w);
             }
         }
+        self.exec_copies_at_joins();
         (execs, kill_lanes)
+    }
+
+    /// A register joined at a block entry that takes EXEC's own incoming value on every edge
+    /// (a copy of it, or the same result written to both) holds exactly the lanes that arrive,
+    /// as EXEC there does: a structurized loop's "lanes still looping", which the compiler keeps
+    /// beside EXEC and tests with `s_andn2_b64 s, s, exec` for its exit. It is that mask, and a
+    /// ballot at the block gives it.
+    fn exec_copies_at_joins(&mut self) {
+        let p = self.p;
+        let same = |a: Value, e: Value, reg: Reg| -> bool {
+            if a == e {
+                return true;
+            }
+            let Some(&(b, i)) = self.defs.get(&a) else { return false };
+            let inst = &p.blocks[b].insts[i];
+            // `s_mov` of EXEC: the copy reads the incoming value itself.
+            let copy = matches!(inst.name(), "s_mov_b64" | "s_mov_b32") && inst.read(reg) == Some(e);
+            // `s_*_wrexec_b64`: the destination and EXEC get the same result.
+            let both = inst.name().contains("_wrexec_") && inst.write(reg) == Some(e);
+            copy || both
+        };
+        let mut found = Vec::new();
+        for b in 0..p.blocks.len() {
+            let phis = &p.blocks[b].phis;
+            let find = |r: Reg| phis.iter().find(|ph| ph.reg == r);
+            let Some(elo) = find(Reg::S(EXEC)) else { continue };
+            let ehi = if p.wave64 { find(Reg::S(EXEC + 1)) } else { Some(elo) };
+            let Some(ehi) = ehi else { continue };
+            let exec = (elo.value, ehi.value);
+            for lo in phis {
+                let Reg::S(code) = lo.reg else { continue };
+                if code == EXEC || code == EXEC + 1 || (p.wave64 && code % 2 == 1) {
+                    continue;
+                }
+                let hi = if p.wave64 { find(Reg::S(code + 1)) } else { Some(lo) };
+                let Some(hi) = hi else { continue };
+                let all = (0..lo.args.len()).all(|n| {
+                    same(lo.args[n], elo.args[n], Reg::S(EXEC))
+                        && (!p.wave64 || same(hi.args[n], ehi.args[n], Reg::S(EXEC + 1)))
+                });
+                if all && lo.args.len() == elo.args.len() {
+                    found.push(((lo.value, hi.value), exec));
+                }
+            }
+        }
+        for (k, exec) in found {
+            let m = self.mask(exec).0;
+            self.masks.insert(k, m);
+            self.active.insert(k.0);
+        }
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
@@ -1044,6 +1095,20 @@ impl<'a> Lanes<'a> {
             Operand::Literal(x) => Some(x),
             _ => None,
         }
+    }
+
+    /// The key the last XORs of a swap ([`xored_back`]) give back in `k`, each half, or both
+    /// halves of a 32-lane key.
+    fn copy_key(&self, k: Key) -> Option<Key> {
+        let p = self.p;
+        let def = |x: Value| self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i]);
+        let copy = |v: Value| {
+            let inst = def(v)?;
+            xored_back(inst, inst.writes.iter().position(|&(_, x)| x == v)? as u8, def)
+        };
+        let lo = copy(k.0)?;
+        let hi = if p.wave64 { copy(k.1)? } else { lo };
+        Some((lo, hi))
     }
 
     /// One step back across a 32-bit value-preserving copy or spill restore.
@@ -1491,6 +1556,11 @@ impl<'a> Lanes<'a> {
                     && let Some((m, d)) = self.split_wave64(k, 16)
                 {
                     (m, d || exec_w)
+                } else if let Some(src) = self.copy_key(k) {
+                    // The last XOR of a swap (also of a pair a 32-lane program swaps with
+                    // `s_xor_b64`): the mask it gives back, bit for bit. (Moves are `sop`'s.)
+                    let (m, d) = self.mask(src);
+                    (m, d || exec_w)
                 } else {
                     let born = self.born(k.0);
                     (self.b.atom(Atom::Opaque(k.0), born), exec_w)
@@ -1591,20 +1661,8 @@ impl<'a> Lanes<'a> {
             if let Some(&s) = self.restored.get(&v) {
                 return Some(s);
             }
-            let &(b, i) = self.defs.get(&v)?;
-            let inst = &p.blocks[b].insts[i];
-            let half = inst.writes.iter().position(|&(_, x)| x == v)? as u8;
-            match (inst.name(), &inst.fields) {
-                ("s_mov_b32" | "s_mov_b64", Fields::Sop { src, .. }) => match src.as_slice() {
-                    [Operand::Scalar { code, .. }] if *code != NULL => {
-                        inst.read(Reg::S(code + half))
-                    }
-                    _ => None,
-                },
-                _ => xored_back(inst, half, |x| {
-                    self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i])
-                }),
-            }
+            let def = |x: Value| self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i]);
+            copied(def(v)?, v, def)
         };
         let phi_args = |k: Key| -> Option<Vec<Key>> {
             let (&(b, i), &(hb, hi)) = (self.phis.get(&k.0)?, self.phis.get(&k.1)?);
@@ -2179,6 +2237,24 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
             what: "irreducible control flow",
         }),
         None => Ok(()),
+    }
+}
+
+/// What `v`, which `inst` writes, is a copy of: the SGPR an `s_mov` moves (each dword of a pair
+/// on its own), or what a swap's last XOR gives back ([`xored_back`]). `def` gives a value's
+/// instruction.
+pub(crate) fn copied<'a>(
+    inst: &Inst,
+    v: Value,
+    def: impl Fn(Value) -> Option<&'a Inst>,
+) -> Option<Value> {
+    let half = inst.writes.iter().position(|&(_, x)| x == v)? as u8;
+    match (inst.name(), &inst.fields) {
+        ("s_mov_b32" | "s_mov_b64", Fields::Sop { src, .. }) => match src.as_slice() {
+            [Operand::Scalar { code, .. }] if *code != NULL => inst.read(Reg::S(code + half)),
+            _ => None,
+        },
+        _ => xored_back(inst, half, def),
     }
 }
 

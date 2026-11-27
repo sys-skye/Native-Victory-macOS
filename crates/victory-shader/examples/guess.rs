@@ -17,6 +17,7 @@ fn main() {
         Ok(h) => {
             println!("{:?} dxil {} bytes", h.stage, h.dxil.len());
             println!("user_data {:?}", h.user_data);
+            println!("table_entries {:?}", h.table_entries);
             println!("cbvs {:?} srvs {:?} uavs {:?} memory {} heap {} view_addresses {}", h.root_cbvs, h.root_srvs, h.root_uavs, h.memory, h.heap, h.view_addresses);
             if let Ok(p) = std::env::var("VICTORY_DXIL") {
                 std::fs::write(p, &h.dxil).expect("writable");

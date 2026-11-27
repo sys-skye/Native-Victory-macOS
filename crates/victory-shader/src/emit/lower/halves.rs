@@ -32,7 +32,8 @@
 //! counts too ([`barrier_blocks`](super::barrier_blocks)): the console's
 //! barrier waits for every wave that has not ended, so the title brings every
 //! live wave there together, and the host's group barrier for it already
-//! relies on that (not past a branch on an SCC from a `v_readfirstlane`).
+//! relies on that (not past a branch on an SCC from a `v_readfirstlane`,
+//! unless of an LDS word read alike in a barrier phase: `barrier_reads`).
 //! An SCC computed from a `v_readfirstlane` is not uniform here: each half
 //! reads its own first lane. Elsewhere (in a branch of EXEC, a
 //! per-lane loop) the translation is refused. Cost: two barriers and a

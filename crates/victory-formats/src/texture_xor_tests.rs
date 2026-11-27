@@ -251,3 +251,164 @@ fn modes_without_tables_and_msaa_are_not_addressable() {
     let l = Layout::new_for(&desc(64, 64, 1, 4, Swizzle::SW_64KB_D_X), bad).unwrap();
     assert!(!l.addressable());
 }
+
+/// `Layout::walk` visits each active element once and pairs its linear byte offset with the exact
+/// per-element `Layout::xor_address` across every addressable XOR mode (`_X` and `_T`),
+/// power-of-two element byte width (`1, 2, 4, 8, 16`), 2D array and 3D depth layout, mip chain
+/// (including tail mips), pipe configuration, and pipe-bank XOR.
+#[test]
+fn walk_matches_per_element_xor_address_across_modes() {
+    fn check_walk(l: &Layout, d: &Desc) {
+        let xor = l.xor.as_deref().expect("XOR layout");
+        let n = d.element_bytes as usize;
+        let slices = if d.dimension == Dimension::Tex3d {
+            1
+        } else {
+            d.depth
+        };
+        for slice in 0..slices {
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let row = m.width as usize * n + 13;
+                let plane = row * m.height as usize + 11;
+                let linear_len = plane * m.depth as usize;
+                let mut got = vec![None::<usize>; linear_len];
+                let mut total_elems = 0usize;
+                l.walk(
+                    l.size as usize,
+                    mip,
+                    slice,
+                    linear_len,
+                    row,
+                    plane,
+                    |tiled_off, linear_off, len| {
+                        assert!(len >= n && len.is_multiple_of(n));
+                        for step in (0..len).step_by(n) {
+                            let slot = &mut got[linear_off + step];
+                            assert!(
+                                slot.is_none(),
+                                "{d:?} mip {mip} slice {slice} linear byte {} visited twice",
+                                linear_off + step
+                            );
+                            *slot = Some(tiled_off + step);
+                            total_elems += 1;
+                        }
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    total_elems,
+                    m.width as usize * m.height as usize * m.depth as usize
+                );
+                for z in 0..m.depth {
+                    let (slab, _) = l.split(slice + z);
+                    let slab_base = u64::from(slab) * l.slice_size + m.offset;
+                    for y in 0..m.height {
+                        for x in 0..m.width {
+                            let lin =
+                                z as usize * plane + y as usize * row + x as usize * n;
+                            let want =
+                                (slab_base + l.xor_address(xor, &m, x, y, slice + z)) as usize;
+                            assert_eq!(
+                                got[lin],
+                                Some(want),
+                                "{d:?} mip {mip} slice {slice} ({x},{y},{z})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let other = PipeConfig {
+        pipes_log2: 4,
+        packers_log2: 3,
+    };
+    for config in [PipeConfig::DEFAULT, other] {
+        for flip in [0u32, 0x1AB] {
+            for swizzle in XOR_MODES {
+                for e in 0..5u32 {
+                    let d = Desc {
+                        depth: 2,
+                        ..desc(67, 35, 6, 1 << e, swizzle)
+                    };
+                    let l = Layout::new_for(&d, config)
+                        .unwrap()
+                        .with_pipe_bank_xor(flip, config);
+                    check_walk(&l, &d);
+                }
+            }
+            for swizzle in [
+                Swizzle::SW_64KB_S_T,
+                Swizzle::SW_4KB_S_X,
+                Swizzle::SW_64KB_Z_X,
+                Swizzle::SW_64KB_S_X,
+                Swizzle::SW_64KB_D_X,
+                Swizzle::SW_64KB_R_X,
+            ] {
+                for e in [0u32, 2, 4] {
+                    let d = Desc {
+                        dimension: Dimension::Tex3d,
+                        depth: 9,
+                        ..desc(35, 19, 4, 1 << e, swizzle)
+                    };
+                    let l = Layout::new_for(&d, config)
+                        .unwrap()
+                        .with_pipe_bank_xor(flip, config);
+                    check_walk(&l, &d);
+                }
+            }
+        }
+    }
+    // Non-power-of-two element byte widths (`3, 6, 12`) are rejected by `Layout::new_for`.
+    for swizzle in XOR_MODES {
+        for bpe in [3u32, 6, 12] {
+            assert_eq!(
+                Layout::new(&desc(4, 4, 1, bpe, swizzle)),
+                Err(Error::Invalid)
+            );
+        }
+    }
+}
+
+/// Partial trailing micro-runs (widths not divisible by the 16-byte micro-run length) with a
+/// non-zero pipe-bank XOR round-trip across every element byte width (`1, 2, 4, 8, 16`), including
+/// mip tails.
+#[test]
+fn partial_xor_runs_with_pipe_bank_xor_round_trip_every_element_size() {
+    let config = PipeConfig::DEFAULT;
+    for e in 0..5u32 {
+        let bpe = 1 << e;
+        for swizzle in [Swizzle::SW_64KB_S_X, Swizzle::SW_64KB_D_X, Swizzle::SW_4KB_S_X] {
+            let d = desc(67, 35, 6, bpe, swizzle);
+            let l = Layout::new_for(&d, config)
+                .unwrap()
+                .with_pipe_bank_xor(0x1AB, config);
+            round_trips(&l, &d);
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn xor_detile_throughput() {
+    for bpe in [4u32, 16] {
+        let d = desc(2048, 2048, 1, bpe, Swizzle::SW_64KB_S_X);
+        let l = Layout::new(&d)
+            .unwrap()
+            .with_pipe_bank_xor(0x155, PipeConfig::DEFAULT);
+        let tiled = vec![0xA5u8; l.size as usize];
+        let row = 2048 * bpe as usize;
+        let slice_pitch = row * 2048;
+        let mut linear = vec![0u8; slice_pitch];
+        let iters = 20u32;
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            l.detile(&tiled, 0, 0, &mut linear, row, slice_pitch).unwrap();
+            std::hint::black_box(&linear);
+        }
+        let per_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+        eprintln!("2048x2048 SW_64KB_S_X {bpe}B detile: {per_ms:.2} ms");
+    }
+}

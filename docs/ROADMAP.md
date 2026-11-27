@@ -21,12 +21,12 @@ Two problems stop it, in this order:
    - `VICTORY_TRACE_OWNERS=1` names who owns the memory, and `VICTORY_DUMP_REFUSED=<dir>` dumps the refused shaders.
    - **Ruled out:** linear root views (those shaders go through the page table), pool pages owned twice (fixed by #108; a pool audit finds 0 differences), and GPU command buffers that fail (their signals are now paid on the CPU).
 
-**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended.
+**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended. `tools/macos/tester-report.sh` turns a log into a scrubbed attachment and a tester-report body.
 
 ## 2. Frame rate and memory in the world
 
 - In the world, fps falls from about 15 to about 7 over 4 minutes. Something grows every frame; host texture copies are the main suspect (one tester counted 26,000 by frame 4096). Being investigated on `fix/fps-decay`.
-- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies is proposed in #110. Series S is the default on 16 GB Macs. The native host now logs Metal's own recommended working set size alongside the title's declared budget at startup, so a tester's log carries the numbers needed to set a real threshold.
+- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies ([#294](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/294); `VICTORY_METAL_TEXTURE_BUDGET_MB`, off unless set) gives up copies nothing uses past a byte limit; whether that frees enough on 16 GB is not measured yet. On a 24 GB M4 Pro the world load stopped with the budget off because copies overlap: 8.5 GB of copies over 1.7 GB of distinct title memory (#301). Series S is the default on Macs with 24 GB or less. The native host now logs Metal's own recommended working set size alongside the title's declared budget at startup, so a tester's log carries the numbers needed to set a real threshold.
 - The game rewrites about 40,000 descriptor records a frame with plain stores. Patching its store sites instead of remirroring is being measured ([#43](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/43); `VICTORY_TRACE_DESCRIPTORS=sites`).
 - Textures the GPU writes and the CPU reads back (the water simulation) are copied back behind `VICTORY_TEXTURE_BACK=1`, off by default ([#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)). A world run on an M5 Pro names 22 textures at no measurable cost, then crashes before boats can be seen. Needed: a run past that crash.
 
@@ -54,7 +54,7 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 
 - Reverb: the audio DSP's convolution has a synthetic CPU fallback behind `VICTORY_GUESS_DSP=1` (a fixed decaying-noise tail, not the title's own impulse response); default behaviour is unchanged (silence) until a real run judges whether it sounds right ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)). The hardware's impulse-response layout is still undocumented; `VICTORY_TRACE_DSP=1` logs the title's own `ir` data to help settle it.
 - The Brightness logo draws as half a rectangle ([#16](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/16)).
-- Mesh-shader pipelines: indirect mesh dispatches still drop.
+- Mesh-shader pipelines: direct and indirect mesh dispatches run on the native host (#353 for the direct ones), under a guessed record layout and a guessed `DispatchMeshX` group count.
 - Culling, depth, stencil and write mask in guessed pipelines are still partly guessed.
 
 ## Solved recently

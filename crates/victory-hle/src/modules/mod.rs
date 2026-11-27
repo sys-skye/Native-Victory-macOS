@@ -16,6 +16,8 @@ pub mod display;
 pub mod dsp;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod dstorage;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod read_cache;
 #[cfg(windows)]
 pub mod fidelityfx;
 #[cfg(windows)]

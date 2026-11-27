@@ -44,8 +44,13 @@ pub struct Heap {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kind: HeapKind,
     count: usize,
-    /// What each entry names, kept alive here and made resident with the heap.
-    refs: RefCell<std::collections::HashMap<usize, Res>>,
+    /// What each entry names: `(resident_allocation, optional_buffer_backed_texture_view)`.
+    /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
+    /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
+    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
+    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// Entries in `refs` that currently hold `Some(texture_buffer)`.
+    typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
     /// name each: an allocation is added to `set` once and removed + committed before its last
     /// `refs` entry is dropped, and without a set each is named to an encoder once.
@@ -53,6 +58,8 @@ pub struct Heap {
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+    /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
+    requested: bool,
 }
 
 impl Drop for Heap {
@@ -60,8 +67,11 @@ impl Drop for Heap {
         // MTLResidencySet does not retain allocations: detach everything and commit before
         // `buf` and `refs` are dropped.
         if let Some(set) = self.set.take() {
+            if self.requested {
+                crate::metal::residency_timed("end", Some(&set), || set.endResidency());
+            }
             set.removeAllAllocations();
-            set.commit();
+            crate::metal::residency_timed("drop_commit", Some(&set), || set.commit());
         }
     }
 }
@@ -209,6 +219,12 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
         Format::Bgr5a1Unorm => MTLPixelFormat::BGR5A1Unorm,
         Format::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
+        Format::Rgba16Uint => MTLPixelFormat::RGBA16Uint,
+        Format::Rgba8Snorm => MTLPixelFormat::RGBA8Snorm,
+        Format::Rg16Snorm => MTLPixelFormat::RG16Snorm,
+        Format::R16Snorm => MTLPixelFormat::R16Snorm,
+        Format::R8Snorm => MTLPixelFormat::R8Snorm,
+        Format::Rgb10a2Uint => MTLPixelFormat::RGB10A2Uint,
     }
 }
 
@@ -495,7 +511,13 @@ fn size(a: [usize; 3]) -> MTLSize {
 }
 
 impl Metal {
-    fn heap_entry(&self, heap: &Heap, index: usize, words: [u64; 3], keep: Option<Res>) {
+    fn heap_entry(
+        &self,
+        heap: &Heap,
+        index: usize,
+        words: [u64; 3],
+        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+    ) {
         assert!(
             index < heap.count,
             "descriptor index {index} out of {}",
@@ -515,8 +537,9 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
+        let added_typed = matches!(keep, Some((_, Some(_))));
         let old = match keep {
-            Some(r) => {
+            Some((r, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
                 let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
@@ -528,11 +551,17 @@ impl Metal {
                 }
                 *count += 1;
                 drop(counts);
-                heap.refs.borrow_mut().insert(index, r)
+                heap.refs.borrow_mut().insert(index, (r, tex_view))
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
-        if let Some(old) = old {
+        let removed_typed = matches!(old, Some((_, Some(_))));
+        if added_typed != removed_typed {
+            let n = heap.typed_views.get();
+            heap.typed_views
+                .set(if added_typed { n + 1 } else { n - 1 });
+        }
+        if let Some((old, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
@@ -549,10 +578,65 @@ impl Metal {
             drop(counts);
             if last && let Some(set) = &heap.set {
                 set.removeAllocation(ProtocolObject::from_ref(&*old));
-                set.commit();
+                crate::metal::residency_timed("remove_commit", Some(set), || set.commit());
                 heap.dirty.set(false);
             }
+            drop(old_tex_view);
             drop(old);
+        }
+    }
+
+    /// A command buffer of `queue`, with encoder execution status when tracing failures.
+    fn new_command_buffer(&self, queue: &Queue) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        if self.trace_fails {
+            let d = MTLCommandBufferDescriptor::new();
+            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+            queue.0.commandBufferWithDescriptor(&d)
+        } else {
+            queue.0.commandBuffer()
+        }
+        .ok_or_else(|| "no command buffer".to_string())
+    }
+
+    /// The command buffer for the next piece of a split submission (`VICTORY_PASSES_PER_BUFFER`).
+    /// A residency set keeps its allocations resident only for the command buffers it was given
+    /// to, so every heap is attached again (`attached_heaps` is emptied): without that, pieces 2
+    /// and later read heap entries with nothing keeping them resident, and the GPU faulted
+    /// (`kIOGPUCommandBufferCallbackErrorPageFault`). The submission's waits are encoded again too,
+    /// so no piece starts before what the submission waits for (values already reached cost
+    /// nothing), and the piece waits for the one before it (`after`: the submission's piece event
+    /// and the value that piece raises it to, by the GPU or, if the GPU fails it, by its recovery).
+    fn next_piece(
+        &self,
+        queue: &Queue,
+        waits: &[(&crate::metal::Fence, u64)],
+        attached_heaps: &mut Vec<*const Heap>,
+        after: Option<(&ProtocolObject<dyn MTLSharedEvent>, u64)>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        let cb = self.new_command_buffer(queue)?;
+        attached_heaps.clear();
+        for (f, v) in waits {
+            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+        }
+        if let Some((event, v)) = after {
+            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(event), v);
+        }
+        Ok(cb)
+    }
+
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY`, asks that a heap's set, as last committed, stay
+    /// resident between the command buffers that use it. Without it the system may make the
+    /// set's allocations non-resident whenever no command buffer in flight uses the set, and
+    /// make them resident again for the next one: in a run on a 48 GB Mac the wired memory fell
+    /// from about 22 GB to 6 GB and came back within 10 s in the world, then command buffers
+    /// timed out (#79). Measured since (`VICTORY_TRACE_RESIDENCY`, docs/native-host.md): the
+    /// wired memory falls only after the host has committed no command buffer for a few seconds,
+    /// this request does not stop that, and making the set resident again cost 0.1 to 0.3 s: the
+    /// fall follows a stall, it does not cause it.
+    fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        if self.request_residency {
+            crate::metal::residency_timed("request", Some(set), || set.requestResidency());
+            self.count(|c| c.requests += 1);
         }
     }
 
@@ -565,7 +649,8 @@ impl Metal {
     ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
-                set.commit();
+                crate::metal::residency_timed("add_commit", Some(set), || set.commit());
+                self.request(set);
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
                     c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
@@ -777,8 +862,9 @@ impl ResourceBackend for Metal {
                 .newResidencySetWithDescriptor_error(&d)
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
-            s.commit();
-            Some(s)
+            crate::metal::residency_timed("made", Some(&s), || s.commit());
+            self.request(&s);
+            Some(track_residency_set(s))
         } else {
             None
         };
@@ -787,7 +873,9 @@ impl ResourceBackend for Metal {
             kind,
             count,
             refs: RefCell::default(),
+            typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
         })
@@ -809,7 +897,90 @@ impl ResourceBackend for Metal {
         let gpu = self.gpu_address(buffer, title);
         let keep: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
         // IRDescriptorTableSetBuffer(entry, gpu, metadata = size & 0xffffffff).
-        self.heap_entry(heap, index, [gpu, 0, size as u64], Some(keep));
+        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, None)));
+    }
+
+    fn write_typed_buffer(
+        &self,
+        heap: &Heap,
+        index: usize,
+        buffer: &Buffer,
+        title: *const u8,
+        size: u32,
+        format: Format,
+        writable: bool,
+    ) -> bool {
+        debug_assert_eq!(heap.kind, HeapKind::Resource);
+        let (bw, elem_bytes) = format.block();
+        if bw != 1 || format.is_depth() || size == 0 {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        let pf = pixel_format(format);
+        let align = self
+            .dev
+            .minimumTextureBufferAlignmentForPixelFormat(pf)
+            .max(elem_bytes);
+        let offset = title as usize - buffer.base as usize;
+        let max_elems = (buffer.buf.length().saturating_sub(offset)) / elem_bytes;
+        let width = ((size as usize) / elem_bytes).min(max_elems).min(1 << 26);
+        if width == 0 {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        if !offset.is_multiple_of(align) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    offset = format!("{offset:#x}"),
+                    align,
+                    ?format,
+                    size,
+                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer; falling back to raw buffer entry (first time)"
+                );
+            } else {
+                tracing::debug!(
+                    offset = format!("{offset:#x}"),
+                    align,
+                    ?format,
+                    size,
+                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer"
+                );
+            }
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        let td = MTLTextureDescriptor::new();
+        td.setTextureType(MTLTextureType::TypeTextureBuffer);
+        td.setPixelFormat(pf);
+        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
+        unsafe {
+            td.setWidth(width);
+        }
+        td.setStorageMode(MTLStorageMode::Shared);
+        let mut usage = MTLTextureUsage::ShaderRead;
+        if writable {
+            usage |= MTLTextureUsage::ShaderWrite;
+        }
+        td.setUsage(usage);
+        let Some(tex) = buffer
+            .buf
+            .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
+        else {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        };
+        let gpu = self.gpu_address(buffer, title);
+        let tex_id = resource_id(tex.gpuResourceID());
+        let keep_buf: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
+        self.heap_entry(
+            heap,
+            index,
+            [gpu, tex_id, size as u64],
+            Some((keep_buf, Some(tex))),
+        );
+        true
     }
 
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
@@ -817,7 +988,7 @@ impl ResourceBackend for Metal {
         let id = resource_id(t.tex.gpuResourceID());
         let keep: Res = ProtocolObject::from_ref(&*t.tex).retain();
         // IRDescriptorTableSetTexture(entry, tex, minLODClamp, metadata = 0).
-        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some(keep));
+        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some((keep, None)));
     }
 
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
@@ -829,6 +1000,49 @@ impl ResourceBackend for Metal {
 
     fn clear_entry(&self, heap: &Heap, index: usize) {
         self.heap_entry(heap, index, [0; 3], None);
+    }
+
+    fn heap_typed_views(&self, heap: &Heap) -> usize {
+        heap.typed_views.get()
+    }
+
+    fn heap_allocations(&self, heap: &Heap, last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
+        use objc2_foundation::NSObjectProtocol;
+        heap.set.as_ref()?;
+        // Each allocation's latest use over the entries naming it.
+        let mut latest = std::collections::HashMap::<usize, u32>::new();
+        for (&index, (r, _)) in heap.refs.borrow().iter() {
+            let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+            let used = last_used.get(index).copied().unwrap_or(0);
+            let e = latest.entry(ptr).or_insert(0);
+            *e = (*e).max(used);
+        }
+        // A view's (or a texture over a buffer's) memory is its parent's: count the allocation under
+        // it, once, with the latest use over every object made of it.
+        let mut under = std::collections::HashMap::<usize, HeapAllocation>::new();
+        for (&id, (_, r)) in heap.alloc_counts.borrow().iter() {
+            let used = latest.get(&id).copied().unwrap_or(0);
+            let texture = r.respondsToSelector(objc2::sel!(textureType));
+            let root: Res = if texture {
+                // SAFETY: it answers `textureType`, so it is an MTLTexture.
+                let mut t: Retained<ProtocolObject<dyn MTLTexture>> = unsafe { Retained::cast_unchecked(r.clone()) };
+                while let Some(p) = t.parentTexture() {
+                    t = p;
+                }
+                match t.buffer() {
+                    Some(b) => ProtocolObject::from_retained(b),
+                    None => ProtocolObject::from_retained(t),
+                }
+            } else {
+                r.clone()
+            };
+            let rid = (&*root as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+            under
+                .entry(rid)
+                .and_modify(|a| a.latest = a.latest.max(used))
+                .or_insert(HeapAllocation { id: rid, bytes: MTLResource::allocatedSize(&*root) as u64, latest: used, texture });
+        }
+        Some(under.into_values().collect())
     }
 
     fn create_texture(&self, d: &TextureDesc) -> Result<Texture, String> {
@@ -1065,20 +1279,20 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
-    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
-        self.report_bounded();
+    fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
+    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
+            self.trace_args.borrow_mut().clear();
         }
-        let cb = if self.trace_fails {
-            let d = MTLCommandBufferDescriptor::new();
-            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
-            queue.0.commandBufferWithDescriptor(&d)
-        } else {
-            queue.0.commandBuffer()
-        }
-        .ok_or("no command buffer")?;
+        let mut cb = self.new_command_buffer(queue).map_err(SubmitFailure::uncommitted)?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut label = String::new();
         if self.trace_fails {
@@ -1116,10 +1330,29 @@ impl GraphicsBackend for Metal {
         // A pass that cannot be encoded must not take the submission's fence signals and
         // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
-        // is dropped, the command buffer still commits, and the caller is told.
-        let mut refused: Option<String> = None;
+        // is dropped, the command buffer still commits, and the caller is told which passes were
+        // dropped, so it can pay only their lost work.
+        let mut refused: Vec<usize> = Vec::new();
+        let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
-        for pass in work.passes {
+        // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
+        // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
+        // runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
+        // submission of 72 to 80 passes ran 6 to 21 s with the ray-traced passes on, while none of
+        // its passes alone took more than 1.4 s. The earlier pieces are committed as they fill.
+        // Each piece owes its own value writes, and raises the submission's piece event for the
+        // next piece, which waits for it; the last piece owes the fence signals and the order
+        // event. A piece the GPU fails pays its own share on the CPU, once ([`Owed`]), so the
+        // later pieces still run and nothing is paid twice.
+        let per = self.passes_per_buffer;
+        let pieces = if per > 0 && work.passes.len() > per {
+            Some(track_event(self.dev.newSharedEvent().ok_or_else(|| SubmitFailure::uncommitted("newSharedEvent failed"))?))
+        } else {
+            None
+        };
+        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        let mut first = 0;
+        for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
                     self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
@@ -1136,8 +1369,41 @@ impl GraphicsBackend for Metal {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
                 // whose root arguments were never set) is dropped; the passes after it still run,
                 // so one bad pass does not cost the frame's whole picture.
-                if refused.is_none() {
-                    refused = Some(e);
+                refused.push(n);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            if let Some(event) = &pieces
+                && (n + 1) % per == 0
+                && n + 1 < work.passes.len()
+            {
+                let piece = ((n + 1) / per) as u64;
+                cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
+                let owed = Owed::of(vec![(event.clone(), piece)], &work.passes[first..=n], 0);
+                // The trace names what this piece holds, not the whole submission.
+                let tinfo = self.trace_fails.then(|| {
+                    let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+                    (format!("{label} piece {piece} | {enc}"), std::mem::take(&mut *self.trace_args.borrow_mut()))
+                });
+                self.commit_piece(queue, &cb, owed, piece, tinfo);
+                first = n + 1;
+                cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        // The current piece never started: every pass from `first` on was lost,
+                        // and the earlier pieces did commit.
+                        refused.extend(first..work.passes.len());
+                        return Err(SubmitFailure {
+                            committed: true,
+                            refused,
+                            error: e,
+                        });
+                    }
+                };
+                if self.trace_fails {
+                    let piece = format!("{label} piece {}", piece + 1);
+                    cb.setLabel(Some(&objc2_foundation::NSString::from_str(&piece)));
                 }
             }
         }
@@ -1147,22 +1413,30 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        let owed = std::sync::Arc::new(Owed::new(queue, work, set_on_queue));
-        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        let mut events = Vec::with_capacity(work.signals.len() + 1);
+        if set_on_queue {
+            events.push((queue.2.clone(), queue.3.get()));
+        }
+        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        let owed = std::sync::Arc::new(Owed::of(events, &work.passes[first..], work.signals.len()));
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
-        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        let tinfo = trace.then(|| (serial, label.clone(), self.trace_enc.borrow().join(" | ")));
+        self.trace_commit(serial, queue_id, &label);
         if let Some((s, l, enc)) = &tinfo {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
+            GATED.lock().unwrap().insert(*s, std::mem::take(&mut *self.trace_args.borrow_mut()));
         }
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
+                gated_args(*s, true);
                 if done.error().is_none()
                     && let Some(t) = started
                     && t.elapsed().as_secs_f64() > 1.0
@@ -1189,9 +1463,14 @@ impl GraphicsBackend for Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
-        match refused {
-            Some(e) => Err(e),
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
+        self.committed.set(self.committed.get() + 1);
+        match first_error {
+            Some(e) => Err(SubmitFailure {
+                committed: true,
+                refused,
+                error: e,
+            }),
             None => Ok(()),
         }
     }
@@ -1239,6 +1518,88 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
 }
 
 impl Metal {
+    /// Commits piece `piece` (from 1) of a submission, not its last ([`GraphicsBackend::submit_passes`]),
+    /// with what it owes: its value writes and the piece event raised to `piece`, which the next
+    /// piece waits for. One the GPU fails is logged as the last piece's failure is and pays that on
+    /// the CPU, so the next piece runs. It is in flight as any command buffer is: one Metal never
+    /// reports on is paid by [`recover_lost`].
+    fn commit_piece(
+        &self,
+        queue: &Queue,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        owed: Owed,
+        piece: u64,
+        tinfo: Option<(String, Vec<(String, usize, usize)>)>,
+    ) {
+        let owed = std::sync::Arc::new(owed);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        // Tests: a piece the GPU drops, as one it fails (its passes and its event signal not run).
+        #[cfg(test)]
+        let dropped = DROP_PIECE.with(|d| d.get()) == Some(piece);
+        #[cfg(not(test))]
+        let dropped = {
+            let _ = piece;
+            false
+        };
+        let empty;
+        let cb = if dropped {
+            empty = self.new_command_buffer(queue).expect("a command buffer");
+            &*empty
+        } else {
+            cb
+        };
+        flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
+        self.trace_commit(serial, queue_id, &format!("piece {piece}"));
+        let trace = self.trace_fails;
+        let tinfo = tinfo.map(|(d, args)| {
+            IN_FLIGHT.lock().unwrap().insert(serial, (std::time::Instant::now(), d.clone()));
+            GATED.lock().unwrap().insert(serial, args);
+            d
+        });
+        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            // SAFETY: Metal passes the command buffer that completed.
+            let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
+            let error = done.error();
+            landed(serial, queue_id, dropped || error.is_some());
+            // A piece is traced as a whole command buffer is: slow ones, and what a failed one held
+            // (a time-out carries no encoder states, so the label alone does not name the pass).
+            if let Some(d) = &tinfo {
+                let started = IN_FLIGHT.lock().unwrap().remove(&serial).map(|(t, _)| t);
+                let secs = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                let args = gated_args(serial, true);
+                if (error.is_some() || secs > 1.0)
+                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                {
+                    tracing::warn!(
+                        "metal: {} piece {d} took {secs:.3}s (gpu {:.3}s, kernel {:.3}s){args}",
+                        if error.is_some() { "failed" } else { "slow" },
+                        done.GPUEndTime() - done.GPUStartTime(),
+                        done.kernelEndTime() - done.kernelStartTime()
+                    );
+                }
+            }
+            if let Some(e) = &error
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
+            {
+                if trace {
+                    trace_failure(done, e);
+                } else {
+                    eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                }
+            }
+            if dropped || error.is_some() {
+                owed.recover();
+            }
+        });
+        // SAFETY: the block is retained by Metal until it has run.
+        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
+        self.committed.set(self.committed.get() + 1);
+    }
+
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
     fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MTLSize>) -> Result<RenderPipeline, String> {
         let has_stencil = d.depth == Some(Format::D32FloatS8);
@@ -1469,8 +1830,19 @@ impl Owed {
             events.push((queue.2.clone(), queue.3.get()));
         }
         events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        Owed::of(events, work.passes, work.signals.len())
+    }
+
+    /// What `passes` owe if they fail: their value writes, then `events` raised (`signals` of them
+    /// the submission's fence signals, for the log).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn of(
+        events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+        passes: &[Pass<'_, Metal>],
+        signals: usize,
+    ) -> Owed {
         let mut fills = Vec::new();
-        for pass in work.passes {
+        for pass in passes {
             if let Pass::Blit(ops) = pass {
                 for op in ops {
                     // shortcut: copies are not replayed (one may have partly run and its source
@@ -1482,7 +1854,7 @@ impl Owed {
                 }
             }
         }
-        Owed { recovery: std::sync::Once::new(), events, fills, signals: work.signals.len() }
+        Owed { recovery: std::sync::Once::new(), events, fills, signals }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
@@ -1607,10 +1979,176 @@ fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::
     lost.len()
 }
 
+/// The process's shared events (queue order events, title fences, piece events), weakly, so a
+/// stop can wake every command buffer waiting on one ([`stop_gpu`]).
+struct TrackedEvents(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLSharedEvent>>>);
+// SAFETY: shared events may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedEvents {}
+static EVENTS: std::sync::Mutex<TrackedEvents> = std::sync::Mutex::new(TrackedEvents(Vec::new()));
+
+/// Remembers `event` for [`stop_gpu`] and returns it.
+pub(crate) fn track_event(
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+) -> Retained<ProtocolObject<dyn MTLSharedEvent>> {
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if events.0.len() % 1024 == 1023 {
+        events.0.retain(|w| w.load().is_some());
+    }
+    events.0.push(objc2::rc::Weak::from_retained(&event));
+    event
+}
+
+/// The process's residency sets (each heap's and the pool's), weakly, so a stop can give back what
+/// they hold before the process exits ([`stop_gpu`]).
+struct TrackedSets(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLResidencySet>>>);
+// SAFETY: residency sets may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedSets {}
+static SETS: std::sync::Mutex<TrackedSets> = std::sync::Mutex::new(TrackedSets(Vec::new()));
+
+/// Remembers `set` for [`stop_gpu`] and returns it.
+pub(crate) fn track_residency_set(
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    if sets.0.len() % 256 == 255 {
+        sets.0.retain(|w| w.load().is_some());
+    }
+    sets.0.push(objc2::rc::Weak::from_retained(&set));
+    set
+}
+
+/// Empties and commits `sets`: what they held is no longer kept resident. Returns the bytes they
+/// held.
+fn release_sets(sets: &[Retained<ProtocolObject<dyn MTLResidencySet>>]) -> u64 {
+    let mut bytes = 0;
+    for set in sets {
+        bytes += set.allocatedSize();
+        set.removeAllAllocations();
+        set.commit();
+    }
+    bytes
+}
+
+/// A value above any a command buffer waits for: an event raised to it lets every wait on it pass.
+const STOP_VALUE: u64 = 1 << 62;
+
+/// Stops the process's GPU work cleanly before it exits: raises every shared event a command
+/// buffer may wait on ([`track_event`]), waits up to `wait` for the command buffers in flight to
+/// complete, and pays what the ones that did not still owe on the CPU. Returns how many were in
+/// flight and how many of them did not complete.
+///
+/// A process killed while its command buffers sleep in the kernel on events it never signals can
+/// leave the GPU memory they hold allocated after it exits: on macOS 26.5 an M5 Max kept about
+/// 20 GB "in use" by the GPU driver, owned by no process, until a reboot (#357). Woken first, they
+/// finish and the process exits with nothing pending.
+pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
+    let events: Vec<_> = EVENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let drained = wake_and_drain(&events, wait);
+    // Then what the residency sets keep resident is given back before the process goes, not left
+    // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
+    // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
+    let sets: Vec<_> = SETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let bytes = release_sets(&sets);
+    tracing::warn!(sets = sets.len(), mb = bytes >> 20, "stop: residency sets emptied");
+    drained
+}
+
+/// [`stop_gpu`] for `events` (the tests wake only their own).
+fn wake_and_drain(
+    events: &[Retained<ProtocolObject<dyn MTLSharedEvent>>],
+    wait: std::time::Duration,
+) -> (usize, usize) {
+    let in_flight = flights().len();
+    for e in events {
+        if e.signaledValue() < STOP_VALUE {
+            e.setSignaledValue(STOP_VALUE);
+        }
+    }
+    let deadline = std::time::Instant::now() + wait;
+    while !flights().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let left: Vec<Flight> = flights().drain(..).collect();
+    for f in &left {
+        f.owed.recover();
+    }
+    (in_flight, left.len())
+}
+
+/// `VICTORY_TRACE_COMMITS=1` (with `VICTORY_TRACE_GPU_FAILS` for the encoder names): a line for
+/// each command buffer as it is committed (serial, queue, its encoders: pipelines by shader hash,
+/// draw counts, dispatch sizes) and one as it completes, so a command buffer the GPU never
+/// finishes is the one committed and never done (#79).
+fn commits_traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TRACE_COMMITS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The completion line of [`commits_traced`].
+fn trace_done(serial: u64, done: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if commits_traced() {
+        tracing::info!(
+            "cb done #{serial} t={:.3} gpu_ms={:.1} failed={}",
+            crate::metal::since_start(),
+            (done.GPUEndTime() - done.GPUStartTime()) * 1000.0,
+            done.error().is_some()
+        );
+    }
+}
+
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: the piece of this thread's split submissions that the GPU drops, as one it fails.
+    static DROP_PIECE: Cell<Option<u64>> = const { Cell::new(None) };
+}
 /// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
 static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Tracing: the gate buffers of a command buffer's indirect dispatches and draws (pipeline name or
+/// the draw's place in its pass, contents address, words), by serial. The command buffer keeps
+/// the buffers alive while it is in flight.
+static GATED: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<(String, usize, usize)>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The group counts the GPU gave command buffer `serial`'s indirect dispatches, as its gates
+/// wrote them (zeros for a gate that has not run); `forget` when the command buffer has landed.
+fn gated_args(serial: u64, forget: bool) -> String {
+    let mut gated = GATED.lock().unwrap();
+    let args = if forget { gated.remove(&serial) } else { gated.get(&serial).cloned() };
+    let mut out = String::new();
+    for (name, at, words) in args.unwrap_or_default() {
+        // SAFETY: a shared buffer of `words` words, alive while its command buffer is in flight; a
+        // landed one is read in its completion handler, before Metal releases it.
+        let w: Vec<u32> = (0..words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
+        // A dispatch's gate holds what it runs, then what the record asked for.
+        let asked = if words == 6 { &w[3..] } else { &w[..] };
+        out.push_str(&format!(" | gpu read {name} {asked:?}"));
+        // A record past the most groups the gate runs, which ran nothing: each pipeline's first few.
+        if words == 6 && asked.iter().map(|g| u128::from(*g)).product::<u128>() > 1 << 22 {
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap();
+            if seen.iter().filter(|n| **n == name).count() < 4 {
+                seen.push(name.clone());
+                tracing::warn!("metal: an indirect dispatch past the most groups ran nothing: {name} {asked:?}");
+            }
+        }
+    }
+    out
+}
 static REPORTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 /// Slow and in-flight lines printed so far (each capped at 100).
@@ -1635,7 +2173,7 @@ pub fn report_in_flight() -> usize {
         if REPORTED.lock().unwrap().insert(s)
             && FLIGHT_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
         {
-            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}");
+            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}{}", gated_args(s, false));
         }
     }
     count
@@ -1681,131 +2219,24 @@ fn cap_label_str(mut s: String) -> String {
     s
 }
 
-/// Every indirect dispatch reads its group counts through this one-thread kernel. A record of
-/// more than 2^24 groups in all (a count the title or a mistranslated shader wrote wrong) would
-/// keep the GPU busy until Metal's watchdog fails the queue, and a GPU that long stuck also
-/// stalls WindowServer. Such a record runs no groups, and the first one since the host last
-/// looked is noted in `seen`: 1, the pipeline (two words), the three counts. Not D3D12's 65535
-/// a dimension: the title dispatches over 100000 groups in x, which the console and Metal run.
-const BOUND: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void bound(device const uint *record [[buffer(21)]],
-                  device uint *out [[buffer(22)]],
-                  constant uint2 &who [[buffer(23)]],
-                  device atomic_uint *seen [[buffer(24)]]) {
-    uint x = record[0], y = record[1], z = record[2];
-    ulong groups = ulong(x) * ulong(y) * ulong(z);
-    bool ok = groups <= (1ul << 24);
-    out[0] = ok ? x : 0u;
-    out[1] = ok ? y : 0u;
-    out[2] = ok ? z : 0u;
-    if (!ok && atomic_exchange_explicit(&seen[0], 1u, memory_order_relaxed) == 0u) {
-        atomic_store_explicit(&seen[1], who.x, memory_order_relaxed);
-        atomic_store_explicit(&seen[2], who.y, memory_order_relaxed);
-        atomic_store_explicit(&seen[3], x, memory_order_relaxed);
-        atomic_store_explicit(&seen[4], y, memory_order_relaxed);
-        atomic_store_explicit(&seen[5], z, memory_order_relaxed);
-    }
-}
-"#;
-
 impl Metal {
-    fn bound_pipeline(&self) -> Result<&ProtocolObject<dyn MTLComputePipelineState>, String> {
-        self.bound
-            .get_or_init(|| {
-                let lib = self
-                    .dev
-                    .newLibraryWithSource_options_error(
-                        &objc2_foundation::NSString::from_str(BOUND),
-                        None,
-                    )
-                    .map_err(|e| e.localizedDescription().to_string())?;
-                let f = lib
-                    .newFunctionWithName(&objc2_foundation::NSString::from_str("bound"))
-                    .ok_or("no bound function")?;
-                self.dev
-                    .newComputePipelineStateWithFunction_error(&f)
-                    .map_err(|e| e.localizedDescription().to_string())
-            })
-            .as_deref()
-            .map_err(Clone::clone)
-    }
-
-    fn bound_seen(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
-        self.bound_seen
-            .get_or_init(|| {
-                let b = self.dev.newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)?;
-                // SAFETY: a fresh 32-byte shared buffer.
-                unsafe { std::ptr::write_bytes(b.contents().as_ptr().cast::<u8>(), 0, 32) };
-                Some(b)
-            })
-            .as_deref()
-    }
-
-    /// Encodes the bound of the three group counts at `at` in `record` into `e`; returns the
-    /// buffer the indirect dispatch reads instead (`BOUND`).
-    fn encode_bound(
-        &self,
-        e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        record: &ProtocolObject<dyn MTLBuffer>,
-        at: usize,
-        who: usize,
-    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
-        let seen = self.bound_seen().ok_or("no buffer for dropped indirect dispatches")?;
-        let out = self
-            .dev
-            .newBufferWithLength_options(12, MTLResourceOptions::StorageModePrivate)
-            .ok_or("no buffer for a bounded indirect record")?;
-        e.useResource_usage(ProtocolObject::from_ref(seen), MTLResourceUsage::Read | MTLResourceUsage::Write);
-        // What the work before wrote (the record) is seen.
-        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        e.setComputePipelineState(self.bound_pipeline()?);
-        let who = [who as u32, (who as u64 >> 32) as u32];
-        // SAFETY: `at` lies inside `record` (the caller resolved three words there); the bytes are
-        // copied before the call returns.
-        unsafe {
-            e.setBuffer_offset_atIndex(Some(record), at, 21);
-            e.setBuffer_offset_atIndex(Some(&out), 0, 22);
-            e.setBytes_length_atIndex(NonNull::new(who.as_ptr().cast_mut().cast()).unwrap(), 8, 23);
-            e.setBuffer_offset_atIndex(Some(seen), 0, 24);
-        }
-        e.dispatchThreadgroups_threadsPerThreadgroup(size([1, 1, 1]), size([1, 1, 1]));
-        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        Ok(out)
-    }
-
-    /// Logs an indirect dispatch `BOUND` dropped since the last look (the first 50 of a run).
-    pub(crate) fn report_bounded(&self) {
-        let Some(seen) = self.bound_seen.get().and_then(|s| s.as_deref()) else { return };
-        let w = seen.contents().as_ptr().cast::<u32>();
-        // SAFETY: the buffer is 8 shared words; the GPU may write them meanwhile (a diagnostic).
-        let v: [u32; 6] = unsafe { std::array::from_fn(|i| std::ptr::read_volatile(w.add(i))) };
-        if v[0] == 0 {
-            return;
-        }
-        // SAFETY: as above.
-        unsafe { std::ptr::write_volatile(w, 0) };
-        let n = self.bound_logged.get();
-        if n >= 50 {
-            return;
-        }
-        self.bound_logged.set(n + 1);
-        let k = (u64::from(v[2]) << 32 | u64::from(v[1])) as usize;
-        let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
-        tracing::warn!(
-            "metal: an indirect dispatch of over 2^24 groups ran none: {name} {}x{}x{} (one of those since the last report)",
-            v[3], v[4], v[5]
-        );
-    }
-
     /// The capped label for an encoder, kept for the command buffer's description.
+    /// The command buffer's description keeps the whole label when `VICTORY_TRACE_COMMITS` logs it
+    /// (a capped one hid the end of a 17-dispatch pass, #79).
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
-        // The in-flight and failure trace keeps the whole list: a stuck command buffer must name
-        // every dispatch it holds; only Metal's label is capped.
-        let n = objc2_foundation::NSString::from_str(&cap_label_str(s.clone()));
-        self.trace_enc.borrow_mut().push(s);
+        let capped = cap_label_str(s.clone());
+        let n = objc2_foundation::NSString::from_str(&capped);
+        self.trace_enc.borrow_mut().push(if commits_traced() { s } else { capped });
         n
+    }
+
+    /// The commit line of [`commits_traced`]: this command buffer's encoders, which are then
+    /// forgotten so the next piece lists only its own.
+    fn trace_commit(&self, serial: u64, queue_id: usize, what: &str) {
+        if commits_traced() {
+            let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+            tracing::warn!("cb commit #{serial} q{queue_id:x} t={:.3} {what} | {enc}", crate::metal::since_start());
+        }
     }
 
     fn encode_blit(
@@ -2091,17 +2522,46 @@ pub fn direct_copy(a: Format, b: Format) -> bool {
 /// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
 /// on the GPU: this one-thread kernel copies the record's `words`, or zeros (no groups, no
 /// vertices or instances), into a buffer of its own, which the indirect command then reads.
-/// Bound at 20 and up, apart from the converter's slots.
+/// A rectangle list's record (`DrawCall::Rects`) becomes the four-vertex strip instances a direct
+/// one draws: (4, vertices / 3, 0, first vertex / 3).
+/// A dispatch's record, or a mesh dispatch's, runs nothing if it asks for more than 2^22 groups in
+/// all: such a record is what its writer left unfinished in title memory, and Metal would run it
+/// (510 x 1,182,027,346 x 1,314,076,063 groups in GTA VI's world: that command buffer never
+/// ended, and every one behind it on the queue timed out). A guard of ours, not a console rule:
+/// the title's own records ask for far less (9,192 groups at most seen here), but for more than
+/// D3D12's 65,535 in one dimension on larger targets, so the limit is on the product.
+/// Bound at 20 and up, apart from the converter's slots. `at`: the record's index, its words,
+/// whether a count applies, 1 for a rectangle list's record or 2 for a dispatch's or a mesh
+/// dispatch's (six words out: the three it runs, then the three the record asked for, for
+/// `VICTORY_TRACE_GPU_FAILS`).
 const GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 kernel void gate(device const uint *count [[buffer(20)]],
                  device const uint *record [[buffer(21)]],
                  device uint *out [[buffer(22)]],
-                 constant uint2 &at [[buffer(23)]]) {
-    bool run = at.x < count[0];
+                 constant uint4 &at [[buffer(23)]]) {
+    bool run = at.z == 0u || at.x < count[0];
+    if (at.w == 2u) {
+        // Two steps: the product of three words does not fit 64 bits.
+        ulong plane = ulong(record[0]) * record[1];
+        run = run && plane <= 4194304ul && plane * record[2] <= 4194304ul;
+        for (uint w = 0; w < 3u; w++) {
+            out[w] = run ? record[w] : 0u;
+            out[3u + w] = record[w];
+        }
+        return;
+    }
     for (uint w = 0; w < at.y; w++) {
         out[w] = run ? record[w] : 0u;
+    }
+    if (at.w == 1u) {
+        // shortcut: an instanced rectangle list draws nothing (the rectangle translation takes the
+        // instance for the rectangle); draw its instances when a title is seen to use them.
+        out[0] = 4u;
+        out[1] = run && record[1] == 1u ? record[0] / 3u : 0u;
+        out[2] = 0u;
+        out[3] = run ? record[2] / 3u : 0u;
     }
 }
 "#;
@@ -2128,7 +2588,8 @@ impl Metal {
             .map_err(Clone::clone)
     }
 
-    /// Encodes the gate of one counted record (`words` long at `record`) into `e`; returns the
+    /// Encodes the gate of one counted (`count`: buffer, address, index), rectangle-list (`kind` 1)
+    /// or dispatch or mesh dispatch (`kind` 2) record (`words` long at `record`) into `e`; returns the
     /// buffer the indirect command reads instead of the record. Tracked by Metal (unlike the
     /// title's pools), so whatever reads it later in the command buffer waits for the write.
     /// shortcut: one gate dispatch and one small buffer per record; gate all the records of one
@@ -2136,15 +2597,24 @@ impl Metal {
     fn encode_gate(
         &self,
         e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        (count, at, index): (&Buffer, *const u8, u32),
+        count: Option<(&Buffer, *const u8, u32)>,
         (record, title): (&Buffer, *const u8),
         words: u32,
+        kind: u32,
         set_on_queue: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
         let out = self
             .dev
-            .newBufferWithLength_options(words as usize * 4, MTLResourceOptions::StorageModePrivate)
+            .newBufferWithLength_options(
+                // A dispatch's gate also keeps what the record asked for.
+                if kind == 2 { 24 } else { words as usize * 4 },
+                // Tracing reads the record the GPU used back (`GATED`).
+                if self.trace_fails { MTLResourceOptions::StorageModeShared } else { MTLResourceOptions::StorageModePrivate },
+            )
             .ok_or("no buffer for a gated indirect record")?;
+        let counted = u32::from(count.is_some());
+        // Without a count, slot 20 is bound to the record (not read).
+        let (count, at, index) = count.unwrap_or((record, title, 0));
         for b in [count, record] {
             if self.names(b, set_on_queue) {
                 e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
@@ -2153,7 +2623,7 @@ impl Metal {
         // What the work before wrote (the count, the record) is seen.
         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         e.setComputePipelineState(self.gate_pipeline()?);
-        let args = [index, words];
+        let args = [index, words, counted, kind];
         // SAFETY: both title ranges lie inside live buffers (the caller resolved them); the bytes
         // are copied before the call returns.
         unsafe {
@@ -2166,7 +2636,7 @@ impl Metal {
             e.setBuffer_offset_atIndex(Some(&out), 0, 22);
             e.setBytes_length_atIndex(
                 NonNull::new(args.as_ptr().cast_mut().cast()).unwrap(),
-                8,
+                16,
                 23,
             );
         }
@@ -2207,28 +2677,21 @@ impl Metal {
         }
         let mut named = Vec::new();
         for d in dispatches.iter().filter(|d| runs(d)) {
-            let gated = match (d.count, d.indirect) {
-                (Some(count), Some(record)) => {
-                    // An open encoder left behind makes Metal abort at the next pass's encoder.
-                    Some(self.encode_gate(&e, count, record, 3, set_on_queue).inspect_err(|_| e.endEncoding())?)
-                }
-                _ => None,
-            };
-            // Every indirect record's counts pass `BOUND` first, into a buffer of its own.
-            let bounded = match d.indirect {
-                Some((b, title)) => {
-                    if self.names(b, set_on_queue) {
-                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
-                    }
-                    let (buf, at) = match &gated {
-                        Some(g) => (&**g, 0),
-                        None => (&*b.buf, title as usize - b.base as usize),
-                    };
-                    let who = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
-                    Some(self.encode_bound(&e, buf, at, who).inspect_err(|_| e.endEncoding())?)
-                }
+            // Every indirect record goes through the gate: the count buffer's limit, and the most
+            // groups a record may ask for.
+            let gated = match d.indirect {
+                // An open encoder left behind makes Metal abort at the next pass's encoder.
+                Some(record) => Some(
+                    self.encode_gate(&e, d.count, record, 3, 2, set_on_queue)
+                        .inspect_err(|_| e.endEncoding())?,
+                ),
                 None => None,
             };
+            if let (true, Some(g)) = (self.trace_fails, &gated) {
+                let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
+                let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
+                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 6));
+            }
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
@@ -2240,17 +2703,15 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            match &bounded {
-                Some(bounded) => {
-                    // SAFETY: the bound kernel wrote three words to its own buffer.
-                    unsafe {
-                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            bounded,
-                            0,
-                            size(d.threads_per_group),
-                        )
-                    };
-                }
+            match &gated {
+                // SAFETY: the gate wrote three words to its own buffer.
+                Some(g) => unsafe {
+                    e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                        g,
+                        0,
+                        size(d.threads_per_group),
+                    )
+                },
                 None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
             }
         }
@@ -2267,10 +2728,15 @@ impl Metal {
                     Some(n) => l.push_str(n),
                     None => l.push_str(&format!("{k:#x}")),
                 }
-                if d.indirect.is_some() {
-                    l.push_str(" indirect; ");
-                } else {
-                    l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+                match d.indirect {
+                    // The record as title memory holds it now: what earlier command buffers
+                    // left there, not what this one's earlier passes will write.
+                    Some((_, title)) => {
+                        // SAFETY: the caller resolved three words at `title` inside the live buffer.
+                        let w: [u32; 3] = unsafe { title.cast::<[u32; 3]>().read_unaligned() };
+                        l.push_str(&format!(" indirect{w:?}; "));
+                    }
+                    None => l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2])),
                 }
             }
             e.setLabel(Some(&self.cap_label(l)));
@@ -2421,13 +2887,15 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        // Counted indirect draws are gated first, in a compute pass of their own.
+        // Counted indirect draws, indirect rectangle lists and indirect mesh dispatches (for the
+        // most groups they may ask for) are gated first, in a compute pass of their own; when
+        // tracing, every indirect draw is, so what the GPU read is known.
+        let gated = |d: &Draw<'_, Metal>| {
+            d.indirect.is_some()
+                && (d.count.is_some() || matches!(d.call, DrawCall::Rects | DrawCall::Mesh { .. }) || self.trace_fails)
+        };
         let mut gates = Vec::new();
-        if rp
-            .draws
-            .iter()
-            .any(|d| d.count.is_some() && d.indirect.is_some())
-        {
+        if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
             if let Some((f, started)) = order
                 && started.get()
@@ -2437,12 +2905,22 @@ impl Metal {
             for d in &rp.draws {
                 let words = match d.call {
                     DrawCall::Indexed { .. } => 5,
-                    DrawCall::Arrays { .. } => 4,
+                    DrawCall::Arrays { .. } | DrawCall::Rects => 4,
                     DrawCall::Mesh { .. } => 3,
                 };
-                gates.push(match (d.count, d.indirect) {
-                    (Some(count), Some(record)) => {
-                        Some(self.encode_gate(&c, count, record, words, set_on_queue).inspect_err(|_| c.endEncoding())?)
+                let kind = match d.call {
+                    DrawCall::Rects => 1,
+                    DrawCall::Mesh { .. } => 2,
+                    _ => 0,
+                };
+                gates.push(match d.indirect {
+                    Some(record) if gated(d) => {
+                        let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue).inspect_err(|_| c.endEncoding())?;
+                        if self.trace_fails {
+                            let name = format!("{} {}", if kind == 2 { "mesh draw" } else { "draw" }, gates.len());
+                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, if kind == 2 { 6 } else { words as usize }));
+                        }
+                        Some(g)
                     }
                     _ => None,
                 });
@@ -2504,7 +2982,7 @@ impl Metal {
             // The stage that reads the draw's buffers before the pixel shader.
             let first = match (d.pipeline.mesh, d.call) {
                 (Some(_), DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
-                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. }) => MTLRenderStages::Vertex,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => MTLRenderStages::Vertex,
                 _ => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| eprintln!("metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"));
@@ -2663,7 +3141,7 @@ impl Metal {
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
                 unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
                 match (d.call, d.index_buffer) {
-                    (DrawCall::Arrays { .. }, _) => {
+                    (DrawCall::Arrays { .. } | DrawCall::Rects, _) => {
                         set_index_type(&e, 0);
                         // SAFETY: as above.
                         unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at) };
@@ -2734,6 +3212,7 @@ impl Metal {
                         )
                     };
                 }
+                DrawCall::Rects => unreachable!("an indirect-only call, and so empty here"),
                 DrawCall::Indexed {
                     index_count,
                     instance_count,
@@ -2791,7 +3270,25 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+            // Each distinct pipeline once, with its draw count: names the pass's shaders.
+            let names = self.pipe_names.borrow();
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            for d in &rp.draws {
+                let k = Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize;
+                match seen.iter_mut().find(|(p, _)| *p == k) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((k, 1)),
+                }
+            }
+            let mut l = format!("render: {} draws", rp.draws.len());
+            for (k, n) in seen {
+                match names.get(&k) {
+                    Some(name) => l.push_str(&format!("; {name} x{n}")),
+                    None => l.push_str(&format!("; {k:#x} x{n}")),
+                }
+            }
+            drop(names);
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())
@@ -2808,6 +3305,8 @@ fn empty_draw(call: &DrawCall) -> bool {
             index_count == 0 || instance_count == 0
         }
         DrawCall::Mesh { groups } => groups.contains(&0),
+        // Only an indirect call.
+        DrawCall::Rects => true,
     }
 }
 
@@ -2997,6 +3496,93 @@ mod owed_tests {
     use crate::backend::ComputeBackend;
     use crate::mem::{Region, page_size};
 
+    /// A submission of more passes than a command buffer takes goes in several, in order: every
+    /// pass runs and the fence is signalled once the last has.
+    #[test]
+    fn a_long_submission_is_cut_into_command_buffers_of_at_most_n_passes() {
+        let m = Metal::new().unwrap().with_passes_per_buffer(8);
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        // Each pass fills its own 8 bytes; the last one also overwrites the first pass's.
+        let mut passes: Vec<_> = (0..20u8)
+            .map(|n| Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(usize::from(n) * 8)), len: 8, value: n + 1 }]))
+            .collect();
+        passes.push(Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(0)), len: 8, value: 0xEE }]));
+        let signals = [(&fence, 1)];
+        let before = m.command_buffers();
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        assert_eq!(m.command_buffers() - before, 3, "21 passes, 8 to a command buffer");
+        assert!(m.wait(&fence, 1, 5000), "the last piece signals");
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 20 * 8) };
+        assert_eq!(&bytes[..8], &[0xEE; 8], "the pieces ran in order");
+        for n in 1..20 {
+            assert_eq!(&bytes[n * 8..][..8], &[n as u8 + 1; 8], "pass {n}");
+        }
+
+        // 0: the whole submission in one command buffer.
+        let m = m.with_passes_per_buffer(0);
+        let before = m.command_buffers();
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&fence, 2)] }).unwrap();
+        assert_eq!(m.command_buffers() - before, 1);
+        assert!(m.wait(&fence, 2, 5000));
+    }
+
+    /// A piece of a split submission that the GPU fails (here one the test drops: its passes and
+    /// its release of the next piece do not run, as when the GPU fails it) pays its own value
+    /// writes on the CPU and lets the next piece go; the later pieces still run on the GPU, and the
+    /// fence is signalled by the last one. Nothing is paid twice: a write made after the fence was
+    /// reached stays.
+    #[test]
+    fn a_failed_earlier_piece_pays_its_own_writes_and_the_later_pieces_still_run() {
+        let _shared = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap().with_passes_per_buffer(4);
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        q.1.set(true); // as with the pool's residency set: the order event is in play
+        let fence = m.create_fence(0).unwrap();
+        // 12 passes, three pieces of 4: pass n fills its own 8 bytes with n + 1.
+        let passes: Vec<_> = (0..12u8)
+            .map(|n| Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(usize::from(n) * 8)), len: 8, value: n + 1 }]))
+            .collect();
+        let check = |first: u8, signal: u64| {
+            DROP_PIECE.with(|d| d.set(Some(1)));
+            let before = m.command_buffers();
+            let signals = [(&fence, signal)];
+            m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+            DROP_PIECE.with(|d| d.set(None));
+            assert_eq!(m.command_buffers() - before, 3);
+            assert!(m.wait(&fence, signal, 5000), "the later pieces did not run");
+            // SAFETY: inside the region; the GPU is done with it.
+            let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 12 * 8) };
+            for n in 0..12 {
+                assert_eq!(&bytes[n * 8..][..8], &[n as u8 + first; 8], "pass {n}");
+            }
+        };
+        check(1, 1);
+        // The title writes over the first piece's words once it has seen the fence: a second
+        // payment of the failed piece would undo that.
+        // SAFETY: inside the region; the GPU is done with it.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xCD, 8) };
+        let after = [(&fence, 2)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
+        assert!(m.wait(&fence, 2, 5000));
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0xCD; 8], "paid twice");
+        assert_eq!(q.2.signaledValue(), 2, "the order event went past what the submissions owe");
+        // Again from zeros: the failed piece's words come from the CPU, the rest from the GPU.
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0, 12 * 8) };
+        check(1, 3);
+    }
+
     #[test]
     fn a_failed_command_buffer_is_paid_on_the_cpu() {
         let m = Metal::new().unwrap();
@@ -3084,6 +3670,48 @@ mod owed_tests {
         let after = [(&fence, 4)];
         m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
         assert!(m.wait(&fence, 4, 5000), "the queue runs on behind the recovered command buffer");
+    }
+
+    /// A stop wakes a command buffer asleep on an event nobody signals, as a title's queues are
+    /// when the process is told to stop: it completes on the GPU (its fence is reached by the GPU,
+    /// not paid), and nothing is left in flight.
+    #[test]
+    fn a_stop_wakes_command_buffers_waiting_on_events_nobody_signals() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap();
+        let q = m.create_queue().unwrap();
+        let (never, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
+        m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &[], signals: &signals }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(m.completed(&fence), 0, "the command buffer sleeps on its wait");
+        let (in_flight, left) = wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5));
+        assert!(in_flight >= 1);
+        assert_eq!(left, 0, "every command buffer completed on the GPU");
+        assert_eq!(m.completed(&fence), 3);
+        // The events a stop wakes are tracked as they are made, and let go with them.
+        let tracked = |e: &Retained<ProtocolObject<dyn MTLSharedEvent>>| {
+            EVENTS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(e)))
+        };
+        assert!(tracked(&never.0) && tracked(&q.2));
+    }
+
+    /// A stop empties the residency sets it tracks, so nothing it made stays resident.
+    #[test]
+    fn a_stop_empties_the_residency_sets() {
+        use objc2_foundation::NSObjectProtocol;
+        let m = Metal::new().unwrap();
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        let set = track_residency_set(m.dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap());
+        let buf = m.dev.newBufferWithLength_options(1 << 20, MTLResourceOptions::StorageModePrivate).unwrap();
+        set.addAllocation(ProtocolObject::from_ref(&*buf));
+        set.commit();
+        assert_eq!(set.allocationCount(), 1);
+        assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
+        assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
+        assert_eq!(set.allocationCount(), 0);
     }
 
     #[test]
@@ -3320,6 +3948,54 @@ mod heap_set_tests {
         assert!(!attaches(&a, &mut second));
     }
 
+    /// Each piece of a split submission is a command buffer of its own, and a residency set keeps
+    /// its allocations resident only for the command buffers it was given to: the next piece
+    /// attaches every heap again.
+    #[test]
+    fn the_next_piece_of_a_split_submission_attaches_the_heaps_again() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        if heap.set.is_none() {
+            eprintln!("skipped: no residency sets on this system");
+            return;
+        }
+        let q = m.create_queue().unwrap();
+        let attaches = |attached: &mut Vec<*const Heap>| {
+            let mut called = false;
+            m.use_heap_cb(&heap, attached, |_| called = true);
+            called
+        };
+        let mut attached = Vec::new();
+        assert!(attaches(&mut attached), "the first piece");
+        assert!(!attaches(&mut attached), "once per command buffer");
+        let _next = m.next_piece(&q, &[], &mut attached, None).unwrap();
+        assert!(attaches(&mut attached), "the next piece is given the heap's set too");
+    }
+
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY` a heap's set asks to stay resident when it is made
+    /// and after each commit a use makes; without it, never.
+    #[test]
+    fn a_heaps_set_asks_to_stay_resident_only_when_switched_on() {
+        for on in [false, true] {
+            let m = Metal::new().unwrap().with_heap_sets().with_requested_residency(on);
+            let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+            if heap.set.is_none() {
+                eprintln!("skipped: no residency sets on this system");
+                return;
+            }
+            let before = m.residency_counts().requests;
+            let t = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+            m.write_texture(&heap, 0, &t, 0.0);
+            let mut attached = Vec::new();
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            let made = u64::from(on);
+            assert_eq!(before, made, "on={on}: when the set is made");
+            assert_eq!(m.residency_counts().requests, 2 * made, "on={on}: again after the one commit");
+            drop(heap); // ends the residency it asked for
+        }
+    }
+
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,
     /// and lets an allocation go when the last entry naming it is overwritten: the set is what a
     /// command buffer that uses the heap keeps resident.
@@ -3351,6 +4027,190 @@ mod heap_set_tests {
         // SAFETY: the heap buffer holds four entries of `ENTRY` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY) };
         assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
+
+        let heap_only = set.allocatedSize();
+        let arena = crate::mem::Alias::new(65536).unwrap();
+        let buf = victory_backend::backend::ComputeBackend::wrap_title_memory(
+            &m,
+            arena.primary,
+            arena.len,
+        )
+        .unwrap();
+        let entry_words = |i: usize| -> [u64; 3] {
+            // SAFETY: the heap buffer holds four entries of `ENTRY` (24) bytes.
+            unsafe {
+                heap.buf
+                    .contents()
+                    .as_ptr()
+                    .cast::<[u64; 3]>()
+                    .add(i)
+                    .read_unaligned()
+            }
+        };
+        assert!(m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true));
+        assert_eq!(m.heap_typed_views(&heap), 1);
+        assert_ne!(entry_words(0)[1], 0, "aligned typed buffer writes textureViewID");
+        // SAFETY: `1024` and `4` are inside the 64 KiB `arena` allocation.
+        let second = unsafe { arena.primary.add(1024) };
+        let unaligned = unsafe { arena.primary.add(4) };
+        assert!(m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2);
+        assert!(!m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2, "unaligned fallback holds no typed view");
+        assert_ne!(entry_words(2)[0], 0, "unaligned fallback preserves gpuVA in word 0");
+        assert_eq!(entry_words(2)[1], 0, "unaligned fallback leaves textureViewID null");
+        assert_eq!(entry_words(2)[2], 1024);
+        assert_eq!(held(), 2, "typed buffer views over one pool add only the pool allocation");
+        assert_eq!(
+            set.allocatedSize(),
+            heap_only + arena.len as u64,
+            "buffer-backed texture views do not multiply the pool's residency-set size"
+        );
+        m.write_buffer(&heap, 0, &buf, arena.primary, 1024);
+        assert_eq!(m.heap_typed_views(&heap), 1, "overwriting with write_buffer drops the typed view");
+        assert_eq!(entry_words(0)[1], 0, "write_buffer zeroes textureViewID");
+        m.clear_entry(&heap, 0);
+        m.clear_entry(&heap, 2);
+        assert_eq!(held(), 2);
+        assert_eq!(m.heap_typed_views(&heap), 1);
+        m.clear_entry(&heap, 1);
+        assert_eq!(m.heap_typed_views(&heap), 0, "clear_entry drops the last typed view");
+        assert_eq!(held(), 1, "cleared typed buffer entries release the pool allocation");
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test -p victory-metal typed_buffer_view_cost_benchmark -- --ignored --nocapture"]
+    fn typed_buffer_view_cost_benchmark() {
+        fn phys_footprint() -> usize {
+            const TASK_VM_INFO: i32 = 22;
+            unsafe extern "C" {
+                fn mach_task_self() -> u32;
+                fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+            }
+            let mut info = [0u64; 64];
+            let mut count = 128u32;
+            // SAFETY: local buffer of `count` 32-bit words for `TASK_VM_INFO`.
+            let kr = unsafe { task_info(mach_task_self(), TASK_VM_INFO, info.as_mut_ptr(), &mut count) };
+            if kr == 0 && count >= 38 { info[18] as usize } else { 0 }
+        }
+
+        let m = Metal::new().unwrap().with_heap_sets();
+        for fmt in [
+            Format::R8Unorm,
+            Format::R16Float,
+            Format::R32Uint,
+            Format::Rg32Float,
+            Format::Rgba16Uint,
+            Format::Rgba32Uint,
+            Format::Rgba32Float,
+        ] {
+            let pf = pixel_format(fmt);
+            let align = m.dev.minimumTextureBufferAlignmentForPixelFormat(pf);
+            println!("align {fmt:?} (MTLPixelFormat {:?}): {align} B", pf);
+        }
+
+        const TOTAL: usize = 40_000;
+        let arena_len = TOTAL * 64;
+        let arena = crate::mem::Alias::new(arena_len).unwrap();
+        // Touch pages upfront so pool page faults do not pollute descriptor measurements.
+        // SAFETY: `arena.primary` is a writable `arena_len` allocation.
+        unsafe { std::ptr::write_bytes(arena.primary, 0, arena_len) };
+        let buf = victory_backend::backend::ComputeBackend::wrap_title_memory(
+            &m,
+            arena.primary,
+            arena.len,
+        )
+        .unwrap();
+        let heap = m.create_heap(HeapKind::Resource, TOTAL).unwrap();
+        if let Some(set) = &heap.set {
+            set.commit();
+        }
+
+        let fp0 = phys_footprint();
+        let t0 = std::time::Instant::now();
+        for i in 0..TOTAL {
+            // SAFETY: `i * 64 < arena_len`.
+            let ptr = unsafe { arena.primary.add(i * 64) };
+            m.write_buffer(&heap, i, &buf, ptr, 64);
+        }
+        let raw_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let fp_raw = phys_footprint();
+        println!(
+            "40,000 write_buffer (lazy mirror): {raw_ms:.2} ms, phys_footprint delta = {:.2} KiB",
+            (fp_raw as isize - fp0 as isize) as f64 / 1024.0
+        );
+
+        for count in [64usize, 512, 1_000, 10_000, 40_000] {
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                m.write_buffer(&heap, i, &buf, ptr, 64);
+            }
+            let before = phys_footprint();
+            let start = std::time::Instant::now();
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                let fmt = match i % 3 {
+                    0 => Format::Rgba32Float,
+                    1 => Format::Rg32Float,
+                    _ => Format::R32Uint,
+                };
+                m.write_typed_buffer(&heap, i, &buf, ptr, 64, fmt, true);
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let after = phys_footprint();
+            let set_bytes = heap.set.as_ref().map_or(0, |s| {
+                s.commit();
+                s.allocatedSize()
+            });
+            let delta_kib = (after as isize - before as isize) as f64 / 1024.0;
+            println!(
+                "materialize {count:>6} write_typed_buffer: {ms:>7.2} ms ({:.2} us/view), phys_footprint delta = {delta_kib:>8.1} KiB ({:.1} B/view), heap_set = {:.2} MiB",
+                ms * 1000.0 / count as f64,
+                (after as isize - before as isize) as f64 / count as f64,
+                set_bytes as f64 / (1024.0 * 1024.0)
+            );
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                m.write_buffer(&heap, i, &buf, ptr, 64);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod heap_usage_tests {
+    use super::*;
+
+    #[test]
+    fn heap_allocations_give_each_allocation_once_with_its_latest_use() {
+        use objc2_foundation::NSObjectProtocol;
+        let Ok(mut m) = Metal::new() else { return };
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        m.residency_sets = true;
+        let heap = m.create_heap(HeapKind::Resource, 8).unwrap();
+        let tex = |w| m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, w, w)).unwrap();
+        let (a, b, c) = (tex(64), tex(128), tex(256));
+        m.write_texture(&heap, 0, &a, 0.0);
+        m.write_texture(&heap, 1, &a, 0.0);
+        m.write_texture(&heap, 2, &b, 0.0);
+        m.write_texture(&heap, 3, &c, 0.0);
+        // A view of `c` is `c`'s memory: one allocation, its latest use theirs.
+        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1) }).unwrap();
+        m.write_texture(&heap, 4, &view, 0.0);
+        // `a` is named by entries last used at frames 10 and 50, `b` at 20, `c` never, its view at 5.
+        let mut all = m.heap_allocations(&heap, &[10, 50, 20, 0, 5, 0, 0, 0]).unwrap();
+        all.sort_by_key(|a| a.bytes);
+        assert_eq!(all.iter().map(|a| a.latest).collect::<Vec<_>>(), [50, 20, 5], "{all:?}");
+        assert!(all.iter().all(|a| a.texture && a.bytes > 0), "{all:?}");
+        // Without a residency set nothing is kept resident by the heap.
+        m.residency_sets = false;
+        let plain = m.create_heap(HeapKind::Resource, 1).unwrap();
+        assert_eq!(m.heap_allocations(&plain, &[0]), None);
     }
 }
 

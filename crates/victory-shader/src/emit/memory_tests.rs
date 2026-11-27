@@ -80,6 +80,8 @@ fn program() -> HostShader {
     // tracers take their BVH's), read through.
     w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
     w.push(S_WAITCNT_ALL);
+    // Only the address's high bits of dword 1: its stride and swizzle are no address (#311).
+    w.extend([0x8711_FF11, 0x0000_FFFF]); // s_and_b32 s17, s17, 0xffff
     w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
     w.push(S_WAITCNT_ALL);
     // Pointers into a page no copy holds and into a 256 MiB region with no
@@ -109,6 +111,10 @@ fn program() -> HostShader {
     // its size fields (dwords 1-3).
     w.extend(s_load(3, 28, 4, 0x40)); // s[28:35]
     w.push(S_WAITCNT_ALL);
+    // Only the size fields, as a title reads them: the table gives the rest of these dwords as 0.
+    w.extend([0x871D_FF1D, 0xC000_0000]); // s_and_b32 s29, s29, 0xc0000000 (width, low bits)
+    w.extend([0x871E_FF1E, 0x3FFF_FFFF]); // s_and_b32 s30, s30, 0x3fffffff
+    w.extend([0x871F_FF1F, 0xF00F_FFFF]); // s_and_b32 s31, s31, !tiling
     for (k, at) in [(29, 24), (30, 28), (31, 32)] {
         w.push(v_mov_b32(5, k));
         w.extend(buffer_store_dword(5, 8, at));

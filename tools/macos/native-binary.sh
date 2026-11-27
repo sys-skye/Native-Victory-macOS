@@ -19,6 +19,14 @@ find_rustup() {
   return 1
 }
 
+# The console model run-native.sh reports when --console is not given, from the
+# Mac's RAM in whole GiB. Series X declares 13.5 GiB of title memory: more than
+# Metal's working set on 16 GB Macs (#8), and it can still run out of GPU
+# memory at the world load on 24 GB (#79, #110). Series S declares 7.6 GiB.
+default_console() {
+  if (( $1 <= 24 )); then echo series-s; else echo series-x; fi
+}
+
 # Cargo resolves environment overrides and local/global build.target-dir config.
 # plutil is part of macOS and decodes JSON strings without losing path quoting.
 native_binary() {

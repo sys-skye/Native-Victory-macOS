@@ -1292,7 +1292,7 @@ const DISPATCH_WAVE32: u32 = 0x8000;
 
 /// `VICTORY_TRACE_DISPATCH_FLAGS=1`: the flags of dispatches are logged,
 /// each value once, so one the host does not honour shows.
-fn trace_dispatch_flags() -> bool {
+pub(crate) fn trace_dispatch_flags() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_DISPATCH_FLAGS").is_some())
 }
@@ -1749,9 +1749,10 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With `indirect`, the group counts
+    /// are the record at that GPU (title) address, run as a one-record `ExecuteIndirect`.
+    /// Guess (`docs/native-host.md`): the record is `D3D12_DISPATCH_MESH_ARGUMENTS` and `x` is
+    /// then unused; flags and payload are ignored.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1761,8 +1762,15 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH: u32 = 10;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None);
+            });
+            if !ran {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1797,8 +1805,11 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
+    /// `DispatchMesh(x, y, z)`: the bound mesh pipeline runs those groups (#353).
+    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        super::count_draw();
+        glue::dispatch_mesh(this, x, y, z);
+    }
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
 
@@ -1877,6 +1888,20 @@ mod state {
         super::count_dispatch();
         glue::dispatch(this, x, y, z);
     }
+    /// `DispatchMeshX`: with `indirect`, a Metal indirect mesh draw of the record at that title
+    /// address; without, `x` groups of the bound mesh pipeline (#353). Both are the D3D12 host's
+    /// guess in `dispatch_mesh_x` (`docs/native-host.md`): flags and payload are ignored.
+    pub(super) extern "system" fn dispatch_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
+        if indirect == 0 {
+            dispatch_mesh(this, x, 1, 1);
+            return;
+        }
+        if glue::execute_indirect(this, crate::signature::Command::DispatchMesh, 12, 1, indirect, None) {
+            super::count_draw();
+            return;
+        }
+        super::dropped_mesh_x(this, x, flags, indirect, payload);
+    }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         glue::set_heaps(this, items(heaps, count));
     }
@@ -1921,11 +1946,12 @@ mod state {
 /// Without a host GPU every draw state call is ignored.
 #[cfg(not(any(windows, target_os = "macos")))]
 mod state {
+    use super::This;
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    pub(super) use super::dropped_mesh as dispatch_mesh;
-    pub(super) use super::dropped_mesh_x as dispatch_mesh_x;
+    pub(super) extern "system" fn dispatch_mesh(_: This, _: u32, _: u32, _: u32) {}
+    pub(super) extern "system" fn dispatch_mesh_x(_: This, _: u32, _: u64, _: u64, _: u64) {}
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
@@ -1985,15 +2011,10 @@ fn drop_kind(kind: usize) {
     crate::native::glue::trace_reason(what);
 }
 
+/// An indirect mesh dispatch the host could not run.
 #[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
-    drop_kind(0);
-    draw(this);
-}
-
-#[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u64, _payload: u64) {
-    drop_kind(if indirect != 0 { 1 } else { 0 });
+extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, _indirect: u64, _payload: u64) {
+    drop_kind(1);
     draw(this);
 }
 

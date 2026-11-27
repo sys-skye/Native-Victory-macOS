@@ -361,11 +361,23 @@ mod tests {
     fn malformed_relocations_return_error_and_release_mapping() {
         let len = 0x2000usize.next_multiple_of(mem::page_size());
         // Pick a free address so we can check whether a failed map leaked it.
-        // SAFETY: probe and immediately release a fresh anonymous region.
-        let probe = unsafe { mem::alloc(None, len, Protect::READ_WRITE) }.unwrap();
-        let forced = probe as usize;
-        // SAFETY: just allocated.
-        unsafe { mem::release(probe, len) }.unwrap();
+        // Far above where the system places allocations made anywhere: a range
+        // freed there stays free while the other tests allocate, so step 3
+        // fails only if one of the failed maps below kept it (a range found
+        // with `alloc(None)` is the next one handed out, and other threads
+        // took it about 1 run in 3).
+        let forced = (0..64)
+            .map(|i| 0x5000_0000_0000 + i * 0x1_0000_0000)
+            .find(|&at| {
+                // SAFETY: a fresh allocation at a fixed address; it fails
+                // rather than replacing anything.
+                match unsafe { mem::alloc(Some(at), len, Protect::READ_WRITE) } {
+                    // SAFETY: just allocated.
+                    Ok(p) => unsafe { mem::release(p, len) }.is_ok(),
+                    Err(_) => false,
+                }
+            })
+            .expect("a free range far above the allocations");
 
         // 1. Relocation block whose size runs past its directory.
         let mut bad_block = Vec::new();

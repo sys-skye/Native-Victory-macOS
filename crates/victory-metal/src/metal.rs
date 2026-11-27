@@ -35,19 +35,23 @@ pub struct Metal {
     pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
+    /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
+    /// default 0: no limit).
+    pub(crate) passes_per_buffer: usize,
+    /// `VICTORY_METAL_REQUEST_RESIDENCY=1`: each heap's set asks to stay resident between the
+    /// command buffers that use it (`requestResidency` after each commit), instead of being made
+    /// resident again for each one.
+    pub(crate) request_residency: bool,
+    /// Command buffers `submit_passes` committed.
+    pub(crate) committed: std::cell::Cell<u64>,
     /// Pipeline state pointer to name, kept only when tracing.
     pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
+    /// Tracing: the gate buffers of the indirect dispatches encoded since the last commit.
+    pub(crate) trace_args: std::cell::RefCell<Vec<(String, usize, usize)>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
-    /// The kernel that bounds every indirect dispatch's group counts (`gfx.rs`), made at first use.
-    pub(crate) bound:
-        std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
-    /// Where that kernel notes a dispatch it dropped (shared with the CPU), made with it.
-    pub(crate) bound_seen: std::cell::OnceCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
-    /// Dropped dispatches logged so far.
-    pub(crate) bound_logged: std::cell::Cell<u32>,
     /// Every sampler made, by descriptor: a heap entry holds only the sampler's ID, which Metal
     /// hands to a new sampler once the old one is freed. Few distinct descriptors exist.
     #[allow(clippy::type_complexity)]
@@ -55,6 +59,12 @@ pub struct Metal {
         Vec<(crate::resources::SamplerDesc, Retained<ProtocolObject<dyn MTLSamplerState>>)>,
     >,
 }
+
+/// The most passes of a submission in one command buffer unless `VICTORY_PASSES_PER_BUFFER` says
+/// otherwise: no limit (0), the whole submission in one, until other Macs than the one it was
+/// measured on (an M4 Pro) have run the split. 1 is the safest value there; see
+/// docs/native-host.md.
+const PASSES_PER_BUFFER: usize = 0;
 
 type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// Pipelines a `pipeline-compile` thread is making or has made, by what they are made of.
@@ -65,6 +75,47 @@ pub(crate) type Compiling<T> =
 pub(crate) fn since_start() -> f64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// `VICTORY_TRACE_RESIDENCY=1`: times residency-set calls and command buffer commits. Each call over
+/// 50 ms is logged at once; once a second a summary gives count, total and longest per kind, with
+/// the bytes and allocations of the last set seen. Lines up the host's calls with wired memory (#79).
+pub(crate) fn residency_timed<R>(
+    what: &'static str,
+    set: Option<&ProtocolObject<dyn MTLResidencySet>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static SUM: Mutex<(f64, BTreeMap<&'static str, (u64, f64, f64)>, u64, usize)> = Mutex::new((0.0, BTreeMap::new(), 0, 0));
+    if !*ON.get_or_init(|| std::env::var("VICTORY_TRACE_RESIDENCY").is_ok_and(|v| v.trim() == "1")) {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let size = set.map(|s| (s.allocatedSize(), s.allocationCount()));
+    if ms > 50.0 {
+        tracing::warn!(what, ms, t = since_start(), set_mb = size.map(|s| s.0 >> 20), allocations = size.map(|s| s.1), "residency: slow call");
+    }
+    let mut g = SUM.lock().unwrap();
+    let e = g.1.entry(what).or_default();
+    e.0 += 1;
+    e.1 += ms;
+    e.2 = e.2.max(ms);
+    if let Some((b, n)) = size {
+        (g.2, g.3) = (b, n);
+    }
+    let now = since_start();
+    if now - g.0 >= 1.0 {
+        let kinds = g.1.iter().map(|(k, (n, tot, max))| format!("{k} {n}x {tot:.0}/{max:.0}ms")).collect::<Vec<_>>().join(", ");
+        tracing::info!(t = now, set_mb = g.2 >> 20, allocations = g.3, "residency: last {:.1} s: {kinds}", now - g.0);
+        g.0 = now;
+        g.1.clear();
+    }
+    r
 }
 
 /// Counters of residency work.
@@ -85,6 +136,8 @@ pub struct ResidencyCounts {
     pub added: u64,
     /// Queues the pool set was added to.
     pub queues: u64,
+    /// `requestResidency` calls on heaps' sets (`VICTORY_METAL_REQUEST_RESIDENCY`).
+    pub requests: u64,
 }
 
 impl Metal {
@@ -138,7 +191,7 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         if let Some(set) = self.resident.get_mut().take() {
             set.removeAllocation(ProtocolObject::from_ref(&*self.buf));
-            set.commit();
+            residency_timed("pool_commit", Some(&set), || set.commit());
         }
     }
 }
@@ -215,6 +268,7 @@ impl Metal {
                 mode,
                 memory_gb = memory >> 30,
                 switch = asked.as_deref().unwrap_or("unset"),
+                request_residency = std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
                 "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
             );
         });
@@ -237,12 +291,16 @@ impl Metal {
                 since_start();
                 std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
             },
+            passes_per_buffer: std::env::var("VICTORY_PASSES_PER_BUFFER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(PASSES_PER_BUFFER),
+            request_residency: std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
+            committed: Default::default(),
             pipe_names: Default::default(),
             trace_enc: Default::default(),
+            trace_args: Default::default(),
             gate: Default::default(),
-            bound: Default::default(),
-            bound_seen: Default::default(),
-            bound_logged: Default::default(),
             samplers: Default::default(),
         })
     }
@@ -261,11 +319,28 @@ impl Metal {
         self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
+    /// At most `n` passes of a submission in one command buffer (0: no limit).
+    pub fn with_passes_per_buffer(mut self, n: usize) -> Metal {
+        self.passes_per_buffer = n;
+        self
+    }
+
+    /// Command buffers committed for submissions so far.
+    pub fn command_buffers(&self) -> u64 {
+        self.committed.get()
+    }
+
     /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the
     /// queues, where the system has sets) or `useResource` in every encoder (`false`).
     pub fn with_residency_sets(mut self, on: bool) -> Metal {
         self.residency_sets = on && sets_supported(&self.dev);
         self.pool_sets = self.residency_sets;
+        self
+    }
+
+    /// Heaps' sets ask to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`).
+    pub fn with_requested_residency(mut self, on: bool) -> Metal {
+        self.request_residency = on;
         self
     }
 
@@ -408,7 +483,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let order = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         // With the heaps' sets alone the host orders the queue's work from the start; with the
         // pool's set too, from when that set joins the queue (`make_resident`).
         let ordered = self.residency_sets && !self.pool_sets;
@@ -416,9 +491,13 @@ impl ComputeBackend for Metal {
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
-        let e = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let e = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         e.setSignaledValue(initial);
         Ok(Fence(e))
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.dev.currentAllocatedSize() as u64
     }
 
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Buffer, String> {
@@ -464,10 +543,11 @@ impl ComputeBackend for Metal {
             match &*slot {
                 Some(s) => s.clone(),
                 None => {
-                    let s = self
-                        .dev
-                        .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-                        .map_err(|e| e.localizedDescription().to_string())?;
+                    let s = crate::gfx::track_residency_set(
+                        self.dev
+                            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                            .map_err(|e| e.localizedDescription().to_string())?,
+                    );
                     *slot = Some(s.clone());
                     s
                 }
@@ -538,6 +618,7 @@ impl ComputeBackend for Metal {
                 signals: work.signals,
             },
         )
+        .map_err(|e| e.to_string())
     }
 
     fn signal(&self, fence: &Fence, value: u64) {

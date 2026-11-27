@@ -200,11 +200,74 @@ fn sym<T: Copy>(h: *mut c_void, name: &str) -> T {
 /// Where Apple's installer puts the converter (universal binary); `VICTORY_MSC_DYLIB` overrides.
 pub const DEFAULT_DYLIB: &str = "/usr/local/lib/libmetalirconverter.dylib";
 
+/// The converter to load, and whether `VICTORY_MSC_DYLIB` named it (an empty value counts as
+/// unset, as in `native-setup.sh`).
+fn dylib_path(var: Option<String>) -> (String, bool) {
+    match var.filter(|v| !v.is_empty()) {
+        Some(v) => (v, true),
+        None => (DEFAULT_DYLIB.into(), false),
+    }
+}
+
+/// The start-up line naming the loaded converter (`id`: its path, size and modification time),
+/// and a warning when it is not the installed default. The library exposes no version to log:
+/// its Mach-O current version is 0.0.0 and the C API has no version call.
+fn load_note(path: &str, from_var: bool, id: &str) -> (String, Option<String>) {
+    let source = if from_var { "VICTORY_MSC_DYLIB" } else { "the installed default" };
+    let note = format!("metal: shader converter {id} (from {source})");
+    let warn = (path != DEFAULT_DYLIB).then(|| {
+        format!(
+            "metal: the shader converter is not {DEFAULT_DYLIB}; a copy other than Apple's package \
+             may convert shaders differently (a non-Apple copy drew no loading-screen art, #295)"
+        )
+    });
+    (note, warn)
+}
+
+/// An export that Apple's converter has from 3.0 on (function constants), and no earlier release
+/// has: 1.0, 1.1 and 2.1 lack it, 3.0 and 4.0 beta 3 export it. The C API has no version call,
+/// so the generation is told by what the library exports.
+const FIRST_IN_3_0: &str = "IRCompilerSetFunctionConstantResourceSpace";
+
+/// Why the converter at `path` cannot be used, if it is older than 3.0 (`has`: whether the library
+/// exports a symbol). Converters before 3.0 take every 1D and 2D texture as an array type (their
+/// manual, "Texture arrays"), and 3.0 made plain types the default. The host binds a 2D texture
+/// as a plain 2D view, which is what 3.0 and later expect: through an older converter, a compute
+/// shader's writes to such a texture are dropped and the memory stays zero, with no error from
+/// Metal (`a_texture_compute_writes_is_copied_back_into_title_memory` fails on 1.1 and 2.1, and
+/// passes on them with the views made as 2D arrays, which in turn fails on 3.0). That is the
+/// missing loading art of #295, whose converter (Unreal Engine 5.6's, `D3DRendererMetal-30.2`) is
+/// older than Apple's 2.1 (`31.2`).
+fn too_old(path: &str, has: impl Fn(&str) -> bool) -> Option<String> {
+    (!has(FIRST_IN_3_0)).then(|| {
+        format!(
+            "{path} is a Metal Shader Converter older than 3.0 (it does not export {FIRST_IN_3_0}). \
+             Converters before 3.0 need every 1D and 2D texture bound as an array, and this host \
+             binds plain ones, so their shaders would read and write nothing (#295). Install \
+             Apple's 3.0 or newer from https://developer.apple.com/metal/shader-converter/"
+        )
+    })
+}
+
 impl Msc {
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default.
+    /// Logs, once per run, which converter it loaded (#295: a non-Apple copy drew no loading art),
+    /// or why none was.
     pub fn try_open_default() -> Result<Msc, String> {
-        let path = std::env::var("VICTORY_MSC_DYLIB").unwrap_or_else(|_| DEFAULT_DYLIB.into());
-        Msc::open(&path).map_err(|e| format!("dlopen {path}: {e}"))
+        let (path, from_var) = dylib_path(std::env::var("VICTORY_MSC_DYLIB").ok());
+        let opened = Msc::open(&path);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| match &opened {
+            Ok(msc) => {
+                let (note, warn) = load_note(&path, from_var, &msc.id);
+                tracing::info!("{note}");
+                if let Some(w) = warn {
+                    tracing::warn!("{w}");
+                }
+            }
+            Err(e) => tracing::error!("metal: no shader converter: {e}"),
+        });
+        opened
     }
 
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default, panicking on failure.
@@ -225,6 +288,16 @@ impl Msc {
                 // SAFETY: non-null NUL-terminated string from dlerror.
                 unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned()
             };
+            return Err(format!("dlopen {path}: {e}"));
+        }
+        let has = |name: &str| {
+            let n = CString::new(name).unwrap();
+            // SAFETY: h is a live dlopen handle.
+            !unsafe { libc::dlsym(h, n.as_ptr()) }.is_null()
+        };
+        if let Some(e) = too_old(path, has) {
+            // SAFETY: h came from dlopen above and nothing from it is kept.
+            unsafe { libc::dlclose(h) };
             return Err(e);
         }
         let id = std::fs::metadata(path)
@@ -459,5 +532,42 @@ impl Msc {
             }
             res
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_converter_path_is_the_override_if_set_else_the_default() {
+        assert_eq!(dylib_path(None), (DEFAULT_DYLIB.into(), false));
+        assert_eq!(dylib_path(Some(String::new())), (DEFAULT_DYLIB.into(), false));
+        assert_eq!(dylib_path(Some("/x/libmetalirconverter.dylib".into())), ("/x/libmetalirconverter.dylib".into(), true));
+    }
+
+    #[test]
+    fn the_load_note_names_its_source_and_warns_only_off_the_default_path() {
+        let (note, warn) = load_note(DEFAULT_DYLIB, false, "id");
+        assert!(note.contains("id (from the installed default)"), "{note}");
+        assert!(warn.is_none());
+        // The variable naming the default path itself is not warned about.
+        let (note, warn) = load_note(DEFAULT_DYLIB, true, "id");
+        assert!(note.contains("from VICTORY_MSC_DYLIB"), "{note}");
+        assert!(warn.is_none());
+        let (_, warn) = load_note("/ue/libmetalirconverter.dylib", true, "id");
+        assert!(warn.unwrap().contains(DEFAULT_DYLIB));
+    }
+
+    /// The exports of Apple's releases decide: 2.1 (and 1.x) lack the 3.0 export and are refused
+    /// with a reason that names the path and the fix; 3.0 and later are taken.
+    #[test]
+    fn a_converter_older_than_3_is_refused_by_its_exports() {
+        let before_3 = |name: &str| name == "IRCompilerAllocCompileAndLink";
+        let from_3 = |name: &str| matches!(name, "IRCompilerAllocCompileAndLink" | FIRST_IN_3_0);
+        let e = too_old("/ue/libmetalirconverter.dylib", before_3).expect("2.1 is refused");
+        assert!(e.contains("/ue/libmetalirconverter.dylib"), "{e}");
+        assert!(e.contains("older than 3.0") && e.contains("3.0 or newer"), "{e}");
+        assert_eq!(too_old(DEFAULT_DYLIB, from_3), None);
     }
 }

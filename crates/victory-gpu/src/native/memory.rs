@@ -191,6 +191,80 @@ impl PoolTable {
     pub fn take_released(&self) -> Vec<usize> {
         std::mem::take(&mut self.lock().released)
     }
+
+    /// Reads `[addr, addr + out.len())` across the title-address spans mapped in this table,
+    /// coalescing adjacent mappings (even across different pools or out-of-order physical pages)
+    /// into one `read_span` call each and zeroing unmapped gaps without calling `read_span` or
+    /// querying VM regions. Returns `None` when no mapping overlaps `[addr, addr + out.len())`,
+    /// `Some(true)` when the entire range was mapped and read cleanly, and `Some(false)` when part
+    /// of the range was unmapped or `read_span` reported a partial/failed span.
+    pub fn read_mapped_with(
+        &self,
+        addr: usize,
+        out: &mut [u8],
+        mut read_span: impl FnMut(usize, &mut [u8]) -> bool,
+    ) -> Option<bool> {
+        if out.is_empty() {
+            return Some(true);
+        }
+        let end = addr.checked_add(out.len())?;
+        let mut inline = [(0usize, 0usize); 8];
+        let mut inline_len = 0usize;
+        let mut extra: Vec<(usize, usize)> = Vec::new();
+        {
+            let g = self.lock();
+            let before = g
+                .maps
+                .range(..addr)
+                .next_back()
+                .filter(|&(&a, m)| a.saturating_add(m.len) > addr);
+            for (&a, m) in before.into_iter().chain(g.maps.range(addr..end)) {
+                if m.len == 0 || !g.pools.contains_key(&m.pool) {
+                    continue;
+                }
+                let start = addr.max(a);
+                let stop = end.min(a.saturating_add(m.len));
+                if start >= stop {
+                    continue;
+                }
+                let merged = if !extra.is_empty() {
+                    extra.last_mut()
+                } else if inline_len > 0 {
+                    Some(&mut inline[inline_len - 1])
+                } else {
+                    None
+                };
+                if let Some(last) = merged.filter(|last| last.1 == start) {
+                    last.1 = stop;
+                } else if inline_len < inline.len() {
+                    inline[inline_len] = (start, stop);
+                    inline_len += 1;
+                } else {
+                    extra.push((start, stop));
+                }
+            }
+            if inline_len == 0 {
+                return None;
+            }
+        }
+        let mut cur = addr;
+        let mut whole = true;
+        for &(start, stop) in inline[..inline_len].iter().chain(extra.iter()) {
+            if cur < start {
+                out[cur - addr..start - addr].fill(0);
+                whole = false;
+            }
+            if !read_span(start, &mut out[start - addr..stop - addr]) {
+                whole = false;
+            }
+            cur = stop;
+        }
+        if cur < end {
+            out[cur - addr..].fill(0);
+            whole = false;
+        }
+        Some(whole)
+    }
 }
 
 impl PoolObserver for PoolTable {
@@ -340,5 +414,144 @@ mod tests {
         let second = t.mapping_at(0x6fff).unwrap();
         assert_eq!((second.at, second.len, second.pool, second.offset), (0x5000, 0x2000, 2, 0x800));
         assert!(t.mapping_at(0x7000).is_none());
+    }
+
+    #[test]
+    fn read_mapped_with_coalesces_adjacent_pages_across_pools_and_zeroes_gaps() {
+        let t = PoolTable::default();
+        let (pa, pb) = (pool(1), pool(2));
+        t.pool_created(&pa);
+        t.pool_created(&pb);
+
+        // No mapping yet: returns None so callers can fall back to non-pool memory reads.
+        let mut out = vec![0xffu8; 6 * 0x1_0000];
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |_, _| panic!("should not be called")),
+            None
+        );
+        assert!(out.iter().all(|&b| b == 0xff));
+
+        // Map scattered pages in descending pool order across two pools, leaving page 1 and pages
+        // 4..6 unmapped (mip-streamed texture with an unmapped hole and unmapped fine mips).
+        t.mapped(0x9000_0000, 0x1_0000, &pa, 5 * 0x1_0000);
+        t.mapped(0x9002_0000, 0x1_0000, &pb, 2 * 0x1_0000);
+        t.mapped(0x9003_0000, 0x1_0000, &pa, 0x1_0000);
+
+        let mut spans_seen = Vec::new();
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |at, dst| {
+                spans_seen.push((at, dst.len()));
+                dst.fill(((at - 0x9000_0000) >> 16) as u8 + 0x21);
+                true
+            }),
+            Some(false)
+        );
+        // Pages 2 and 3 come from different pools (`pb` then `pa`) at out-of-order pool offsets,
+        // yet coalesce into one contiguous title-address span `(0x9002_0000, 0x2_0000)`.
+        assert_eq!(
+            spans_seen,
+            vec![(0x9000_0000, 0x1_0000), (0x9002_0000, 0x2_0000)]
+        );
+        assert!(out[..0x1_0000].iter().all(|&b| b == 0x21));
+        assert!(out[0x1_0000..0x2_0000].iter().all(|&b| b == 0));
+        assert!(out[0x2_0000..0x4_0000].iter().all(|&b| b == 0x23));
+        assert!(out[0x4_0000..].iter().all(|&b| b == 0));
+
+        // Mapping the remaining pages coalesces all 6 pages into a single whole read (`Some(true)`).
+        t.mapped(0x9001_0000, 0x1_0000, &pa, 7 * 0x1_0000);
+        t.mapped(0x9004_0000, 0x2_0000, &pb, 0);
+        out.fill(0xff);
+        spans_seen.clear();
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |at, dst| {
+                spans_seen.push((at, dst.len()));
+                dst.fill(0x5a);
+                true
+            }),
+            Some(true)
+        );
+        assert_eq!(spans_seen, vec![(0x9000_0000, 6 * 0x1_0000)]);
+        assert!(out.iter().all(|&b| b == 0x5a));
+    }
+}
+
+/// A regression measure, run by hand (`cargo test --release -p victory-gpu --lib
+/// signature_walks_of_a_follow_pass -- --ignored --nocapture`): `PoolTable::signature` over the
+/// ranges `NativeHost::follow_title_pages` checks at each look, in a pool table laid out like the
+/// world's (synthetic addresses and sizes, no title data). M5 Pro, 27 November: 36-78 us for the
+/// 174 MiB view; a look over the entries a world run had (one range per entry) 2.7-3.1 ms; the
+/// same look walking each distinct range once, as `follow_title_pages` does, 60-90 us.
+#[cfg(test)]
+mod signature_timing {
+    use super::*;
+
+    const PAGE: usize = 1 << 16;
+
+    /// A table of `others` scattered one-page mappings, plus the world's three large views as
+    /// one-page mappings from pools in descending page order (the 174 MiB one over three runs
+    /// of pool pages apart).
+    fn world(others: usize) -> (PoolTable, [(u64, u64); 3]) {
+        let t = PoolTable::default();
+        let pool = |id: usize, len: usize| PoolInfo { id, base: 0x1000_0000_0000 + id * (1 << 34), len, memory_entry: None };
+        let views = [(0x2000_0000u64, 182_452_224u64), (0xd_0000_0000, 52_428_800), (0xd_4000_0000, 25_165_824)];
+        for (k, &(at, len)) in views.iter().enumerate() {
+            let pages = (len as usize).div_ceil(PAGE);
+            let p = pool(1 + k, 4 * pages * PAGE);
+            t.pool_created(&p);
+            for n in 0..pages {
+                // Three runs of descending pool pages, apart from one another.
+                let run = n * 3 / pages;
+                let offset = (run * 2 * pages + (pages - n)) * PAGE;
+                t.mapped(at as usize + n * PAGE, PAGE, &p, offset);
+            }
+        }
+        let p = pool(9, others * PAGE);
+        t.pool_created(&p);
+        for n in 0..others {
+            t.mapped(0x8_0000_0000 + 2 * n * PAGE, PAGE, &p, n * PAGE);
+        }
+        (t, views)
+    }
+
+    fn time(what: &str, n: u32, mut f: impl FnMut()) -> f64 {
+        f();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        println!("{what}: {us:.1} us");
+        us
+    }
+
+    #[test]
+    #[ignore]
+    fn signature_walks_of_a_follow_pass() {
+        for others in [1_000, 10_000, 100_000] {
+            let (t, [big, mid, small]) = world(others);
+            println!("-- {others} other mappings");
+            let sig = |(a, l): (u64, u64)| std::hint::black_box(t.signature(a, l));
+            time("174 MiB view", 200, || { sig(big); });
+            time("50 MiB view", 200, || { sig(mid); });
+            time("24 MiB view", 200, || { sig(small); });
+            time("a range in no pool (host memory)", 2_000, || { sig((0x7f00_0000_0000, 21_045_760)); });
+            // The entries a look at 1,000 checked in a world run: 54 of the 174 MiB range, 12 of
+            // the 50 MiB one, 59 of the 24 MiB one, 571 outside every pool.
+            time("a look, one walk per entry (54 + 12 + 59 + 571 entries)", 20, || {
+                for _ in 0..54 { sig(big); }
+                for _ in 0..12 { sig(mid); }
+                for _ in 0..59 { sig(small); }
+                for _ in 0..571 { sig((0x7f00_0000_0000, 21_045_760)); }
+            });
+            time("the same look, each distinct range walked once", 20, || {
+                let mut walked = std::collections::HashMap::new();
+                let entries = [(big, 54), (mid, 12), (small, 59), ((0x7f00_0000_0000, 21_045_760), 571)];
+                for (range, copies) in entries {
+                    for _ in 0..copies {
+                        std::hint::black_box(*walked.entry(range).or_insert_with(|| sig(range)));
+                    }
+                }
+            });
+        }
     }
 }

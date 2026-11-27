@@ -21,10 +21,19 @@ macro_rules! env_set {
     }};
 }
 
+/// Whether the pass trace's window is open (`VICTORY_TRACE_PASSES`, see `glue::pass_present`):
+/// false unless that variable is set, so every pass-trace line costs one relaxed load otherwise.
+static PASS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn pass_on() -> bool {
+    PASS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub mod addr;
 pub mod console_state;
 pub(crate) mod descriptor_trace;
 pub mod descriptors;
+pub mod freed;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
 pub mod host;

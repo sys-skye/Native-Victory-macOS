@@ -34,12 +34,41 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     translate_cached(container, options())
 }
 
+/// Whether [`translate`]'s translation is in the disk cache already.
+pub fn cached(container: &[u8]) -> bool {
+    crate::shader_cache::native_present(container, &format!("{:?}", options()))
+}
+
+/// Keeps `container`, as the run is about to translate it, for later warm-ups
+/// (`crate::prewarm::keep`); nothing with the shader cache off.
+#[cfg(target_os = "macos")]
+pub fn keep(container: &[u8]) {
+    if let Some(dir) = crate::prewarm::kept_dir() {
+        crate::prewarm::keep(&dir, &blake3::hash(container).to_hex()[..16], container);
+    }
+}
+
+/// The files of the containers earlier runs kept ([`keep`]).
+#[cfg(target_os = "macos")]
+pub fn kept() -> Vec<std::path::PathBuf> {
+    crate::prewarm::kept_dir().map(|dir| crate::prewarm::kept(&dir)).unwrap_or_default()
+}
+
+/// The container in one of [`kept`]'s files; `None` if it is damaged.
+#[cfg(target_os = "macos")]
+pub fn read_kept(file: &std::path::Path) -> Option<Vec<u8>> {
+    crate::prewarm::read_kept(file)
+}
+
 /// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
 /// `o` is part of the key.
 fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
-    crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
         victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
-    })
+    });
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return victory_shader::emit::translate_with(container, o).map_err(|e| e.to_string());
 }
 
 /// A compute shader's container translated for dispatches of thread counts
@@ -74,7 +103,35 @@ pub fn uint_cached(container: &[u8], uint_targets: u8) -> bool {
 
 pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
     let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
-    crate::shader_cache::native_present(container, &format!("{o:?}"))
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, rect, extra, copy_params, o);
+        false
+    }
+}
+
+/// A pixel shader's container translated for colour targets of integer formats (bit n: target n).
+pub fn translate_targets(container: &[u8], integer: u8) -> Result<HostShader, String> {
+    translate_cached(container, Options { integer_targets: integer, ..options() })
+}
+
+/// Whether [`translate_targets`]'s translation is in the disk cache already.
+pub fn targets_cached(container: &[u8], integer: u8) -> bool {
+    let o = Options { integer_targets: integer, ..options() };
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, o);
+        false
+    }
+}
+
+/// Bit n set: colour target n has an integer format.
+pub fn integer_targets(color: &[Format]) -> u8 {
+    color.iter().enumerate().filter(|(n, f)| *n < 8 && f.is_integer()).fold(0, |m, (n, _)| m | 1 << n)
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
@@ -88,8 +145,8 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory && !memory {
         return Some("reads title memory through the page table in a graphics pipeline");
     }
-    if shader.view_addresses || shader.view_marks {
-        return Some("needs view addresses or write marks");
+    if shader.view_marks {
+        return Some("needs write marks");
     }
     None
 }
@@ -211,6 +268,8 @@ impl<B: PresentBackend> Title<B> {
                 }))
             }
             Err(e) => {
+                #[cfg(target_os = "macos")]
+                self.compile_failed(name, &e);
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -282,9 +341,19 @@ impl<B: PresentBackend> Title<B> {
                 attributes.insert(at, next);
             }
         }
-        let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
-            self.shaders.refuse(name, "a target format the host does not know".into());
-            return Pipe::Refused;
+        // Resolve colour and depth formats, reporting unknown formats as refusals.
+        let (color, depth) = match (g.color_formats(), g.depth_format()) {
+            (Ok(c), Ok(d)) => (c, d),
+            (Err(dxgi), _) => {
+                self.shaders
+                    .refuse(name, format!("unknown target format {}", dxgi));
+                return Pipe::Refused;
+            }
+            (_, Err(dxgi)) => {
+                self.shaders
+                    .refuse(name, format!("unknown depth format {}", dxgi));
+                return Pipe::Refused;
+            }
         };
         if g.samples > 1 {
             self.shaders.refuse(name, "multisampled targets".into());
@@ -298,15 +367,19 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
-        let ps_binding = ps
-            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+        let ps_full = ps.map(|ps| Binding { name: name.into(), ..Binding::of(ps) });
+        let mut vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
+        if let Some(p) = &ps_full {
+            vs_binding.typed_buffers |= p.typed_buffers;
+            vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+        }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
         // user data (descriptor table offsets, root constants) from address 0.
         let vs_layout = vs_binding.layout();
-        let ps_layout = ps.map(Binding::of).and_then(|b| b.layout());
+        let ps_layout = ps_full.as_ref().and_then(Binding::layout);
+        let ps_binding = ps_full
+            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),
@@ -327,12 +400,15 @@ impl<B: PresentBackend> Title<B> {
             Ok(None) => self.put_off(),
             Ok(Some(p)) => {
                 self.shaders.pipelines += 1;
+                self.host.backend.name_render_pipeline(&p, name);
                 Pipe::Render(Rc::new(p), Some(Rc::new(Binding {
                     ps: ps_binding.map(Rc::new),
                     ..vs_binding
                 })))
             }
             Err(e) => {
+                #[cfg(target_os = "macos")]
+                self.compile_failed(name, &e);
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -342,5 +418,14 @@ impl<B: PresentBackend> Title<B> {
     /// A translation that failed, counted.
     pub fn refused_translation(&mut self, name: &str, reason: String) {
         self.shaders.refuse(name, format!("translation: {reason}"));
+    }
+
+    /// A pipeline compile that ended in `error`: if Metal's compiler died on it rather than
+    /// refusing a shader the host cannot run, the frame spends the rest of its pipeline budget
+    /// (`glue::compile_failed`), so the frame's other new pipelines are put off instead of each
+    /// waiting about a second for a compiler that crashes (issue #181).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn compile_failed(&mut self, name: &str, error: &str) {
+        super::glue::compile_failed(name, error);
     }
 }
