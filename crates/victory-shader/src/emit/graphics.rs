@@ -263,6 +263,33 @@ fn infer(
             });
         }
     }
+    // Root constants run on over the user SGPRs right after them that the program reads on entry
+    // and no other parameter fills, as compute's do (`constants_to_the_end`): a guessed block is
+    // one dword unless the next root slot bounds it, and the title's mesh-style programs read a
+    // second word from the SGPR after it (an index they mask and scale into a descriptor
+    // offset), which was "a hardware SGPR input".
+    let live: std::collections::BTreeSet<u8> = p
+        .inputs
+        .iter()
+        .filter_map(|&(r, _)| match r {
+            Reg::S(n) => user_data_of(n),
+            _ => None,
+        })
+        .collect();
+    for i in 0..layout.len() {
+        if layout[i].root != RootType::Constants {
+            continue;
+        }
+        while layout[i].sgprs < 32 {
+            let Ok(next) = u8::try_from(u32::from(layout[i].user_data) + layout[i].sgprs) else {
+                break;
+            };
+            if !live.contains(&next) || occupied(&layout, next) {
+                break;
+            }
+            layout[i].sgprs += 1;
+        }
+    }
     let top = p
         .blocks
         .iter()
