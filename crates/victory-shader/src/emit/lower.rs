@@ -12519,7 +12519,7 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let (base, extra) = self.built_offset(&src)?;
+            let (base, extra) = self.built_offset(src)?;
             let b = self.s.m.i32(base);
             let mut at = self.s.m.bin(c, Bin::Add, off, b);
             if let Some(x) = extra {
@@ -12528,7 +12528,7 @@ impl<'a> Lower<'a> {
             let records = self.s.m.i32(words[0]);
             let zero = self.s.m.i32(0);
             for k in 0..count {
-                let four_k = self.s.m.i32(4 * k as u32);
+                let four_k = self.s.m.i32(4 * k);
                 let byte = self.s.m.bin(c, Bin::Add, at, four_k);
                 let x = self.code_dword(byte)?;
                 let rel = self.s.m.bin(c, Bin::Add, off, four_k);
