@@ -9,8 +9,8 @@
 //! `victory_shader`'s "Title memory", which `super::addr` fills with views of the pools
 //! themselves (the pool-offset contract). What a translated shader needs
 //! from the host that this one does not give yet, and is refused for: buffer views read from the
-//! heap by index, the write marks and view addresses of the shadow-copy design, and the page
-//! table for graphics pipelines outside the guessed path. See docs/metal-backend.md.
+//! heap by index and the write marks and view addresses of the shadow-copy design. See
+//! docs/metal-backend.md.
 
 use super::list::{Binding, ComputePso};
 use super::state::{self, Graphics};
@@ -78,7 +78,7 @@ pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
+/// give the page table (every pipeline of the Metal host: compute, guessed and described graphics). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
 /// stage (`bind_root_render`, `bind_root` in `victory-metal`).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
@@ -225,7 +225,9 @@ impl<B: PresentBackend> Title<B> {
         graphics: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        if let Some(why) = refusal(vs, ps, graphics.is_guessed()) {
+        // A described pipeline binds as a guessed one does (`make_render`, and the draw's
+        // `memory_args` for either stage), so either gets the page table.
+        if let Some(why) = refusal(vs, ps, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }

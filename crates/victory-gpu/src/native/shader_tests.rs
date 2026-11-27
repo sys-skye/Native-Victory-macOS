@@ -117,14 +117,19 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
     assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
-    // Compute shaders get the page table; a graphics pipeline does not yet.
+    // A described graphics pipeline gets the page table as compute and guessed ones do; a
+    // stage that marks the pages it writes is refused there too.
     let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
     vs.memory = true;
     let g = Graphics::default();
-    assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
+    assert!(!g.is_guessed());
+    let _ = t.render_pipe(&vs, None, &g, "vs");
+    assert!(!t.shaders.refused.iter().any(|(why, _)| why.contains("page table")), "{:?}", t.shaders.refused);
+    let before = t.shaders.refusals();
+    vs.memory_writes = true;
+    assert!(matches!(t.render_pipe(&vs, None, &g, "marks"), Pipe::Refused));
     t.refused_translation("y", "no DXIL part".into());
-    assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
+    assert_eq!(t.shaders.refusals(), before + 2, "{:?}", t.shaders.refused);
 }
 
 /// A graphics pipeline from a vertex and pixel shader and a pipeline-state stream's state:
