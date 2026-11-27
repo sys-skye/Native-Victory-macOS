@@ -343,6 +343,10 @@ pub(crate) fn raise_graphics(
                     .unwrap_or_else(|| user.clamp(8, 104));
                 Some(base.min(104) as u8 + 2)
             }
+            // A mesh-style (NGG) program: 8 system SGPRs, then at most 32 user SGPRs (the user
+            // count is 5 bits). Above s39 a register holds what the last wave left, so a read the
+            // paths only seem to allow reads zero, as for compute.
+            StageIo::Ms(_) => Some(40),
             _ => None,
         },
         ..Io::default()
