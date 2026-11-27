@@ -276,8 +276,9 @@ fn infer(
             _ => None,
         })
         .collect();
+    // A pixel program's take the rule above, which stops at its primitive mask.
     for i in 0..layout.len() {
-        if layout[i].root != RootType::Constants {
+        if stage == HwStage::Ps || layout[i].root != RootType::Constants {
             continue;
         }
         while layout[i].sgprs < 32 {
