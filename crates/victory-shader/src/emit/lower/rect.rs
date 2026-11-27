@@ -15,6 +15,11 @@
 //! finds the right-angle corner opposite the longest `SV_Position.xy` side,
 //! extrapolates the fourth corner `p + q - r` across every float output, and
 //! selects `(p, r, fourth, q)` by the strip vertex id `0..3`.
+//!
+//! A described vertex program (the title's input layout, signature inputs) drawn as a rectangle
+//! list runs the same way: its signature has each input element three times (corner k's with
+//! semantic index `index | k << 28`, `emit_fast`), the host binds them per instance at the
+//! corner's offset, and the corner-k body reads corner k's copies (`Lower::rect_input`).
 
 use super::super::bitcode::{Attr, Bin, Term, V, pred};
 use super::{Lower, Stop, Val, unsupported};
@@ -25,7 +30,8 @@ use crate::native::HwStage;
 
 pub(super) struct RectPass {
     pub(super) corner: u32,
-    pub(super) vid_val: Value,
+    /// The program's `v0` entry value, which reads as this corner's console vertex id.
+    pub(super) vid_val: Option<Value>,
     pub(super) corner_vid: V,
     pub(super) done_block: usize,
     pub(super) zeros: Vec<V>,
@@ -36,10 +42,45 @@ pub(super) struct RectPass {
 }
 
 impl<'a> Lower<'a> {
-    /// Returns the `Reg::V(0)` (`Input::VertexId`) entry value when this is a guessed
-    /// `Options::rect_list` vertex program that reads `v0` outside the ignored vertex-index
-    /// operand of a `VERTEX_TABLE` stage-in fetch.
-    pub(super) fn rect_vertex_id(&self) -> Option<Value> {
+    /// Whether this vertex program runs its body once for each of a rectangle's three corners,
+    /// and then its `Reg::V(0)` (`Input::VertexId`) entry value if it reads one:
+    /// - a guessed `Options::rect_list` program that reads `v0` outside the ignored vertex-index
+    ///   operand of a `VERTEX_TABLE` stage-in fetch;
+    /// - any described one (its inputs are signature elements, read for each corner from that
+    ///   corner's copy of the element, [`Self::rect_input`]).
+    pub(super) fn rect_corners(&self) -> Option<Option<Value>> {
+        if !(self.x.rect_list && self.x.native.stage == HwStage::Vs) {
+            return None;
+        }
+        if !self.guessed {
+            let p = self.x.p;
+            let vid = p.inputs.iter().find(|&&(r, v)| {
+                r == Reg::V(0) && self.x.io.inputs.contains(&(v, Input::VertexId))
+            });
+            return Some(vid.map(|&(_, v)| v));
+        }
+        self.rect_vertex_id().map(Some)
+    }
+
+    /// The element a described rectangle-list program reads input `id` from in the current corner:
+    /// corner k's copy of it (`index | k << 28`, `rect_inputs`) past the first corner.
+    pub(super) fn rect_input(&self, id: usize) -> usize {
+        let Some(corner) = self.rect_pass.as_ref().map(|rp| rp.corner).filter(|&c| c > 0) else {
+            return id;
+        };
+        if self.guessed {
+            return id;
+        }
+        let e = &self.s.inputs[id];
+        let index = e.index | corner << 28;
+        self.s
+            .inputs
+            .iter()
+            .position(|c| c.kind == 0 && c.name == e.name && c.index == index)
+            .unwrap_or(id)
+    }
+
+    fn rect_vertex_id(&self) -> Option<Value> {
         if !(self.guessed && self.x.rect_list && self.x.native.stage == HwStage::Vs) {
             return None;
         }
@@ -116,7 +157,7 @@ impl<'a> Lower<'a> {
 
     /// Lowers all three corners of one rectangle (`v0 = 3 * SV_InstanceID + 0..2`) and emits the
     /// reconstructed four-vertex strip outputs.
-    pub(super) fn run_rect_by_id(&mut self, order: &[usize], vid_val: Value) -> Result<(), Stop> {
+    pub(super) fn run_rect_by_id(&mut self, order: &[usize], vid_val: Option<Value>) -> Result<(), Stop> {
         if self.writes_uavs {
             return Err(unsupported(
                 0,

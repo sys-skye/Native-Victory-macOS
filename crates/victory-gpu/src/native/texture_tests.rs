@@ -1109,8 +1109,9 @@ fn a_render_target_view_selects_its_mip_and_slice() {
 }
 
 /// A rectangle-list draw (`D3D_PRIMITIVE_TOPOLOGY_RECTLIST`, 17) on a described (non-guessed)
-/// pipeline must draw the supplied vertices as `Topology::Triangles` instead of issuing
-/// 4-vertex instanced strips designed for `Options::rect_list`.
+/// pipeline whose vertex shader has no rectangle-list translation (here: no title shaders at all,
+/// so `glue::described_rect` makes nothing) draws the supplied vertices as `Topology::Triangles`
+/// instead of issuing 4-vertex instanced strips designed for `Options::rect_list`.
 #[test]
 fn described_rectangle_list_draw_uses_supplied_triangles() {
     let Some(pool) = pool(9204, 4) else { return };

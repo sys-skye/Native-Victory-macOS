@@ -1292,7 +1292,7 @@ Texture uploads, the background scanner and submit-time probes first try one Mac
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
-* A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn as a plain strip without its fourth corner, and now warns once.
+* A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn with its fourth corner too since 27 Nov 2026 ("Described pipeline rectangle-list draws"); only when its vertex shader does not translate for rectangle lists, or the draw is indexed, is it drawn as plain triangles (half of each rectangle), warning once.
 * `VICTORY_TRACE_RECTS=1` logs the first three rectangle-list draws of each pipeline with the first three vertices as floats.
 * The Brightness logo (half a rectangle, the cut along one diagonal) is a guessed pipeline (`vertex 511484f3`: float3 position, unorm8x4 colour at 12, float2 uv at 16, 24-byte vertices) drawing one rectangle at (+-0.2, +-0.325) with corners top-left, bottom-left, bottom-right, which is the order the rule expects. Its matrices flip y, so the visible half is the strip's first triangle (which holds the computed corner), and the second triangle is lost. Both triangles wind alike, so culling does not explain it; the next suspects are the guessed depth state (less-equal with writes, `VICTORY_DEBUG_NO_DEPTH`) and the pixel shader on the second triangle. Not settled: the game runs needed were stopped.
 
@@ -2070,16 +2070,36 @@ dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
 `zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
 `victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).
 
-## Described pipeline rectangle-list draws use `Triangles`
+## Described pipeline rectangle-list draws
 
-Only guessed console pipelines translate vertex shaders with `Options::rect_list` to generate the
-fourth corner from 4-vertex `TriangleStrip` instances. Previously, a rectangle-list draw
-(`topology = 17`) bound to a described `Pipe::Render` warned `"drawn without its fourth corner"`
-but still kept `rect = true`, emitting `Topology::TriangleStrip` with `draw_instanced(4, vertices / 3, 0, first / 3)`
-against per-vertex inputs. Described rectangle-list draws now reset `rect = false` and emit
-`Topology::Triangles` with `draw_instanced(vertices, instances, first, first_instance)` so each
-3-corner rectangle renders its supplied triangle and respects `first` (test: `victory-gpu`
-`native::tests::texture_tests::described_rectangle_list_draw_uses_supplied_triangles`).
+A described pipeline's rectangle list (`topology = 17`, a draw or a non-indexed indirect one) is
+drawn as a guessed pipeline's is: four-vertex `TriangleStrip` instances, one a rectangle,
+`draw_instanced(4, vertices / 3, 0, first / 3)` (`glue::described_rect`, cached per pipeline,
+targets and vertex strides in `Title::rect_pipes`).
+
+* The vertex shader is translated with `Options::rect_list`. Its input signature gets each
+  element again for corners 1 and 2, semantic index `index | k << 28` on new rows
+  (`emit::rect_corner_inputs`), and its body runs once for each corner (`lower/rect.rs`, as a
+  guessed program reading `v0` does). Corner k reads corner k's copies (`Lower::rect_input`).
+  The fourth corner's outputs are the two other corners' less the right-angle one's (the corner
+  opposite the longest `SV_Position.xy` side), so only an affine vertex shader is exact.
+* The description's input layout is made per instance for the three corners
+  (`Graphics::for_rects`): corner k's elements at the element's offset plus k vertices, each
+  stream stepping three vertices. A slot's vertex stride is the one bound, or where its elements
+  end when none is bound.
+* Seen 27 Nov 2026: Grand Theft Auto VI's HDR scene had a half-screen orange triangle in some
+  frames, from a described pipeline (`vertex 5ec7617b`, `pixel 813a7ead`) drawing a rectangle list
+  of POSITION, COLOR and TEXCOORD vertices into the scene target (reading the depth texture).
+  Drawn as triangles, each full-target rectangle became its diagonal half.
+* Indexed rectangle lists of either kind are still not drawn as rectangles; a described one is
+  drawn as triangles, and so is one whose vertex shader does not translate so (logged once:
+  "a described vertex shader not translated for rectangle lists").
+
+Tests: `victory-shader`
+`emit::gfx_refusal_tests::a_described_rect_list_vertex_program_reads_each_corners_inputs`,
+`victory-gpu` `native::state::tests::a_rectangle_list_state_reads_three_corners_an_instance`, and
+for the triangle fallback
+`native::tests::texture_tests::described_rectangle_list_draw_uses_supplied_triangles`.
 
 ## Texture copies on the native Metal host
 

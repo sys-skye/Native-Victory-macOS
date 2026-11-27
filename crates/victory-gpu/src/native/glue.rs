@@ -806,6 +806,7 @@ pub(crate) fn pipeline_released(pipeline: This) {
     with_title(|t| {
         t.pipelines.remove(&key);
         t.console_pipes.retain(|(k, _), _| *k != key);
+        t.rect_pipes.retain(|(k, _, _), _| *k != key);
         t.thread_pipes.remove(&key);
     });
 }
@@ -1600,6 +1601,16 @@ fn make_host_pipe(
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
     graphics: Option<super::state::Graphics>,
 ) -> Pipe<Metal> {
+    make_host_pipe_with(t, stages, graphics, None)
+}
+
+/// [`make_host_pipe`], with `vertex` in place of the vertex stage's own translation when given.
+fn make_host_pipe_with(
+    t: &mut MetalTitle,
+    stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
+    graphics: Option<super::state::Graphics>,
+    vertex: Option<Arc<victory_shader::emit::HostShader>>,
+) -> Pipe<Metal> {
     if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
         return Pipe::Skipped;
     }
@@ -1613,7 +1624,10 @@ fn make_host_pipe(
     let integer = graphics.as_ref().and_then(|g| g.color_formats().ok()).map_or(0, |c| super::shaders::integer_targets(&c));
     let mut hosts = Vec::new();
     for (stage, shader) in &stages {
-        let made = shader.native().map(Arc::clone).map_err(str::to_owned);
+        let made = match &vertex {
+            Some(v) if *stage == "vertex" => Ok(v.clone()),
+            _ => shader.native().map(Arc::clone).map_err(str::to_owned),
+        };
         let made = match made {
             Ok(_) if *stage == "pixel" && integer != 0 => {
                 if frame_left().is_zero() && !shader.targets_cached(integer) {
@@ -1684,10 +1698,16 @@ pub(crate) fn install_test_render_pipeline(
     key: usize,
     pso: Rc<<Metal as victory_backend::resources::GraphicsBackend>::RenderPipeline>,
 ) {
+    TEST_PIPES.lock().unwrap().push(key);
     with_title(|t| {
         t.pipelines.insert(key, Pipe::Render(pso, None));
     });
 }
+
+/// The keys of host pipelines tests installed ([`install_test_render_pipeline`]): no title
+/// pipeline object is behind them, so `described_rect` makes nothing for them.
+#[cfg(test)]
+static TEST_PIPES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
@@ -1922,15 +1942,66 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     made
 }
 
+/// The host pipeline of the list's described pipeline for a rectangle-list draw (topology 17,
+/// not indexed) into its targets from its vertex buffers, made at first use: the vertex shader
+/// translated for rectangle lists (`Options::rect_list`: each input read for the rectangle's three
+/// corners, the fourth made from them) and the description's input layout so read
+/// ([`super::state::Graphics::for_rects`]), drawn as four-vertex strip instances like a guessed
+/// pipeline's. `None` when the vertex shader does not translate so.
+fn described_rect(t: &mut MetalTitle, l: &MetalList) -> Option<Pipe<Metal>> {
+    #[cfg(test)]
+    if TEST_PIPES.lock().unwrap().contains(&l.pipeline) {
+        return None;
+    }
+    let key = (l.pipeline, l.targets.clone(), l.strides.clone());
+    if let Some(p) = t.rect_pipes.get(&key) {
+        return p.clone();
+    }
+    let (stages, graphics) = crate::pipeline::native_stages(l.pipeline as This)?;
+    let g = graphics?;
+    let g = if g.names_targets() {
+        g
+    } else {
+        super::console_state::graphics_state_for(&g, l.targets.color.clone(), l.targets.depth)
+    };
+    let vs = stages.iter().find(|s| s.0 == "vertex")?.1.clone();
+    // As in `guess`: past the frame's budget a translation not made yet goes to a worker, and
+    // the draw is dropped this time (nothing is cached).
+    if frame_left().is_zero() && !vs.rect_ready() {
+        let s = vs.clone();
+        put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));
+        return Some(Pipe::Refused);
+    }
+    let rect_vs = match vs.native_rect() {
+        Ok(h) => h.clone(),
+        Err(e) => {
+            tracing::info!(pipeline = l.pipeline, shader = %vs.hash, error = %e, "a described vertex shader not translated for rectangle lists");
+            t.rect_pipes.insert(key, None);
+            return None;
+        }
+    };
+    let state = g.for_rects(&l.strides);
+    t.compile_wait = compile_wait(t);
+    let put_off = t.shaders.put_off;
+    let made = make_host_pipe_with(t, stages, Some(state), Some(rect_vs));
+    if t.shaders.put_off == put_off {
+        let made = matches!(made, Pipe::Render(..)).then_some(made);
+        tracing::info!(pipeline = l.pipeline, shader = %vs.hash, strides = ?l.strides, made = made.is_some(), "described rectangle-list pipeline");
+        t.rect_pipes.insert(key, made.clone());
+        return made;
+    }
+    Some(made)
+}
+
 /// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
 /// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
 /// pipeline).
-fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool, indexed: bool) -> Option<bool> {
     if !pass_on() {
-        return graphics_inner(t, l, mesh);
+        return graphics_inner(t, l, mesh, indexed);
     }
     LAST_WHY.with(|w| w.set(""));
-    let r = graphics_inner(t, l, mesh);
+    let r = graphics_inner(t, l, mesh, indexed);
     let why = LAST_WHY.with(|w| w.get());
     let out = match r {
         Some(true) => "ran-rect",
@@ -1942,20 +2013,28 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     r
 }
 
-fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool, indexed: bool) -> Option<bool> {
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
         return None;
     }
-    // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
-    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`). A described
-    // pipeline has no fourth-corner shader translation, so it falls back to its supplied vertices
-    // drawn as triangles rather than issuing 4-vertex instanced strips.
+    // A rectangle list (topology 17) is drawn as instances of four vertices, a triangle strip,
+    // each instance a rectangle (`Options::rect_list`): a guessed pipeline's by `guess`, a
+    // described one's by `described_rect`. A described pipeline whose vertex shader does not
+    // translate so falls back to its supplied vertices drawn as triangles (half of each
+    // rectangle).
     let rect = l.topology == 17;
     let targets = l.targets.clone();
     let (made, rect) = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => (guess(t, l, &g, rect), rect),
+        p @ Pipe::Render(..) if rect && !indexed => match described_rect(t, l) {
+            Some(made) => (made, true),
+            None => {
+                warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
+                (p, false)
+            }
+        },
         p if rect => {
             if env_set!("VICTORY_TRACE_RECTS") {
                 tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
@@ -2028,7 +2107,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         return;
     }
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l, false) {
+        if let Some(rect) = graphics(t, l, false, false) {
             if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
@@ -2066,7 +2145,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if graphics(t, l, true).is_none() {
+        if graphics(t, l, true, false).is_none() {
             crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -2087,7 +2166,7 @@ pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l, false) {
+        if let Some(rect) = graphics(t, l, false, true) {
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
                 dropped("an indexed rectangle-list draw");
@@ -2128,7 +2207,7 @@ pub(crate) fn execute_indirect(
         Command::DispatchMesh => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
             with_list(this, |t, l| {
-                if graphics(t, l, true).is_none() {
+                if graphics(t, l, true, false).is_none() {
                     return;
                 }
                 if pass_on() {
@@ -2203,7 +2282,7 @@ pub(crate) fn execute_indirect(
         }
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
-            with_list(this, |t, l| match graphics(t, l, false) {
+            with_list(this, |t, l| match graphics(t, l, false, command == Command::DrawIndexed) {
                 // shortcut: an indexed rectangle list is not drawn, as directly.
                 Some(true) if command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");

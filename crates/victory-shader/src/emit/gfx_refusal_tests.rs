@@ -10,7 +10,7 @@ use super::{Options, graphics, translate_with};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
-    UsedResource,
+    UsedResource, VsInput,
 };
 use crate::{ShaderError, io, ir, resource, structure};
 
@@ -394,6 +394,73 @@ fn lower_vs(
         rect_list,
         copy_params: [0; 32],
     })
+}
+
+/// A described vertex program (signature inputs, no vertex fetch) drawn as a rectangle list runs
+/// its body for each corner, and corner k reads its copy of each input element (`index | k <<
+/// 28`, `rect_corner_inputs`): with `rect_list` all three copies of `POSITION` are read; without
+/// it only the first (the copies unread).
+#[test]
+fn a_described_rect_list_vertex_program_reads_each_corners_inputs() {
+    // exp pos0 v4, v5, v6, v7 done (POSITION arrives in v4..v7); s_endpgm.
+    let code = bytes_of(&[0xF800_08CF, 0x0706_0504, 0xBF81_0000]);
+    for rect_list in [false, true] {
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![VsInput { usage: Usage::Generic, row: 0, mask: 0xf, vgpr: 4 }],
+                outputs: vec![],
+            },
+            code: code.clone(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut inputs = vec![sig_el("POSITION", 0, 0, 9, 0, Some(0), 4)];
+        if rect_list {
+            super::rect_corner_inputs(&mut inputs);
+        }
+        let out = lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs,
+            outputs: vec![sig_el("SV_Position", 0, 3, 9, 0, Some(0), 4)],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: false,
+            zero_copy_memory: false,
+            view_marks: false,
+            rect_list,
+            copy_params: [0; 32],
+        })
+        .unwrap_or_else(|e| panic!("rect_list {rect_list}: {e}"));
+        // Each ISG1 row's semantic index (+8) and the channels the program reads (+25).
+        let c = Container::parse(&out.dxil).unwrap();
+        let isg1 = c.part(FourCC::ISG1).expect("ISG1").data;
+        let word = |at: usize| u32::from_le_bytes(isg1[at..at + 4].try_into().unwrap());
+        let read: Vec<(u32, bool)> = (0..word(0) as usize)
+            .map(|n| 8 + 32 * n)
+            .filter(|&e| isg1[word(e + 4) as usize..].starts_with(b"POSITION\0"))
+            .map(|e| (word(e + 8), isg1[e + 25] != 0))
+            .collect();
+        let expect = if rect_list {
+            vec![(0, true), (1 << 28, true), (2 << 28, true)]
+        } else {
+            vec![(0, true)]
+        };
+        assert_eq!(read, expect, "rect_list {rect_list}");
+    }
 }
 
 fn parsed_isg1(dxil: &[u8]) -> Vec<SigElement> {

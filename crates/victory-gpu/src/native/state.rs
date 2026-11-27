@@ -119,6 +119,9 @@ pub struct Graphics {
     /// A guessed pipeline (`VICTORY_GUESS_GRAPHICS`, [`Graphics::guess_base`]): its vertex layout
     /// and strides come from the draw ([`Graphics::for_draw`]).
     guess: Option<Guess>,
+    /// A described pipeline's state for rectangle-list draws ([`Graphics::for_rects`]): each
+    /// slot's vertex stride, a stream stepping three vertices an instance.
+    rects: Option<Vec<u32>>,
 }
 
 /// What a draw gives a guessed pipeline that the description does not.
@@ -152,6 +155,7 @@ impl Default for Graphics {
             samples: 1,
             bound: None,
             guess: None,
+            rects: None,
         }
     }
 }
@@ -377,6 +381,42 @@ impl Graphics {
         g
     }
 
+    /// This described state for rectangle-list draws of the vertex buffers bound at `strides`
+    /// (topology 17, drawn as four-vertex strip instances, one a rectangle): every input element
+    /// is read per instance, for each of the rectangle's three corners. Corner k's copy (semantic
+    /// index `index | k << 28`, as the vertex shader translated with `Options::rect_list` declares
+    /// it) is at the element's offset plus k vertices, and each stream steps three vertices an
+    /// instance. A slot's vertex stride is the one bound, or where its elements end if none is.
+    pub fn for_rects(&self, strides: &[u32]) -> Graphics {
+        let mut g = self.clone();
+        let slots = self.inputs.iter().map(|e| e.slot as usize + 1).max().unwrap_or(0);
+        let mut vertex = vec![0u32; slots];
+        for e in &self.inputs {
+            let bytes = crate::resource::element(e.format).map_or(0, |(b, _)| b as u32);
+            let v = &mut vertex[e.slot as usize];
+            *v = (*v).max(e.offset + bytes);
+        }
+        for (slot, v) in vertex.iter_mut().enumerate() {
+            *v = match strides.get(slot) {
+                Some(&bound) if bound != 0 => bound,
+                _ => v.next_multiple_of(4),
+            };
+        }
+        g.inputs.clear();
+        for k in 0..3u32 {
+            for e in &self.inputs {
+                g.inputs.push(Input {
+                    index: e.index | k << 28,
+                    offset: e.offset + k * vertex[e.slot as usize],
+                    per_instance: true,
+                    ..e.clone()
+                });
+            }
+        }
+        g.rects = Some(vertex);
+        g
+    }
+
     /// Whether this is a guessed state, to be made at the first draw.
     pub fn is_guessed(&self) -> bool {
         self.guess.is_some()
@@ -466,6 +506,10 @@ impl Graphics {
         }
         for s in &mut streams {
             s.stride = s.stride.next_multiple_of(4);
+            // A rectangle-list state's streams step a rectangle's three vertices.
+            if let Some(&vertex) = self.rects.as_ref().and_then(|r| r.get(s.slot)) {
+                s.stride = 3 * vertex as usize;
+            }
             // A guessed pipeline's streams have the strides of the buffers bound.
             if let Some(&bound) = self.guess.as_ref().and_then(|g| g.strides.get(s.slot)) {
                 s.stride = if self.guess.as_ref().is_some_and(|g| g.rect) {
@@ -811,6 +855,42 @@ pub fn system_gaps(dxil: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A described state for rectangle-list draws reads each element for three corners, per
+    /// instance: corner k's (`index | k << 28`) k vertices on, each stream stepping three; the
+    /// vertex stride is the one bound, or where the elements end when none is.
+    #[test]
+    fn a_rectangle_list_state_reads_three_corners_an_instance() {
+        let element = |name: &str, format, offset| Input {
+            name: name.into(),
+            index: 0,
+            format,
+            slot: 0,
+            offset,
+            per_instance: false,
+        };
+        // R32G32B32_FLOAT, R8G8B8A8_UNORM, R32G32_FLOAT: 24 bytes.
+        let g = Graphics {
+            inputs: vec![element("POSITION", 6, 0), element("COLOR", 28, 12), element("TEXCOORD", 16, 16)],
+            ..Graphics::default()
+        };
+        let reads: Vec<(String, u32)> = (0..3u32)
+            .flat_map(|k| ["POSITION", "COLOR", "TEXCOORD"].map(|n| (n.to_owned(), k << 28)))
+            .collect();
+        for (bound, vertex) in [(&[36u32][..], 36usize), (&[][..], 24)] {
+            let r = g.for_rects(bound);
+            assert!(r.inputs().iter().all(|e| e.per_instance));
+            let (attrs, streams) = r.vertex_layout(&reads).expect("every corner's element");
+            let offsets: Vec<usize> = attrs.iter().map(|a| a.offset).collect();
+            let want: Vec<usize> = (0..3).flat_map(|k| [0, 12, 16].map(|o| o + k * vertex)).collect();
+            assert_eq!(offsets, want, "bound {bound:?}");
+            assert_eq!(streams.len(), 1);
+            assert_eq!((streams[0].stride, streams[0].per_instance), (3 * vertex, true), "bound {bound:?}");
+        }
+        // The state itself is unchanged: one vertex an element.
+        let (attrs, streams) = g.vertex_layout(&reads[..3]).unwrap();
+        assert_eq!((attrs.len(), streams[0].stride, streams[0].per_instance), (3, 24, false));
+    }
 
     /// Dual-source blending: the shader gives target 0 one more output than there are targets, and
     /// target 0's blend reads it as its second source. Metal refuses the pipeline otherwise.

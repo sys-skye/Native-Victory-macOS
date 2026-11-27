@@ -1896,7 +1896,7 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
-        if let Some(vid_val) = self.rect_vertex_id() {
+        if let Some(vid_val) = self.rect_corners() {
             self.run_rect_by_id(&order, vid_val)?;
         } else {
             self.lower_blocks(&order, self.s.entry)?;
@@ -2184,7 +2184,7 @@ impl<'a> Lower<'a> {
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&Input::VertexId)
-                        if self.rect_pass.as_ref().is_some_and(|rp| rp.vid_val == v) =>
+                        if self.rect_pass.as_ref().is_some_and(|rp| rp.vid_val == Some(v)) =>
                     {
                         Val::I32(self.rect_pass.as_ref().expect("rect pass").corner_vid)
                     }
@@ -2209,7 +2209,10 @@ impl<'a> Lower<'a> {
             Input::Position(c) => (3, c),
             Input::Attribute { row, channel } => {
                 return match self.find_input(row, channel) {
-                    Some((id, col)) => self.load_input(id, col),
+                    Some((id, col)) => {
+                        let id = self.rect_input(id);
+                        self.load_input(id, col)
+                    }
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }

@@ -204,6 +204,10 @@ pub struct Title<B: PresentBackend> {
     /// Host pipelines of compute pipelines dispatched with thread counts (`DispatchX`), whose
     /// shader is translated for that, by title pipeline object.
     pub thread_pipes: HashMap<usize, Pipe<B>>,
+    /// Host pipelines of described pipelines for rectangle-list draws (`glue::described_rect`),
+    /// by title pipeline object, the draw's targets and its vertex strides; `None` where the
+    /// vertex shader does not translate for rectangle lists.
+    pub rect_pipes: HashMap<(usize, TargetFormats, Vec<u32>), Option<Pipe<B>>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     /// How long a new pipeline may hold the frame while Metal compiles it (`glue::compile_wait`);
@@ -269,6 +273,7 @@ impl<B: PresentBackend> Title<B> {
             host,
             pipelines: HashMap::new(),
             console_pipes: HashMap::new(),
+            rect_pipes: HashMap::new(),
             thread_pipes: HashMap::new(),
             shaders: Default::default(),
             compile_wait: std::time::Duration::MAX,

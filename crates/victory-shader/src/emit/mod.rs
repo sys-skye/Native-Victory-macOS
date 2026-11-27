@@ -477,7 +477,9 @@ pub struct Options {
     /// rectangle), or when the program reads `SV_VertexID` directly its body runs for console
     /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
     /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
-    /// two-channel float fetch).
+    /// two-channel float fetch). A described vertex shader drawn so declares each input element
+    /// for corners 1 and 2 too (semantic index `index | k << 28`), to be bound per instance at
+    /// the corner's offset, and runs its body for each corner.
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
@@ -630,6 +632,13 @@ fn emit_fast(
             row += 1;
         }
     }
+    // A described vertex program drawn as a rectangle list (`Options::rect_list`, `lower/rect.rs`)
+    // reads each of the rectangle's three corners: each input element gets copies for corners 1
+    // and 2 (semantic index `index | k << 28`, as a guessed program's `VB` inputs), which the host
+    // binds per instance at the corner's offset.
+    if !pixel && options.rect_list && native.stage == HwStage::Vs && !graphics::is_guessed(c) {
+        rect_corner_inputs(&mut inputs);
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -751,6 +760,22 @@ fn emit_fast(
         splits: l.splits,
         table_entries: l.table_entries,
     })
+}
+
+/// A described vertex program's input elements for rectangle-list draws: each element again for
+/// corners 1 and 2 (semantic index `index | k << 28`), on rows after the others.
+pub(super) fn rect_corner_inputs(inputs: &mut Vec<container::SigElement>) {
+    let mut row = inputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+    let originals: Vec<_> = inputs.iter().filter(|e| e.kind == 0 && e.row.is_some()).cloned().collect();
+    for k in 1..3u32 {
+        for e in &originals {
+            let mut copy = e.clone();
+            copy.index |= k << 28;
+            copy.row = Some(row);
+            row += 1;
+            inputs.push(copy);
+        }
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
