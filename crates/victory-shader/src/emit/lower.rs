@@ -406,6 +406,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: Set<Value>,
+    /// Constant-lane reads `(v, lane)` from outside `v`'s section, and their lowered values.
+    section_lane_reads: Set<(Value, u32)>,
+    section_lanes: Map<(Value, u32), Result<V, Why>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1132,6 +1135,8 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
+            section_lane_reads: Set::default(),
+            section_lanes: Map::default(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1543,10 +1548,29 @@ impl<'a> Lower<'a> {
                         && !(sb == b && i > start && i < end)
                     {
                         self.section_out.insert(r);
+                        if inst.name() == "v_readlane_b32"
+                            && let Fields::Valu(v) = &inst.fields
+                            && let [Operand::Vector { reg, .. }, at] = v.src.as_slice()
+                            && inst.read(Reg::V(*reg)) == Some(r)
+                            && let Some(lane) = crate::resource::lane_of(*at)
+                        {
+                            self.section_lane_reads.insert((r, lane));
+                        }
                     }
                 }
             }
         }
+        let more: Vec<(Value, u32)> = self
+            .sections
+            .values()
+            .flat_map(|m| m.values())
+            .flat_map(|sec| sec.shapes.values().chain(sec.lane_shapes.values()))
+            .filter_map(|sh| match *sh {
+                super::wave::Shape::ReadLane(r, lane) if inside.contains_key(&r) => Some((r, lane)),
+                _ => None,
+            })
+            .collect();
+        self.section_lane_reads.extend(more);
     }
 
     /// An instruction inside a whole-wave section: the values that leave
@@ -1560,8 +1584,8 @@ impl<'a> Lower<'a> {
         let sec = &self.sections[&b][&start];
         let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
         for &(_, w) in &inst.writes {
+            let shape = self.sections[&b][&start].shapes.get(&w).copied();
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
@@ -1570,6 +1594,23 @@ impl<'a> Lower<'a> {
                 Val::Missing(unknown)
             };
             self.vals.insert(w, val);
+            if self.x.st.masks.contains_key(&w) && shape.is_none() {
+                self.lane_fail.insert(w, unknown);
+            }
+            if self.section_out.contains(&w) && shape.is_none() {
+                let lanes: Vec<(u32, super::wave::Shape)> = self.sections[&b][&start]
+                    .lane_shapes
+                    .iter()
+                    .filter_map(|(&(v, lane), &sh)| {
+                        (v == w && self.section_lane_reads.contains(&(w, lane)))
+                            .then_some((lane, sh))
+                    })
+                    .collect();
+                for (lane, sh) in lanes {
+                    let res = self.shape(sh);
+                    self.section_lanes.insert((w, lane), res);
+                }
+            }
         }
         Ok(())
     }
@@ -1584,6 +1625,9 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
+            Shape::ReadLane(v, lane) if self.section_lanes.contains_key(&(v, lane)) => {
+                return self.section_lanes[&(v, lane)];
+            }
             Shape::ReadLane(v, lane) => {
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
                 let x = self.i32_of(v)?;
@@ -9044,6 +9088,14 @@ impl<'a> Lower<'a> {
             {
                 let a = self.i32_of(x)?;
                 int(self, a)
+            }
+            "v_readlane_b32"
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::V(reg))
+                    && let Some(&res) = self.section_lanes.get(&(x, lane)) =>
+            {
+                int(self, res?)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

@@ -54,6 +54,20 @@ impl Op {
         })
     }
 
+    fn salu_of(name: &str) -> Option<Op> {
+        Some(match name {
+            "s_add_u32" | "s_add_i32" => Op::AddU,
+            "s_min_u32" => Op::MinU,
+            "s_max_u32" => Op::MaxU,
+            "s_min_i32" => Op::MinI,
+            "s_max_i32" => Op::MaxI,
+            "s_or_b32" => Op::Or,
+            "s_and_b32" => Op::And,
+            "s_xor_b32" => Op::Xor,
+            _ => return None,
+        })
+    }
+
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
@@ -129,6 +143,9 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// Per-lane shapes `(v, lane)` for VGPR values whose lanes do not all agree (for example a
+    /// wave64 reduction whose second half combines into lane 63 only, read by `v_readlane_b32`).
+    pub lane_shapes: HashMap<(Value, u32), Shape>,
     /// The first step the simulation does not model, if any: why a value
     /// the section leaves may have no shape.
     pub why: Option<&'static str>,
@@ -160,6 +177,7 @@ pub(super) fn register_only(inst: &Inst) -> bool {
         Fields::Valu(v) => v.dst.is_some(),
         Fields::Sop { .. } => {
             matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
+                || Op::salu_of(inst.name()).is_some()
         }
         _ => false,
     }
@@ -172,8 +190,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let mut out = HashMap::new();
     let mut from = 0;
     while let Some((start, end, saved)) = next_section(insts, from) {
-        let (shapes, why) = simulate(&insts[start + 1..end], wave, saved);
-        out.insert(start, Section { end, shapes, why });
+        out.insert(start, simulate(&insts[start + 1..end], end, wave, saved));
         from = end + 1;
     }
     out
@@ -363,11 +380,7 @@ std::thread_local! {
     pub(super) static SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn simulate(
-    insts: &[Inst],
-    wave: u32,
-    saved: Value,
-) -> (HashMap<Value, Shape>, Option<&'static str>) {
+fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
     #[cfg(test)]
     SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;
@@ -391,7 +404,8 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                let (shapes, lane_shapes) = shapes(vec, uni, wave);
+                return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -406,7 +420,8 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                let (shapes, lane_shapes) = shapes(vec, uni, wave);
+                return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -425,6 +440,26 @@ fn simulate(
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            } else if let Some(op) = Op::salu_of(name) {
+                let sym_of = |o: &Operand| match *o {
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        inst.read(Reg::S(code)).and_then(|x| uni.get(&x).copied())
+                    }
+                    Operand::Const(c) => crate::resource::inline(c).map(Sym::K),
+                    Operand::Literal(x) => Some(Sym::K(x)),
+                    _ => None,
+                };
+                let combined = match (src.first().and_then(sym_of), src.get(1).and_then(sym_of)) {
+                    (Some(a), Some(b)) => combine(op, a, b),
+                    _ => Sym::Unknown,
+                };
+                if combined != Sym::Unknown
+                    && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
+                {
+                    uni.insert(w, combined);
+                } else {
+                    why.get_or_insert(SCALAR);
+                }
             } else {
                 why.get_or_insert(SCALAR);
             }
@@ -605,41 +640,72 @@ fn simulate(
                     }
                 }
             }
-            ("v_sub_nc_u32", Some(a)) => {
+            ("v_writelane_b32", Some(a)) => {
+                writes = all;
+                let lane = match v.src.get(1) {
+                    Some(&Operand::Const(c)) => crate::resource::inline(c),
+                    Some(&Operand::Literal(x)) => Some(x),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        inst.read(Reg::S(code)).and_then(|v| match uni.get(&v) {
+                            Some(&Sym::K(k)) => Some(k),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
+                match lane.filter(|&l| l < wave) {
+                    Some(target) => (0..wave as usize)
+                        .map(|l| if l == target as usize { a[l] } else { old[l] })
+                        .collect(),
+                    None => {
+                        why.get_or_insert(VALU);
+                        vec![Sym::Unknown; wave as usize]
+                    }
+                }
+            }
+            ("v_sub_nc_u32" | "v_sub_co_u32" | "v_subrev_nc_u32" | "v_subrev_co_u32", Some(a)) => {
                 // A prefix sum less the lane's own term: the exclusive one.
                 let b = src(1).unwrap_or_default();
+                let rev = name.starts_with("v_subrev_");
                 (0..wave as usize)
-                    .map(|l| match (a[l], b.get(l).copied()) {
-                        (
-                            Sym::Red {
-                                op: None | Some(Op::AddU),
-                                src,
-                                mask,
-                                ident: 0,
-                                lanes,
-                            },
-                            Some(Sym::Red {
-                                op: None | Some(Op::AddU),
-                                src: s2,
-                                mask: m2,
-                                ident: 0,
-                                lanes: l2,
-                            }),
-                        ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
-                            let rest = lanes & !l2;
-                            if rest == 0 {
-                                Sym::K(0)
-                            } else {
-                                Sym::Red {
-                                    op: Some(Op::AddU),
+                    .map(|l| {
+                        let (lhs, rhs) = if rev {
+                            (b.get(l).copied(), Some(a[l]))
+                        } else {
+                            (Some(a[l]), b.get(l).copied())
+                        };
+                        match (lhs, rhs) {
+                            (
+                                Some(Sym::Red {
+                                    op: None | Some(Op::AddU),
                                     src,
                                     mask,
                                     ident: 0,
-                                    lanes: rest,
+                                    lanes,
+                                }),
+                                Some(Sym::Red {
+                                    op: None | Some(Op::AddU),
+                                    src: s2,
+                                    mask: m2,
+                                    ident: 0,
+                                    lanes: l2,
+                                }),
+                            ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
+                                let rest = lanes & !l2;
+                                if rest == 0 {
+                                    Sym::K(0)
+                                } else {
+                                    Sym::Red {
+                                        op: Some(Op::AddU),
+                                        src,
+                                        mask,
+                                        ident: 0,
+                                        lanes: rest,
+                                    }
                                 }
                             }
+                            _ => Sym::Unknown,
                         }
-                        _ => Sym::Unknown,
                     })
                     .collect()
             }
@@ -673,8 +739,14 @@ fn simulate(
             })
             .collect();
         vec.insert(dst, merged);
+        for &(r, w) in &inst.writes {
+            if matches!(r, Reg::S(_)) {
+                uni.insert(w, Sym::Unknown);
+            }
+        }
     }
-    (shapes(vec, uni, wave), why)
+    let (shapes, lane_shapes) = shapes(vec, uni, wave);
+    Section { end, shapes, lane_shapes, why }
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -698,18 +770,21 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
+/// The shape of each value where every lane agrees on one, plus per-lane
+/// uniform shapes `(v, lane)` for VGPR values where only specific lanes hold
+/// the finished reduction.
 fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
-) -> HashMap<Value, Shape> {
+) -> (HashMap<Value, Shape>, HashMap<(Value, u32), Shape>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
+    let mut lane_out = HashMap::new();
     for (v, s) in uni {
         if let Some(sh) = uniform_shape(s, all) {
             out.insert(v, sh);
@@ -718,9 +793,15 @@ fn shapes(
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+        } else {
+            for (l, &s) in lanes.iter().enumerate() {
+                if let Some(sh) = uniform_shape(s, all) {
+                    lane_out.insert((v, l as u32), sh);
+                }
+            }
         }
     }
-    out
+    (out, lane_out)
 }
 
 fn uniform_shape(s: Sym, all: u64) -> Option<Shape> {
@@ -1108,6 +1189,14 @@ mod tests {
                 Some(Shape::Prefix(Op::AddU, v0, m0, 0, false))
             );
 
+            // Lane 0 holding `-0.0` (`0x8000_0000`) when `ident` is `+0.0` (`0`) must not match.
+            let mut neg_zero_lane0: Vec<Sym> = (0..wave)
+                .map(|l| red(Some(Op::AddF), v0, m0, 0, below_mask(l)))
+                .collect();
+            neg_zero_lane0[0] = Sym::K(0x8000_0000);
+            neg_zero_lane0[1] = red(None, v0, m0, 0, 1);
+            assert_eq!(per_lane(&neg_zero_lane0, all), None);
+
             let mut mixed_other_src = valid_exc.clone();
             mixed_other_src[0] = red(None, v_other, m0, 0, 1);
             assert_eq!(per_lane(&mixed_other_src, all), None);
@@ -1142,5 +1231,224 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn wave64_single_lane_and_salu_reductions_lower_while_partial_lanes_stay_refused() {
+        use crate::emit::lower::{self, Parts};
+        use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+
+        let lower_cs = |body: &[u32], lanes: u32| {
+            let mut words = vec![
+                vop1(2, 1, 128), // v_mov_b32 v2, 0
+                vop1(3, 1, 128), // v_mov_b32 v3, 0
+                vop1(8, 1, 128), // v_mov_b32 v8, 0
+                vop1(9, 1, 128), // v_mov_b32 v9, 0
+            ];
+            words.extend_from_slice(body);
+            words.extend([
+                0xDC70_8000,
+                0x007D_0308, // global_store_dword v[8:9], v3, off
+                S_ENDPGM,
+            ]);
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2 << 1,
+                    threads: [lanes, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, true, 256).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            lower::lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                atomic_locks: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                wave32_host: true,
+                zero_copy_memory: false,
+                rect_list: false,
+                copy_params: [0; 32],
+                view_marks: false,
+            })
+        };
+
+        let mut half_or = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+        half_or.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s[0:1]
+        for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+            half_or.push(vop2(1, 0x1C, 0xFA, 1)); // v_or_b32_dpp v1, v1, v1
+            half_or.push(dpp16(1, ctrl, 0xF, 0xF, false));
+        }
+        half_or.extend([0xD778_0002, 0x0305_8301]); // v_permlanex16_b32 v2, v1, -1, -1
+        half_or.push(vop2(1, 0x1C, 256 + 1, 2)); // v_or_b32 v1, v1, v2
+
+        // Variant 1: combine lower half into lane 63 only (`v_writelane_b32`), then read lane 63
+        // outside the section after narrowing `EXEC` (`s_mov_b64 exec, 1`) in 64- and 128-lane groups.
+        let mut lane63 = half_or.clone();
+        lane63.push(vop1(2, 1, 128)); // v_mov_b32 v2, 0
+        lane63.extend(vop3(4, 0x360, 256 + 1, 128, 0)); // v_readlane_b32 s4, v1, 0
+        lane63.extend(vop3(2, 0x361, 4, 128 + 63, 0)); // v_writelane_b32 v2, s4, 63
+        lane63.push(vop2(1, 0x1C, 256 + 2, 1)); // v_or_b32 v1, v2, v1
+        lane63.extend([
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+            0xBEFE_0481, // s_mov_b64 exec, 1
+        ]);
+        lane63.extend(vop3(5, 0x360, 256 + 1, 128 + 63, 0)); // v_readlane_b32 s5, v1, 63
+        lane63.push(vop1(3, 1, 5)); // v_mov_b32 v3, s5
+        lane63.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+        for group in [64, 128] {
+            lower_cs(&lane63, group).expect("lane 63 holds all 64 lanes and lowers at the section");
+        }
+
+        // Negative 1: lane 0 only holds lanes 0..31, so reading lane 0 stays refused.
+        let mut lane0_partial = half_or.clone();
+        lane0_partial.push(vop1(2, 1, 128));
+        lane0_partial.extend(vop3(4, 0x360, 256 + 1, 128, 0));
+        lane0_partial.extend(vop3(2, 0x361, 4, 128 + 63, 0));
+        lane0_partial.push(vop2(1, 0x1C, 256 + 2, 1));
+        lane0_partial.extend([0xBEFE_0400, 0xBEFE_0481]);
+        lane0_partial.extend(vop3(5, 0x360, 256 + 1, 128, 0)); // v_readlane_b32 s5, v1, 0
+        lane0_partial.push(vop1(3, 1, 5));
+        lane0_partial.push(0xBEFE_0400);
+        assert!(matches!(
+            lower_cs(&lane0_partial, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: NO_SHAPE, .. })
+        ));
+
+        // Negative 2: reading a non-constant lane (`s2` live-in) after the section stays refused.
+        let mut read_nonconst = half_or.clone();
+        read_nonconst.push(vop1(2, 1, 128));
+        read_nonconst.extend(vop3(4, 0x360, 256 + 1, 128, 0));
+        read_nonconst.extend(vop3(2, 0x361, 4, 128 + 63, 0));
+        read_nonconst.push(vop2(1, 0x1C, 256 + 2, 1));
+        read_nonconst.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+        read_nonconst.extend(vop3(5, 0x360, 256 + 1, 2, 0)); // v_readlane_b32 s5, v1, s2
+        read_nonconst.push(vop1(3, 1, 5));
+        assert!(matches!(
+            lower_cs(&read_nonconst, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: NO_SHAPE, .. })
+        ));
+
+        // Negative 3: `v_writelane_b32` with a non-constant lane (`s2`) stays refused (`VALU`).
+        let mut write_nonconst = half_or.clone();
+        write_nonconst.push(vop1(2, 1, 128));
+        write_nonconst.extend(vop3(4, 0x360, 256 + 1, 128, 0));
+        write_nonconst.extend(vop3(2, 0x361, 4, 2, 0)); // v_writelane_b32 v2, s4, s2
+        write_nonconst.push(vop2(1, 0x1C, 256 + 2, 1));
+        write_nonconst.extend([0xBEFE_0400, 0xBEFE_0481]);
+        write_nonconst.extend(vop3(5, 0x360, 256 + 1, 128 + 63, 0));
+        write_nonconst.push(vop1(3, 1, 5));
+        write_nonconst.push(0xBEFE_0400);
+        assert!(matches!(
+            lower_cs(&write_nonconst, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: VALU, .. })
+        ));
+
+        // Variant 2: combine the two 32-lane halves in SALU (`s_or_b32`) inside the section.
+        let mut salu_or = half_or;
+        salu_or.extend(vop3(4, 0x360, 256 + 1, 128, 0)); // v_readlane_b32 s4, v1, 0
+        salu_or.extend(vop3(5, 0x360, 256 + 1, 128 + 32, 0)); // v_readlane_b32 s5, v1, 32
+        salu_or.extend([
+            0x8806_0504,   // s_or_b32 s6, s4, s5
+            0xBEFE_0400,   // s_mov_b64 exec, s[0:1]
+            vop1(3, 1, 6), // v_mov_b32 v3, s6
+        ]);
+        for group in [64, 128] {
+            lower_cs(&salu_or, group).expect("SALU-combined wave64 reduction lowers");
+        }
+
+        // Negative 4: `s_add_u32` of the same partial value twice (`s4 + s4`, overlapping lanes
+        // `0..31`) stays `Sym::Unknown` (`SCALAR`).
+        let mut half_sum = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+        half_sum.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s[0:1]
+        for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+            half_sum.push(vop2(1, 0x25, 0xFA, 1)); // v_add_nc_u32_dpp v1, v1, v1
+            half_sum.push(dpp16(1, ctrl, 0xF, 0xF, false));
+        }
+        half_sum.extend([0xD778_0002, 0x0305_8301]); // v_permlanex16_b32 v2, v1, -1, -1
+        half_sum.push(vop2(1, 0x25, 256 + 1, 2)); // v_add_nc_u32 v1, v1, v2
+        let mut dup_salu = half_sum;
+        dup_salu.extend(vop3(4, 0x360, 256 + 1, 128, 0)); // v_readlane_b32 s4, v1, 0 (lanes 0..31)
+        dup_salu.extend([
+            0x8006_0404,   // s_add_u32 s6, s4, s4 (duplicate lanes)
+            0xBEFE_0400,   // s_mov_b64 exec, s[0:1]
+            vop1(3, 1, 6), // v_mov_b32 v3, s6
+        ]);
+        assert!(matches!(
+            lower_cs(&dup_salu, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: SCALAR, .. })
+        ));
+
+        // Exclusive prefix difference (`v_sub_co_u32` and `v_subrev_nc_u32`):
+        // Build an inclusive prefix sum across all 64 lanes in `v1` from each lane's masked term `v4`.
+        let mut incl = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+        incl.extend(vop3(4, 0x101, 128, 256, 0)); // v_cndmask_b32 v4, 0, v0, s[0:1]
+        incl.push(vop1(1, 1, 256 + 4)); // v_mov_b32 v1, v4
+        for shift in [1u16, 2, 4, 8] {
+            incl.push(vop2(1, 0x25, 0xFA, 1)); // v_add_nc_u32_dpp v1, v1, v1 row_shr:shift
+            incl.push(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
+        }
+        incl.extend(vop3(2, 0x360, 256 + 1, 128 + 15, 0)); // v_readlane_b32 s2, v1, 15
+        incl.extend([sop1(EXEC, 0x04, 255), 0xFFFF_0000]); // s_mov_b64 exec, 0xffff0000
+        incl.push(vop2(1, 0x25, 2, 1)); // v_add_nc_u32 v1, s2, v1
+        incl.extend(vop3(2, 0x360, 256 + 1, 128 + 31, 0)); // v_readlane_b32 s2, v1, 31
+        incl.extend([sop1(EXEC, 0x03, 128), sop1(EXEC + 1, 0x03, 255), 0x0000_FFFF]);
+        incl.push(vop2(1, 0x25, 2, 1));
+        incl.extend(vop3(2, 0x360, 256 + 1, 128 + 47, 0)); // v_readlane_b32 s2, v1, 47
+        incl.extend([sop1(EXEC, 0x03, 128), sop1(EXEC + 1, 0x03, 255), 0xFFFF_0000]);
+        incl.push(vop2(1, 0x25, 2, 1));
+        incl.push(sop1(EXEC, 0x04, 193)); // s_mov_b64 exec, -1
+
+        // Positive `v_subrev_nc_u32 v3, v4, v1` (`v1 - v4` = exclusive prefix).
+        let mut subrev_ok = incl.clone();
+        subrev_ok.push(vop2(3, 0x27, 256 + 4, 1)); // v_subrev_nc_u32 v3, v4, v1
+        subrev_ok.push(0xBEFE_0400);
+        lower_cs(&subrev_ok, 128).expect("v_subrev_nc_u32 (v1 - v4) lowers as exclusive prefix");
+
+        // Negative 5: reversed `v_subrev_nc_u32 v3, v1, v4` (`v4 - v1`) stays refused (`NO_SHAPE`).
+        let mut subrev_bad = incl.clone();
+        subrev_bad.push(vop2(3, 0x27, 256 + 1, 4)); // v_subrev_nc_u32 v3, v1, v4
+        subrev_bad.push(0xBEFE_0400);
+        assert!(matches!(
+            lower_cs(&subrev_bad, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: NO_SHAPE, .. })
+        ));
+
+        // Positive `v_sub_co_u32 v3, s[6:7], v1, v4` when carry-out `s[6:7]` is unread outside.
+        let mut sub_co_ok = incl.clone();
+        sub_co_ok.extend([
+            0xD710_0603,
+            0x0002_0901, // v_sub_co_u32 v3, s[6:7], v1, v4
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        ]);
+        lower_cs(&sub_co_ok, 128).expect("v_sub_co_u32 exclusive prefix lowers when carry is unread");
+
+        // Negative 6: reading the carry-out `s6` of `v_sub_co_u32` after the section stays refused.
+        let mut sub_co_carry_read = incl;
+        sub_co_carry_read.extend([
+            0xD710_0603,
+            0x0002_0901,   // v_sub_co_u32 v3, s[6:7], v1, v4
+            0xBEFE_0400,   // s_mov_b64 exec, s[0:1]
+            vop1(3, 1, 6), // v_mov_b32 v3, s6 (reads carry-out outside section)
+        ]);
+        assert!(matches!(
+            lower_cs(&sub_co_carry_read, 128).err(),
+            Some(crate::ShaderError::Unsupported { what: NO_SHAPE, .. })
+        ));
     }
 }

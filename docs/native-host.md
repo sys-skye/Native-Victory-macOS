@@ -1087,6 +1087,17 @@ reductions, the host multiplies in its own order, so the last bits may differ fr
 Prefix products and integer products (`v_mul_lo_u32`) are still refused. Whether any title shader
 needs a product is not known: no run log names the operation.
 
+When a wave64 reduction combines its two 32-lane halves into only one lane of a VGPR (for example
+through `v_readlane_b32` and `v_writelane_b32` into lane 63, or when only the upper half combines
+with the lower half's `v_readlane_b32` result) and a constant-lane `v_readlane_b32` reads that lane
+after the section (including after narrowing `EXEC`), `Section::lane_shapes` and
+`Lower::section_lanes` evaluate that lane's reduction at the section site while keeping reads of
+incomplete lanes refused (`NO_SHAPE`). The simulator also follows associative SALU combinations of
+reduction terms (`s_add_u32`/`s_add_i32`, `s_min`/`s_max`, `s_or_b32`/`s_and_b32`/`s_xor_b32`),
+`v_writelane_b32`, and `v_sub_co_u32`/`v_subrev_*` exclusive prefix differences (`#258`; tests:
+`emit::wave::tests::wave64_single_lane_and_salu_reductions_lower_while_partial_lanes_stay_refused`
+and `split_wave_tests::wave64_lane63_writelane_and_salu_or_reductions_run_on_the_gpu`).
+
 ## Groups whose lanes are not a multiple of 64 (wave32 host)
 
 With `Options::wave32_host`, what crosses the two host waves of a console wave goes through the

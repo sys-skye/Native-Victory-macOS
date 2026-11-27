@@ -1235,3 +1235,128 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
     assert_eq!(got[16..20], [2; 4]);
     assert_eq!(got[20..], [0; 12]);
 }
+
+#[test]
+fn wave64_lane63_writelane_and_salu_or_reductions_run_on_the_gpu() {
+    // 1. Sum `v0 + 1` across each 64-lane console wave with lower-half `v_readlane_b32 s6, v1, 0`
+    //    written into lane 63 only (`v_writelane_b32 v2, s6, 63; v_add_nc_u32 v1, v2, v1`), then
+    //    narrow `EXEC` to lane 0 (`s_mov_b64 exec, 1`) and read lane 63 (`v_readlane_b32 s7, v1, 63`).
+    //    Tested for 1-wave (64-lane) and 2-wave (128-lane) groups.
+    let lane63_sum = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x4A02_02FA,
+        0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA,
+        0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA,
+        0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA,
+        0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xD760_0006,
+        0x0001_0101, // v_readlane_b32 s6, v1, 0
+        0xD761_0002,
+        0x0001_7E06, // v_writelane_b32 v2, s6, 63
+        0x4A02_0302, // v_add_nc_u32_e32 v1, v2, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0xD760_0007,
+        0x0001_7F01, // v_readlane_b32 s7, v1, 63
+        0x7E04_0207, // v_mov_b32 v2, s7
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        S_ENDPGM,
+    ];
+    let got64 = run_io(&lane63_sum, 0, 64, 0);
+    if got64.is_empty() {
+        return;
+    }
+    assert_eq!(got64[0], 2080, "sum(1..=64)");
+    assert_eq!(&got64[1..64], &[CANARY; 63]);
+
+    let got128 = run_io(&lane63_sum, 0, 128, 0);
+    assert_eq!(got128[0], 2080, "wave 0 sum(1..=64)");
+    assert_eq!(&got128[1..64], &[CANARY; 63]);
+    assert_eq!(got128[64], 6176, "wave 1 sum(65..=128)");
+    assert_eq!(&got128[65..128], &[CANARY; 63]);
+
+    // 2. Divergent `EXEC` (`v0 % 4 == 0` active) bitwise-OR reduction combining `v_readlane_b32` of
+    //    lanes 0 and 32 via `s_or_b32 s6, s4, s5` inside the whole-wave section:
+    //    Active lanes in wave 0 (`0, 4, ..., 60`) set bits `0..7` in the lower half and `8..15` in
+    //    the upper half (`0x0000_FFFF`), while wave 1 (`64, 68, ..., 124`) sets bits `16..23` and
+    //    `24..31` (`0xFFFF_0000`).
+    let salu_or = [
+        0x360A_0083u32, // v_and_b32 v5, 3, v0
+        0x7DA4_0A80,    // v_cmpx_eq_u32 0, v5 (only lanes `v0 % 4 == 0` stay active)
+        0x2C08_0082,    // v_lshrrev_b32 v4, 2, v0 (`0..15` in wave 0, `16..31` in wave 1)
+        0x7E0A_0281,    // v_mov_b32 v5, 1
+        0x3408_0B04,    // v_lshlrev_b32 v4, v4, v5 (`1 << (v0 / 4)`)
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x3802_02FA,
+        0xFF00_B101, // v_or_b32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x3802_02FA,
+        0xFF00_4E01, // v_or_b32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x3802_02FA,
+        0xFF01_4101, // v_or_b32_dpp v1, v1, v1 row_half_mirror
+        0x3802_02FA,
+        0xFF01_4001, // v_or_b32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x3802_0501, // v_or_b32_e32 v1, v1, v2
+        0xD760_0006,
+        0x0001_0101, // v_readlane_b32 s6, v1, 0
+        0xD760_0007,
+        0x0001_4101, // v_readlane_b32 s7, v1, 32
+        0x880A_0706, // s_or_b32 s10, s6, s7
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x7E04_020A, // v_mov_b32 v2, s10
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let or64 = run_io(&salu_or, 0, 64, 0);
+    for (i, &got) in or64.iter().enumerate() {
+        let want = if i % 4 == 0 { 0x0000_FFFF } else { CANARY };
+        assert_eq!(got, want, "64-lane salu_or lane {i}");
+    }
+    let or128 = run_io(&salu_or, 0, 128, 0);
+    for (i, &got) in or128.iter().enumerate() {
+        let want = if i % 4 != 0 {
+            CANARY
+        } else if i < 64 {
+            0x0000_FFFF
+        } else {
+            0xFFFF_0000
+        };
+        assert_eq!(got, want, "128-lane salu_or lane {i}");
+    }
+
+    // 3. Single-wave (64-lane) compute programs that previously failed `emit_fast` fell back to
+    //    `lockstep::retry`; verify `emit_fast` produces the exact same GPU output as `lockstep`
+    //    (forced by appending a divergent `v_readlane_b32` that `emit_fast` refuses).
+    for (fast_out, src) in [(&got64, &lane63_sum[..]), (&or64, &salu_or[..])] {
+        let mut lockstep_words = src[..src.len() - 1].to_vec();
+        lockstep_words.extend([
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0 (divergent EXEC)
+            0xD760_0011,
+            0x0001_0100, // v_readlane_b32 s17, v0, 0 (divergent cross-wave read -> forces lockstep)
+            S_ENDPGM,
+        ]);
+        assert!(
+            refusal(&lockstep_words).is_some(),
+            "divergent readlane must refuse emit_fast"
+        );
+        assert_eq!(&run_io(&lockstep_words, 0, 64, 0), fast_out);
+    }
+}
