@@ -1066,6 +1066,7 @@ impl GraphicsBackend for Metal {
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+        self.report_bounded();
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
@@ -1680,11 +1681,128 @@ fn cap_label_str(mut s: String) -> String {
     s
 }
 
+/// Every indirect dispatch reads its group counts through this one-thread kernel. D3D12 allows
+/// at most 65535 groups a dimension (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`); a
+/// record past that (a count the title or a mistranslated shader wrote wrong) would keep the GPU
+/// busy until Metal's watchdog fails the queue, and a GPU that long stuck also stalls
+/// WindowServer. Such a record runs no groups, and the first one since the host last looked is
+/// noted in `seen`: 1, the pipeline (two words), the three counts.
+const BOUND: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void bound(device const uint *record [[buffer(21)]],
+                  device uint *out [[buffer(22)]],
+                  constant uint2 &who [[buffer(23)]],
+                  device atomic_uint *seen [[buffer(24)]]) {
+    uint x = record[0], y = record[1], z = record[2];
+    bool ok = x <= 65535u && y <= 65535u && z <= 65535u;
+    out[0] = ok ? x : 0u;
+    out[1] = ok ? y : 0u;
+    out[2] = ok ? z : 0u;
+    if (!ok && atomic_exchange_explicit(&seen[0], 1u, memory_order_relaxed) == 0u) {
+        atomic_store_explicit(&seen[1], who.x, memory_order_relaxed);
+        atomic_store_explicit(&seen[2], who.y, memory_order_relaxed);
+        atomic_store_explicit(&seen[3], x, memory_order_relaxed);
+        atomic_store_explicit(&seen[4], y, memory_order_relaxed);
+        atomic_store_explicit(&seen[5], z, memory_order_relaxed);
+    }
+}
+"#;
+
 impl Metal {
+    fn bound_pipeline(&self) -> Result<&ProtocolObject<dyn MTLComputePipelineState>, String> {
+        self.bound
+            .get_or_init(|| {
+                let lib = self
+                    .dev
+                    .newLibraryWithSource_options_error(
+                        &objc2_foundation::NSString::from_str(BOUND),
+                        None,
+                    )
+                    .map_err(|e| e.localizedDescription().to_string())?;
+                let f = lib
+                    .newFunctionWithName(&objc2_foundation::NSString::from_str("bound"))
+                    .ok_or("no bound function")?;
+                self.dev
+                    .newComputePipelineStateWithFunction_error(&f)
+                    .map_err(|e| e.localizedDescription().to_string())
+            })
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    fn bound_seen(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        self.bound_seen
+            .get_or_init(|| {
+                let b = self.dev.newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)?;
+                // SAFETY: a fresh 32-byte shared buffer.
+                unsafe { std::ptr::write_bytes(b.contents().as_ptr().cast::<u8>(), 0, 32) };
+                Some(b)
+            })
+            .as_deref()
+    }
+
+    /// Encodes the bound of the three group counts at `at` in `record` into `e`; returns the
+    /// buffer the indirect dispatch reads instead (`BOUND`).
+    fn encode_bound(
+        &self,
+        e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        record: &ProtocolObject<dyn MTLBuffer>,
+        at: usize,
+        who: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
+        let seen = self.bound_seen().ok_or("no buffer for dropped indirect dispatches")?;
+        let out = self
+            .dev
+            .newBufferWithLength_options(12, MTLResourceOptions::StorageModePrivate)
+            .ok_or("no buffer for a bounded indirect record")?;
+        e.useResource_usage(ProtocolObject::from_ref(seen), MTLResourceUsage::Read | MTLResourceUsage::Write);
+        // What the work before wrote (the record) is seen.
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        e.setComputePipelineState(self.bound_pipeline()?);
+        let who = [who as u32, (who as u64 >> 32) as u32];
+        // SAFETY: `at` lies inside `record` (the caller resolved three words there); the bytes are
+        // copied before the call returns.
+        unsafe {
+            e.setBuffer_offset_atIndex(Some(record), at, 21);
+            e.setBuffer_offset_atIndex(Some(&out), 0, 22);
+            e.setBytes_length_atIndex(NonNull::new(who.as_ptr().cast_mut().cast()).unwrap(), 8, 23);
+            e.setBuffer_offset_atIndex(Some(seen), 0, 24);
+        }
+        e.dispatchThreadgroups_threadsPerThreadgroup(size([1, 1, 1]), size([1, 1, 1]));
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        Ok(out)
+    }
+
+    /// Logs an indirect dispatch `BOUND` dropped since the last look (the first 50 of a run).
+    pub(crate) fn report_bounded(&self) {
+        let Some(seen) = self.bound_seen.get().and_then(|s| s.as_deref()) else { return };
+        let w = seen.contents().as_ptr().cast::<u32>();
+        // SAFETY: the buffer is 8 shared words; the GPU may write them meanwhile (a diagnostic).
+        let v: [u32; 6] = unsafe { std::array::from_fn(|i| std::ptr::read_volatile(w.add(i))) };
+        if v[0] == 0 {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { std::ptr::write_volatile(w, 0) };
+        let n = self.bound_logged.get();
+        if n >= 50 {
+            return;
+        }
+        self.bound_logged.set(n + 1);
+        let k = (u64::from(v[2]) << 32 | u64::from(v[1])) as usize;
+        let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
+        tracing::warn!(
+            "metal: an indirect dispatch past 65535 groups a dimension ran no groups: {name} {}x{}x{} (one of those since the last report)",
+            v[3], v[4], v[5]
+        );
+    }
+
     /// The capped label for an encoder, kept for the command buffer's description.
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
-        let s = cap_label_str(s);
-        let n = objc2_foundation::NSString::from_str(&s);
+        // The in-flight and failure trace keeps the whole list: a stuck command buffer must name
+        // every dispatch it holds; only Metal's label is capped.
+        let n = objc2_foundation::NSString::from_str(&cap_label_str(s.clone()));
         self.trace_enc.borrow_mut().push(s);
         n
     }
@@ -2095,6 +2213,21 @@ impl Metal {
                 }
                 _ => None,
             };
+            // Every indirect record's counts pass `BOUND` first, into a buffer of its own.
+            let bounded = match d.indirect {
+                Some((b, title)) => {
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                    }
+                    let (buf, at) = match &gated {
+                        Some(g) => (&**g, 0),
+                        None => (&*b.buf, title as usize - b.base as usize),
+                    };
+                    let who = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
+                    Some(self.encode_bound(&e, buf, at, who).inspect_err(|_| e.endEncoding())?)
+                }
+                None => None,
+            };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
@@ -2106,21 +2239,13 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            match d.indirect {
-                Some((b, title)) => {
-                    if self.names(b, set_on_queue) {
-                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
-                    }
-                    let (buf, at) = match &gated {
-                        Some(g) => (&**g, 0),
-                        None => (&*b.buf, title as usize - b.base as usize),
-                    };
-                    // SAFETY: the caller resolved three words at `title` inside the live buffer
-                    // (or the gate wrote them to its own).
+            match &bounded {
+                Some(bounded) => {
+                    // SAFETY: the bound kernel wrote three words to its own buffer.
                     unsafe {
                         e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            buf,
-                            at,
+                            bounded,
+                            0,
                             size(d.threads_per_group),
                         )
                     };
@@ -2141,7 +2266,11 @@ impl Metal {
                     Some(n) => l.push_str(n),
                     None => l.push_str(&format!("{k:#x}")),
                 }
-                l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+                if d.indirect.is_some() {
+                    l.push_str(" indirect; ");
+                } else {
+                    l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+                }
             }
             e.setLabel(Some(&self.cap_label(l)));
         }

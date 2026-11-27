@@ -41,6 +41,13 @@ pub struct Metal {
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+    /// The kernel that bounds every indirect dispatch's group counts (`gfx.rs`), made at first use.
+    pub(crate) bound:
+        std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+    /// Where that kernel notes a dispatch it dropped (shared with the CPU), made with it.
+    pub(crate) bound_seen: std::cell::OnceCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Dropped dispatches logged so far.
+    pub(crate) bound_logged: std::cell::Cell<u32>,
     /// Every sampler made, by descriptor: a heap entry holds only the sampler's ID, which Metal
     /// hands to a new sampler once the old one is freed. Few distinct descriptors exist.
     #[allow(clippy::type_complexity)]
@@ -233,6 +240,9 @@ impl Metal {
             pipe_names: Default::default(),
             trace_enc: Default::default(),
             gate: Default::default(),
+            bound: Default::default(),
+            bound_seen: Default::default(),
+            bound_logged: Default::default(),
             samplers: Default::default(),
         })
     }

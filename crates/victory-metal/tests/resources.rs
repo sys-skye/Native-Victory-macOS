@@ -573,6 +573,45 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
     }
 }
 
+/// D3D12 allows at most 65535 groups a dimension: a record past that (a count written wrong)
+/// runs no groups instead of keeping the GPU busy until Metal's watchdog fails the queue. A
+/// record within the limit in the same encoder still runs.
+#[test]
+fn an_indirect_dispatch_past_the_group_limit_runs_nothing() {
+    for m in backends() {
+        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+        let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
+        let (dst, records) = (a.region.len / 2, N * 4);
+        a.write(0, &(0..N as u32).collect::<Vec<_>>());
+        // Half the groups, then every group many times over in x (70000 > 65535).
+        a.write(records, &[(N / 128) as u32, 1, 1, 70_000, 1, 1]);
+        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+        m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
+        m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
+        let w: Vec<_> = (0..2usize)
+            .map(|i| Dispatch {
+                pipeline: &p,
+                root: RootArgs::default()
+                    .constants(&[5, 7])
+                    .address(m.heap_address(&heap, 5)),
+                resources: vec![],
+                heaps: victory_metal::backend::Heaps {
+                    resource: Some(&heap),
+                    sampler: None,
+                },
+                groups: [0, 0, 0],
+                threads_per_group: [64, 1, 1],
+                indirect: Some((&a.buf, a.at(records + 12 * i) as *const u8)),
+                count: None,
+            })
+            .collect();
+        run(&m, &w);
+        let out: Vec<u32> = a.read(dst, N);
+        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
+        assert!(out[N / 2..].iter().all(|v| *v == 0), "the record past the limit ran groups");
+    }
+}
+
 #[test]
 fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
     for m in backends() {
