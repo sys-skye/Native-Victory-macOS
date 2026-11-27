@@ -183,6 +183,33 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
     assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
 }
 
+#[test]
+fn a_wave32_programs_group_info_numbers_its_waves_from_bit_20() {
+    // Two console waves of 32 (GTA VI's temporal resolve numbers its threads so): bits 20-24 of
+    // the info SGPR times 32 plus the lane's count of lanes below it is the thread's index, so
+    // each slot is written once. Bits 6-11 hold the index too, bits 0-5 the wave count.
+    let w = [
+        0x9386_FF05,
+        0x0005_0014, // s_bfe_u32 s6, s5, 0x50014 (bits 20-24)
+        0x8F06_8506, // s_lshl_b32 s6, s6, 5
+        0xD765_0001,
+        0x0200_0CC1, // v_mbcnt_lo_u32_b32 v1, -1, s6
+        0x3404_0282, // v_lshlrev_b32 v2, 2, v1
+        0x7E06_0205, // v_mov_b32 v3, s5
+        0xDC70_8000,
+        0x0002_0302, // global_store_dword v2, v3, s[2:3]
+        S_ENDPGM,
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = translate_wave(&w, 5, 1 << 10, 64, false, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let got = f.get(DST, 64);
+    assert_eq!(got, (0..64).map(|i| i / 32 << 20 | i / 32 << 6 | 2).collect::<Vec<u32>>());
+}
+
 /// `v_ldexp_f32` (a pixel shader of GTA VI's world was refused for it): `s0` scaled by two to
 /// the power `s1`, a signed integer, in range or past it.
 #[test]

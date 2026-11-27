@@ -2269,7 +2269,13 @@ impl<'a> Lower<'a> {
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => {
                 // Guess (RADV's reading of TG_SIZE): bits 0-5 the group's
-                // wave count, 6-11 this wave's index in it; the rest 0.
+                // wave count, 6-11 this wave's index in it; the rest 0. A
+                // wave32 program also finds its wave's index in bits 20-24:
+                // Grand Theft Auto VI's temporal resolve (77e145c1, 64
+                // threads) numbers its threads `bfe(info, 20, 5) * 32 +
+                // lane` to share a 10x10 tile in LDS, so on the console
+                // those bits count the waves (with 0 there both waves fill
+                // the same half and the rest of the tile is never written).
                 let f = if self.console_lanes { self.console_flat() } else { self.mesh_thread() };
                 let lanes: u32 = self.s.threads.expect("compute").iter().product();
                 let wave = self.wave();
@@ -2279,9 +2285,15 @@ impl<'a> Lower<'a> {
                     self.s.m.i32(6),
                     self.s.m.i32(lanes.div_ceil(wave)),
                 );
-                let w = self.s.m.bin(e, Bin::LShr, f, shift);
-                let w = self.s.m.bin(e, Bin::Shl, w, k6);
-                return Val::I32(self.s.m.bin(e, Bin::Or, w, n));
+                let index = self.s.m.bin(e, Bin::LShr, f, shift);
+                let w = self.s.m.bin(e, Bin::Shl, index, k6);
+                let mut info = self.s.m.bin(e, Bin::Or, w, n);
+                if wave == 32 {
+                    let k20 = self.s.m.i32(20);
+                    let high = self.s.m.bin(e, Bin::Shl, index, k20);
+                    info = self.s.m.bin(e, Bin::Or, info, high);
+                }
+                return Val::I32(info);
             }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
