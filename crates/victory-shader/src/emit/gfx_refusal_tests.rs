@@ -2826,3 +2826,79 @@ fn divergent_readlane_in_a_two_wave_group_is_refused() {
         "expected a divergent exchange refusal, got {err:?}",
     );
 }
+
+/// A guessed wave64 pixel shader whose waterfall loop reads an unshifted descriptor index with
+/// `v_readfirstlane_b32`, shifts it in 64-bit SALU (`s_lshl_b32` + `s_lshr_b32` + `s_addc_u32`)
+/// onto an undeclared SM 6.6 `ResourceHeap` SGPR, and loads from it translates on `wave32_host`
+/// without refusing on `"a descriptor outside the heaps"`, `"an address into a descriptor heap
+/// with an untracked high half"`, or `"a cross-lane operation outside compute"`.
+#[test]
+fn guessed_wave64_pixel_salu_shifted_heap_waterfall_translates() {
+    let code = [
+        0xBEFC_0380u32, // s_mov_b32 m0, 0
+        0xC80A_0002,    // v_interp_mov_f32 v2, p0, attr0.x
+        0xBE96_047E,    // s_mov_b64 s[22:23], exec
+        0xBE98_047E,    // s_mov_b64 s[24:25], exec
+        0x7E28_0502,    // loop: v_readfirstlane_b32 s20, v2
+        0x7DA4_0414,    // v_cmpx_eq_u32 exec, s20, v2
+        0x8F0E_8514,    // s_lshl_b32 s14, s20, 5
+        0x900F_9B14,    // s_lshr_b32 s15, s20, 27
+        0x800C_0E0A,    // s_add_u32 s12, s10, s14
+        0x820D_0F80,    // s_addc_u32 s13, 0, s15
+        0xF408_0406,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_0000,
+        0x8004_0300, // buffer_load_dword v3, off, s[16:19], 0
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE98_3A18, // s_andn2_wrexec_b64 s[24:25], s[24:25]
+        0xBF89_FFF2, // s_cbranch_execnz -> loop
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xF800_180F,
+        0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let c = graphics::container(HwStage::Ps, &bytes_of(&code), &[0u8; 0x10]).unwrap();
+    let options = Options {
+        wave32_host: true,
+        zero_copy_memory: true,
+        ..Options::default()
+    };
+    let shader = translate_with(&c, options).unwrap();
+    assert!(shader.heap);
+
+    // Control-flow joined heap address (`s4 = s10 + 0x20, s5 = 0` on one arm and
+    // `s4 = s10 + s9, s5 = s_addc_u32(0, 0)` on the other arm) also translates cleanly.
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Constants in s9 (user_data 9, slot 0)
+    meta[0x25] = 9;
+    let joined_code = [
+        0xBE8C_030Au32, // s_mov_b32 s12, s10
+        0xBE8D_0380,    // s_mov_b32 s13, 0
+        0xF408_0606,
+        0xFA00_0000, // s_load_dwordx4 s[24:27], s[12:13], 0x0 (establishes ResourceHeap s10)
+        0xBF06_8009, // s_cmp_eq_u32 s9, 0
+        0xBF84_0003, // s_cbranch_scc0 -> else (+3 dwords)
+        0x8004_A00A, // s_add_u32 s4, s10, 32
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBF82_0002, // s_branch -> join (+2 dwords)
+        0x8004_090A, // else: s_add_u32 s4, s10, s9
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0xF408_0402,
+        0xFA00_0000, // join: s_load_dwordx4 s[16:19], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_0000,
+        0x8004_0200, // buffer_load_dword v2, off, s[16:19], 0
+        0xE030_0000,
+        0x8006_0300, // buffer_load_dword v3, off, s[24:27], 0
+        0x0604_0702, // v_add_f32 v2, v2, v3
+        0xF800_180F,
+        0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let cj = graphics::container(HwStage::Ps, &bytes_of(&joined_code), &meta).unwrap();
+    let sj = translate_with(&cj, options).unwrap();
+    assert!(sj.heap);
+}

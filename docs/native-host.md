@@ -1375,3 +1375,22 @@ Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resou
 (and its destination keeps the copy when its title memory changes),
 `copy_texture_region_moves_plain_texels_into_compressed_blocks`,
 `resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.
+
+## Descriptor-heap 64-bit offsets, carries, joins, and SALU-shifted waterfall loops
+
+Programs that index a 32-bit `Table`, `ResourceHeap`, or `SamplerHeap` root parameter with an
+unmasked 32-bit index or across control-flow branches form a 64-bit SMEM or global-load address
+whose high dword carries the upper bits of the shifted/sign-extended 32-bit byte offset (`s_lshr_b32`,
+`s_bfe_u32`, `s_ashr_i32`, `s_lshl_b64` / `v_lshlrev_b64` high dword, `v_add_co_ci_u32`, `v_mad_u64_u32`),
+masks the 64-bit pair (`s_and_b64`, 40/48-bit `s_bfe_u32` / `v_bfe_u32`), or joins `0` and
+`s_addc_u32` across phis and selects (`#258`). `Tracer::high_half_with`, `Tracer::compute_sums`,
+`Tracer::compute_joined`, and `infer_roots` now trace those high halves by matching the exact SSA
+offset term and shift or multiplier against the low half's single dynamic addend
+(`Tracer::extract_low_offset` / `Tracer::offset_high_half`, rejecting mismatched shifts, bit-fields,
+multipliers, and shared-only user parameters), precompute phi joins and additive heap bases in
+linear `O(V + E)` time via iterative Tarjan SCCs (with `Tracer::edge_taken` memoized per CFG edge),
+and recognize waterfall loops whose `v_readfirstlane_b32` index is shifted in SALU inside the loop
+(`Tracer::first_lane_in_offset`).
+Tests: `victory-shader` `resource::tests::heap_addresses_with_shifted_offsets_carries_and_joins_trace_cleanly`,
+`resource::tests::deep_diamond_phi_and_add_chains_track_in_linear_time`, and
+`emit::gfx_refusal_tests::guessed_wave64_pixel_salu_shifted_heap_waterfall_translates`.
