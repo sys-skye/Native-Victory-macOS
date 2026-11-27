@@ -3095,6 +3095,46 @@ fn a_stale_vcc_only_anded_with_an_empty_exec_translates_in_lockstep() {
     }
 }
 
+/// A loop gathers the lanes that ever pass a test into `s[4:5]`: cleared before the loop
+/// (`s_mov_b64 0`), read and ORed with a compare behind an EXEC branch, with passes skipped on a
+/// VCC branch. The join at the loop head has only the constant on its forward edge, yet holds
+/// lanes (a carried mask), so the joins of it in the loop are joins of masks.
+pub(crate) const LOOP_GATHERED_MASK: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xF400_01C1,
+    0xFA00_0000, // s_load_dword s7, s[2:3], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE84_0480, // s_mov_b64 s[4:5], 0
+    0xBE86_0380, // s_mov_b32 s6, 0
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    0xD4C2_006A,
+    0x0000_0C07, // loop: v_cmp_eq_u32 vcc, s7, s6
+    0xBF87_0006, // s_cbranch_vccnz join (a pass the wave skips, tested per lane)
+    0x7DA8_0006, // v_cmpx_gt_u32 s6, v0
+    0xBF88_0004, // s_cbranch_execz join
+    0xD501_0003,
+    0x0011_0280, // v_cndmask_b32 v3, 0, 1, s[4:5]
+    0x7D82_0085, // v_cmp_lt_u32 vcc, 5, v0
+    0x8884_6A04, // s_or_b64 s[4:5], s[4:5], vcc
+    0xBEFE_040A, // join: s_mov_b64 exec, s[10:11]
+    0x8006_8106, // s_add_u32 s6, s6, 1
+    0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+    0xBF85_FFF3, // s_cbranch_scc1 loop
+    0xD501_0002,
+    0x0011_0280, // v_cndmask_b32 v2, 0, 1, s[4:5]
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_mask_a_loop_gathers_from_a_cleared_start_translates() {
+    // Two console waves: the fast path alone.
+    if let Err(e) = emit_wave64_cs(LOOP_GATHERED_MASK, 128, false) {
+        panic!("{e}");
+    }
+}
+
 #[test]
 fn divergent_readlane_in_a_two_wave_group_is_refused() {
     // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;

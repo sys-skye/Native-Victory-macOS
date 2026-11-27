@@ -574,6 +574,9 @@ struct Lanes<'a> {
     phis: Map<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
     unresolved: HashSet<Value>,
+    /// Of those, joins some edge of which brings a mask derived from EXEC or a VALU result: a
+    /// loop's mask that starts as a constant (`s_mov_b64 s, 0`) and gathers lanes round the loop.
+    carried: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -655,6 +658,7 @@ impl<'a> Lanes<'a> {
             defs,
             phis,
             unresolved: HashSet::new(),
+            carried: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -899,7 +903,8 @@ impl<'a> Lanes<'a> {
         // Checking an argument can resolve another join; it is checked too.
         while j < self.joins.len() {
             let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
-            for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+            let args = self.joins[j].args.clone();
+            for (n, &a) in args.iter().enumerate() {
                 let (q, taken) = self.incoming[block][n];
                 let e = self.edge(cond[q], q, taken);
                 let mut m = self.mask(a).0;
@@ -908,6 +913,9 @@ impl<'a> Lanes<'a> {
                 }
                 if !self.b.implies(e, m) {
                     wrong.push(id);
+                    if args.iter().any(|&a| self.mask(a).1) {
+                        self.carried.insert(id);
+                    }
                     break;
                 }
             }
@@ -1571,6 +1579,7 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        let derived = derived || self.carried.contains(&id);
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 
