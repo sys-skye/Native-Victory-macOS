@@ -24,6 +24,19 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// Dword 3 of a buffer view in the view addresses, as the console's untyped
+/// buffer descriptor has it (RDNA2 ISA table 32): identity destination
+/// select (X, Y, Z, W: 4, 5, 6, 7), format 32_FLOAT (22, bits 12-18),
+/// resource level 1 (bit 24), type buffer (0, bits 30-31). The host puts the
+/// view's out-of-bounds mode in bits 28-29 ([`VIEW_BUFFER_OOB_RAW`] or
+/// [`VIEW_BUFFER_OOB_STRUCTURED`]).
+pub const VIEW_BUFFER_DWORD3: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9 | 22 << 12 | 1 << 24;
+/// Out-of-bounds mode 3 in dword 3 of a view with no stride: a check of the
+/// access's end against the record count in bytes.
+pub const VIEW_BUFFER_OOB_RAW: u32 = 3 << 28;
+/// Out-of-bounds mode 1 in dword 3 of a view with a stride: a check of the
+/// index against the record count in elements.
+pub const VIEW_BUFFER_OOB_STRUCTURED: u32 = 1 << 28;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;

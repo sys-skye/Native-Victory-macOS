@@ -161,6 +161,19 @@ pub(super) fn stride_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) ->
     element | kind
 }
 
+/// Whether `view` is a buffer view the console describes with no stride (a raw view, a constant
+/// buffer, a whole buffer): its record count is in bytes.
+pub(super) fn raw_buffer(view: &View) -> bool {
+    match view {
+        View::Constant(..) | View::Shader(_, None) | View::Unordered(_, _, None) => true,
+        View::Shader(_, Some(d)) if d[1] == BUFFER => d[7] == 0 && d[8] & FLAG_RAW != 0,
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => d[5] == 0 && d[8] & FLAG_RAW != 0,
+        View::Placed(true, res, d) if res[0] == BUFFER => d[5] == 0 && d[8] & FLAG_RAW != 0,
+        View::Placed(false, res, d) if res[0] == BUFFER => d[7] == 0 && d[8] & FLAG_RAW != 0,
+        _ => false,
+    }
+}
+
 /// Object and placed views have the same SRV/UAV union layout.
 fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> {
     let (mips, layers) = if unordered {

@@ -1562,6 +1562,9 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
+// One copy: rustc copies a function this small into each codegen unit that names it, and the
+// table and the tests that compare slots with it would then hold different addresses.
+#[inline(never)]
 extern "system" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or

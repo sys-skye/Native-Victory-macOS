@@ -7247,28 +7247,31 @@ impl<'a> Lower<'a> {
     /// as a pointer to title memory: the BVH's address in its SRV) or, for
     /// a whole image descriptor (eight dwords), also the size fields of
     /// dwords 1-3 (width, height, first and last level, type: size queries
-    /// of a texture the program never samples). They come from the host's
-    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index. The table gives every other field as 0, so a program
-    /// that can see one of their bits (`seen_bits`) is refused: a buffer's
-    /// stride and swizzle (dword 1 bits 16-31) and dwords 2-3, an image's
+    /// of a texture the program never samples), and a buffer view's stride
+    /// (dword 1 bits 16-29) and record count (dword 2), which the compiler
+    /// reads to turn a structured view into a raw one. They come from the
+    /// host's view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four
+    /// dwords per heap index. The table gives every other field as 0, so a
+    /// program that can see one of their bits (`seen_bits`) is refused: a
+    /// buffer view's entry past its four dwords (dword 3 is the console's
+    /// untyped one, [`super::VIEW_BUFFER_DWORD3`] with the view's
+    /// out-of-bounds mode; the swizzle bits, dword 1 bits 30-31, are 0 in a
+    /// title's buffer view as in the table), an image's
     /// base address, minimum level and format (dword 0, dword 1 bits 0-29),
     /// dword 2 bits 30-31, tiling (dword 3 bits 20-27) and dwords 4-7.
-    // shortcut: the swizzle reads as the identity; the kind of view is the
+    // shortcut: the swizzle reads as the identity; a typed buffer view's
+    // dword 3 has the untyped format (32_FLOAT), not its own; the kind of view is the
     // load's (eight dwords at a whole descriptor: an image) and the table
     // offset's computed part is taken as whole descriptors (32-byte
     // multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         // What the table holds of each dword, and why reading the rest stops the program.
-        const BUFFER: [(u32, Why); 2] = [
-            (!0, ""),
-            (
-                0xFFFF,
-                "a view address field the table gives as 0: a buffer's stride or swizzle",
-            ),
-        ];
+        // The table holds a buffer view's four dwords whole: a title's buffer views have no
+        // swizzle (dword 1 bits 30-31 are 0, as in the table) and dword 3 is the untyped one
+        // (`VIEW_BUFFER_DWORD3`).
+        const BUFFER: [(u32, Why); 4] = [(!0, ""), (!0, ""), (!0, ""), (!0, "")];
         const BUFFER_REST: Why =
-            "a view address field the table gives as 0: a buffer's record count or format";
+            "a view address field the table gives as 0: dwords 4-7 of a buffer view's entry";
         const IMAGE: [(u32, Why); 4] = [
             (
                 0,

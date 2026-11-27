@@ -913,6 +913,15 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
         (false, mov(12)),
         (false, and(13, 0xFFFF)),
         (false, shifted(0xFF)),
+        // A buffer's stride and record count, which the compiler reads to make a structured view
+        // raw (and the swizzle bits, 0 in a title's view as in the table).
+        (false, mov(13)),
+        (false, and(13, 0x3FFF_0000)),
+        (false, shifted(0xFFFF)),
+        (false, mov(14)),
+        // Dword 3, the console's untyped one.
+        (false, mov(15)),
+        (false, and(15, 0xCFFF_FFFF)),
         (true, and(13, 0xC000_0000)),
         (true, and(14, 0x3FFF_FFFF)),
         (true, and(15, 0xF00F_FFFF)),
@@ -928,10 +937,6 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     let prefix = "a view address field the table gives as 0: ";
     let dword_1 = "an image's base address, minimum level or format (dword 1)";
     let refused = [
-        (false, mov(13), "a buffer's stride or swizzle"),
-        (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
-        (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
-        (false, mov(14), "a buffer's record count or format"),
         (true, mov(12), "an image's base address"),
         (true, and(13, 0xFF), dword_1),
         (true, and(13, 0x1FF0_0000), dword_1),

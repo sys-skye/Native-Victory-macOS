@@ -1810,7 +1810,8 @@ root SRV `t1` of the memory space (`victory_shader::emit`, "View addresses"; `Ho
 view_addresses`). The native host bound no such table and refused every such program ("needs view
 addresses or write marks"; write marks stay refused, as "needs write marks"). Each resource heap now
 has one (`NativeHost::view_addresses`, `NativeHeap::addresses`): four dwords per title entry, a
-buffer view's title address (dword 0, and the low 16 bits of dword 1), a texture view's size fields
+buffer view's title address (dword 0, and the low 16 bits of dword 1), stride (dword 1 bits 16-29)
+and record count (dword 2; see "Buffer strides in the view addresses"), a texture view's size fields
 (`descriptor::texture_words`, the D3D12 path's, now shared), zeros for anything else. It is made
 the first time a shader reads it, from the heap's records as they are then, and kept current by
 every mirrored write (`NativeHost::mirror`). It follows the page table in the argument buffer
@@ -1843,7 +1844,7 @@ a decoy view's word instead.
 The table gives every field it doesn't hold as 0. The translator refuses a program that can see a
 bit of one of them, rather than let it read 0 (`Lower::view_addresses`, `Lower::seen_bits`).
 Refused fields:
-- a buffer's stride and swizzle (dword 1 bits 16-31) and its dwords 2-3;
+- a buffer's dword 3 (format, destination select, range-check mode);
 - an image's base address, minimum level and format (dword 0, dword 1 bits 0-29);
 - an image's dword 2 bits 30-31, its tiling (dword 3 bits 20-27) and its dwords 4-7.
 
@@ -1872,6 +1873,31 @@ Test: `gfx_refusal_tests::view_address_fields_the_table_gives_as_0_are_refused`.
 refusal per field class, plus accepted reads of a buffer's address (whole dword 0, dword 1 masked
 to 16 bits, or shifted with `s_lshr_b64` and masked) and of an image's size fields. Without the
 check, a read of a buffer's whole dword 1 translated.
+
+### Buffer strides in the view addresses
+
+The console compiler makes a structured buffer view raw before byte accesses. It reads the
+stride from dword 1 bits 16-29, multiplies the record count (dword 2) by max(stride, 1), clears
+the stride and sets out-of-bounds mode 3 in dword 3. When the table held only a view's address,
+every such load was refused ("a buffer's stride or swizzle"): 255 programs of a warm world run, 247
+of them compute. The table now holds a buffer view's four dwords as the console's untyped
+descriptor has them (`NativeHost::address_words`):
+- dword 1 bits 16-29: the stride. That is a structured view's stride or a typed view's element size
+  (`descriptors::stride_word`), and 0 for a raw view, a constant buffer or a whole buffer
+  (`descriptors::raw_buffer`).
+- dword 2: the record count. That is elements with a stride, else bytes.
+- dword 3: `VIEW_BUFFER_DWORD3`: identity destination select, format 32_FLOAT and resource
+  level 1. Bits 28-29 hold out-of-bounds mode 1 with a stride and mode 3 without
+  (`VIEW_BUFFER_OOB_STRUCTURED`, `VIEW_BUFFER_OOB_RAW`).
+- The swizzle bits (dword 1 bits 30-31) are 0, as in a title's view.
+
+shortcut: a typed view's dword 3 has the untyped format, not its own.
+
+Measured offline (27 November) on those 255 programs: 74 translate, and 181 stop at later
+refusals (lane-mask joins, an image's dwords 5-7, a loaded buffer descriptor's dword 1). Tests:
+`heap_tests::a_compute_shader_reads_a_structured_views_stride_and_record_count`, which reads a
+structured SRV's dwords 1-3 on Metal, and the accepted reads in
+`view_address_fields_the_table_gives_as_0_are_refused`.
 
 shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image), and the
 swizzle reads as the identity.

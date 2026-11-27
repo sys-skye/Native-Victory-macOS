@@ -1584,6 +1584,75 @@ fn a_compute_shader_reads_title_memory_at_a_heap_views_address() {
     drop(records);
 }
 
+/// A compute program that reads a buffer view's dwords 1-3 from its descriptor as numbers, as the
+/// console compiler does to make a structured view raw (stride from dword 1 bits 16-29, record
+/// count from dword 2, the out-of-bounds mode in dword 3), and stores them to the output.
+const CS_VIEW_FIELDS: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0211, // v_mov_b32 v1, s17
+    0xE070_0000, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+    0x7E02_0212, // v_mov_b32 v1, s18
+    0xE070_0004, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:4
+    0x7E02_0213, // v_mov_b32 v1, s19
+    0xE070_0008, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:8
+    0xBF81_0000, // s_endpgm
+];
+
+/// The view addresses give a buffer view's stride, record count and dword 3 as the console's
+/// descriptor has them. With only the address there, 248 compute programs of a world run were
+/// refused ("a view address field the table gives as 0: a buffer's stride or swizzle").
+#[test]
+fn a_compute_shader_reads_a_structured_views_stride_and_record_count() {
+    let record = |kind: u8, offset: u8, register: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        (r[8], r[12], r[16]) = (offset, register, 1);
+        r[20..23].copy_from_slice(&[4, 4, 0]);
+        r
+    };
+    let c = crate::pipeline::test_compute_container(CS_VIEW_FIELDS, &[record(3, 0, 0), record(0, 8, 1)], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.view_addresses, "{cs:?}");
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    // Entry 0: the output, 64 raw dwords at `VA_A`; entry 1: a structured SRV of 5 elements of
+    // 12 bytes at `VA_A + 0x1000`.
+    let mut uav = [0u32; 16];
+    (uav[1], uav[4], uav[8]) = (1, 64, 1);
+    [uav[10], uav[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start);
+    let mut srv = [0u32; 16];
+    (srv[1], srv[6], srv[7]) = (1, 5, 12);
+    [srv[10], srv[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, start + 32);
+    assert!(t.host.mirror(start).unwrap());
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "view fields") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    use victory_shader::emit::{VIEW_BUFFER_DWORD3, VIEW_BUFFER_OOB_STRUCTURED};
+    let high = (super::addr_tests::VA_A >> 32) as u32 & 0xFFFF;
+    assert_eq!(
+        f.get(0x2_0000, 4),
+        [high | 12 << 16, 5, VIEW_BUFFER_DWORD3 | VIEW_BUFFER_OOB_STRUCTURED, super::addr_tests::CANARY]
+    );
+    drop(records);
+}
+
 /// A compute program that needs both of the host's per-heap tables: the view-stride table (root
 /// SRV 255, among its root views) for the output buffer it takes from the resource heap itself
 /// (entry 2, by the heap's base in s6), and the view addresses (`t1` of the memory space, after

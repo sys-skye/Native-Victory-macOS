@@ -1698,15 +1698,34 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The four dwords of a heap entry in the view addresses: a buffer view's title address
-    /// (dword 0, and dword 1 bits 0-15), a texture view's size fields
-    /// ([`crate::descriptor::texture_words`]), zeros for anything else.
+    /// (dword 0, and dword 1 bits 0-15), stride (dword 1 bits 16-29: a structured or typed view's
+    /// element size, 0 for a raw view or a constant buffer) and record count (dword 2: elements
+    /// with a stride, else bytes) and dword 3 (the console's untyped one,
+    /// [`victory_shader::emit::VIEW_BUFFER_DWORD3`], with the view's out-of-bounds mode), as the
+    /// console's buffer descriptor has them; a texture view's
+    /// size fields ([`crate::descriptor::texture_words`]); zeros for anything else.
     fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 4] {
         let Some(view) = view else { return [0; 4] };
         if let Some(words) = crate::descriptor::texture_words(view) {
             return words;
         }
-        match decode(view, &self.resources.borrow()) {
-            Some(Decoded::Buffer { addr, .. }) => [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0],
+        let resources = self.resources.borrow();
+        match decode(view, &resources) {
+            Some(Decoded::Buffer { addr, size }) => {
+                // A raw view's element is 4 in the stride table; its descriptor has no stride.
+                let stride = match super::descriptors::raw_buffer(view) {
+                    true => 0,
+                    false => {
+                        super::descriptors::stride_word(view, &resources)
+                            & victory_shader::emit::VIEW_STRIDE_BITS
+                    }
+                };
+                let records = size.checked_div(stride).unwrap_or(size);
+                let high = (addr >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16;
+                use victory_shader::emit::{VIEW_BUFFER_DWORD3, VIEW_BUFFER_OOB_RAW, VIEW_BUFFER_OOB_STRUCTURED};
+                let oob = if stride > 0 { VIEW_BUFFER_OOB_STRUCTURED } else { VIEW_BUFFER_OOB_RAW };
+                [addr as u32, high, records, VIEW_BUFFER_DWORD3 | oob]
+            }
             _ => [0; 4],
         }
     }
