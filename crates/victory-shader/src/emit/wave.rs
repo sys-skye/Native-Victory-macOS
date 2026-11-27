@@ -194,23 +194,9 @@ pub(super) fn passthrough(inst: &Inst) -> bool {
     matches!(inst.fields, Fields::Sop { .. })
         && matches!(
             inst.name(),
-            "s_lshr_b32"
-                | "s_lshl_b32"
-                | "s_ashr_i32"
-                | "s_bfm_b32"
-                | "s_bfe_u32"
-                | "s_bfe_i32"
-                | "s_add_u32"
-                | "s_add_i32"
-                | "s_sub_u32"
-                | "s_sub_i32"
-                | "s_mul_i32"
-                | "s_or_b32"
-                | "s_xor_b32"
-                | "s_min_u32"
-                | "s_max_u32"
-                | "s_min_i32"
-                | "s_max_i32"
+            // Not the adds, minimums, maximums and bitwise ops: the simulation combines
+            // reduction terms through those (`s_or_b32` of two halves' lane reads).
+            "s_lshr_b32" | "s_lshl_b32" | "s_ashr_i32" | "s_bfm_b32" | "s_bfe_u32" | "s_bfe_i32" | "s_sub_u32" | "s_sub_i32" | "s_mul_i32"
         )
         && !inst.reads.iter().any(|(r, _)| lane_mask(r))
         && !inst.writes.iter().any(|(r, _)| lane_mask(r))
