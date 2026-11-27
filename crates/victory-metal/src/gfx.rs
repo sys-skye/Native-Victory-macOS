@@ -1681,12 +1681,12 @@ fn cap_label_str(mut s: String) -> String {
     s
 }
 
-/// Every indirect dispatch reads its group counts through this one-thread kernel. D3D12 allows
-/// at most 65535 groups a dimension (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`); a
-/// record past that (a count the title or a mistranslated shader wrote wrong) would keep the GPU
-/// busy until Metal's watchdog fails the queue, and a GPU that long stuck also stalls
-/// WindowServer. Such a record runs no groups, and the first one since the host last looked is
-/// noted in `seen`: 1, the pipeline (two words), the three counts.
+/// Every indirect dispatch reads its group counts through this one-thread kernel. A record of
+/// more than 2^24 groups in all (a count the title or a mistranslated shader wrote wrong) would
+/// keep the GPU busy until Metal's watchdog fails the queue, and a GPU that long stuck also
+/// stalls WindowServer. Such a record runs no groups, and the first one since the host last
+/// looked is noted in `seen`: 1, the pipeline (two words), the three counts. Not D3D12's 65535
+/// a dimension: the title dispatches over 100000 groups in x, which the console and Metal run.
 const BOUND: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1695,7 +1695,8 @@ kernel void bound(device const uint *record [[buffer(21)]],
                   constant uint2 &who [[buffer(23)]],
                   device atomic_uint *seen [[buffer(24)]]) {
     uint x = record[0], y = record[1], z = record[2];
-    bool ok = x <= 65535u && y <= 65535u && z <= 65535u;
+    ulong groups = ulong(x) * ulong(y) * ulong(z);
+    bool ok = groups <= (1ul << 24);
     out[0] = ok ? x : 0u;
     out[1] = ok ? y : 0u;
     out[2] = ok ? z : 0u;
@@ -1793,7 +1794,7 @@ impl Metal {
         let k = (u64::from(v[2]) << 32 | u64::from(v[1])) as usize;
         let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
         tracing::warn!(
-            "metal: an indirect dispatch past 65535 groups a dimension ran no groups: {name} {}x{}x{} (one of those since the last report)",
+            "metal: an indirect dispatch of over 2^24 groups ran none: {name} {}x{}x{} (one of those since the last report)",
             v[3], v[4], v[5]
         );
     }
