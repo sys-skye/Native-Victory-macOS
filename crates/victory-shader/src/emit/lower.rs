@@ -13917,7 +13917,10 @@ impl<'a> Lower<'a> {
                             tainted.insert(w);
                         }
                     }
-                } else if guard.is_none() {
+                } else if guard.is_none()
+                    // A compare writes every lane's bit (0 where EXEC is off), guarded or not.
+                    || matches!(inst.fields, Fields::Valu(_)) && inst.name().starts_with("v_cmp_")
+                {
                     for w in &inst.writes {
                         regs.remove(&w.0);
                     }
@@ -13926,6 +13929,39 @@ impl<'a> Lower<'a> {
             if regs.is_empty() {
                 continue;
             }
+            // A branch on a register compared with 0 (`s_cmp_eq_u64 exec, 0`, how lockstep tests
+            // a mask): on the edge where it is 0, so is each of its dwords.
+            let zero = (|| {
+                let [.., cmp, br] = block.insts.as_slice() else { return None };
+                let on_scc1 = match br.name() {
+                    "s_cbranch_scc1" => true,
+                    "s_cbranch_scc0" => false,
+                    _ => return None,
+                };
+                let eq = match cmp.name() {
+                    "s_cmp_eq_u64" | "s_cmp_eq_u32" => true,
+                    "s_cmp_lg_u64" | "s_cmp_lg_u32" => false,
+                    _ => return None,
+                };
+                let Fields::Sop { src, .. } = &cmp.fields else { return None };
+                let (&Operand::Scalar { code, .. }, Some(0)) =
+                    (src.first()?, src.get(1).copied().and_then(scalar_constant))
+                else {
+                    return None;
+                };
+                let dwords = if cmp.name().ends_with("_u64") { 2 } else { 1 };
+                let words: Option<Vec<Value>> =
+                    (0..dwords).map(|h| cmp.read(Reg::S(code + h))).collect();
+                Some((on_scc1 == eq, words?))
+            })();
+            let zeroed = |mut env: HashMap<Value, u32>, taken: bool| {
+                if let Some((on, words)) = &zero
+                    && *on == taken
+                {
+                    env.extend(words.iter().map(|&w| (w, 0)));
+                }
+                env
+            };
             let into = |t: usize| p.blocks[t].preds.iter().position(|&q| q == b);
             let mut go = |t: usize, env, regs| match into(t) {
                 Some(n) => {
@@ -13945,8 +13981,8 @@ impl<'a> Lower<'a> {
                 } => {
                     let (no, yes) = self.can_be(when, &env, &mut HashMap::new());
                     !(no && yes && self.touches(when, &env, &tainted))
-                        && (!yes || go(taken, env.clone(), regs.clone()))
-                        && (!no || go(not_taken, env, regs))
+                        && (!yes || go(taken, zeroed(env.clone(), true), regs.clone()))
+                        && (!no || go(not_taken, zeroed(env, false), regs))
                 }
             };
             if !ok {

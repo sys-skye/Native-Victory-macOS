@@ -3061,6 +3061,40 @@ fn a_mask_joined_with_a_stale_dword_its_edge_never_reads_translates() {
     }
 }
 
+/// `vcc_lo` joins a lane mask with the VCC the program entered with (no value the translation
+/// makes), then on the path where the saveexec leaves no lane it is only ANDed with the empty EXEC
+/// (in lockstep the branch tests `exec_lo == 0`, so the AND is 0), and on the other a compare
+/// overwrites it under EXEC: no lane reads the entry VCC.
+pub(crate) const STALE_VCC_EMPTY_EXEC: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xF400_0181,
+    0xFA00_0000, // s_load_dword s6, s[2:3], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF06_8006, // s_cmp_eq_u32 s6, 0
+    0xBF85_0001, // s_cbranch_scc1 join
+    0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+    0xD4C4_0004,
+    0x0202_008A, // join: v_cmp_gt_u32 s4, 10, v0
+    0xBE85_3C04, // s_and_saveexec_b32 s5, s4
+    0xBF88_0001, // s_cbranch_execz skip
+    0x7D82_0085, // v_cmp_lt_u32 vcc_lo, 5, v0
+    0x8707_7E6A, // skip: s_and_b32 s7, vcc_lo, exec_lo
+    0xBEFE_0305, // s_mov_b32 exec_lo, s5
+    0xD501_0002,
+    0x001D_0280, // v_cndmask_b32 v2, 0, 1, s7
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_stale_vcc_only_anded_with_an_empty_exec_translates_in_lockstep() {
+    if let Err(e) = emit_cs(STALE_VCC_EMPTY_EXEC, 32, false, false, true) {
+        panic!("{e}");
+    }
+}
+
 #[test]
 fn divergent_readlane_in_a_two_wave_group_is_refused() {
     // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;
