@@ -187,6 +187,16 @@ struct Func {
     body: bool,
 }
 
+/// A call as written ([`Module::written_call_places`]).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenCall {
+    pub name: String,
+    pub block: usize,
+    pub place: usize,
+    pub args: Vec<(Option<i64>, Option<usize>)>,
+}
+
 /// A metadata node operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
@@ -649,6 +659,49 @@ impl Module {
                     args.iter().map(|&a| constant(self, a)).collect(),
                 )),
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// The calls [`Module::write`] writes of functions whose name starts
+    /// with `prefix`, in order: the name, the block, the call's place among
+    /// the instructions written, and per argument after the opcode its
+    /// integer constant, if it is one, and the place of the instruction that
+    /// made it, if one did.
+    #[cfg(test)]
+    pub fn written_call_places(&self, prefix: &str) -> Vec<WrittenCall> {
+        let plan = self.plan();
+        let mut place = vec![None; self.insts.len()];
+        let mut calls = Vec::new();
+        let mut next = 0usize;
+        for &b in &plan.layout {
+            let block = &self.blocks[b];
+            for &i in block.phis.iter().chain(&block.body).filter(|&&i| plan.live[i as usize]) {
+                place[i as usize] = Some(next);
+                if let Op::Call(f, _) = &self.insts[i as usize].op
+                    && self.funcs[*f as usize].name.starts_with(prefix)
+                {
+                    calls.push((b, i));
+                }
+                next += 1;
+            }
+        }
+        calls
+            .into_iter()
+            .map(|(block, i)| {
+                let Op::Call(f, args) = &self.insts[i as usize].op else { unreachable!("a call") };
+                WrittenCall {
+                    name: self.funcs[*f as usize].name.clone(),
+                    block,
+                    place: place[i as usize].expect("written"),
+                    args: args[1..]
+                        .iter()
+                        .map(|&a| match a {
+                            V::Inst(d) => (None, place[d as usize]),
+                            _ => (self.int_value(a), None),
+                        })
+                        .collect(),
+                }
             })
             .collect()
     }

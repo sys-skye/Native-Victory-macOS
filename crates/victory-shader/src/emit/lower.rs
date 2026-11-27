@@ -119,6 +119,10 @@ pub(crate) struct Lowered {
     /// Live f32 multiplies, including the inclusive and cross-wave prefix steps.
     #[cfg(test)]
     pub float_multiplies: usize,
+    /// The output stores (`storeOutput`, `storeVertexOutput`, `storePrimitiveOutput`), with
+    /// where each and the values it stores are written.
+    #[cfg(test)]
+    pub output_stores: Vec<super::bitcode::WrittenCall>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1955,6 +1959,13 @@ impl<'a> Lower<'a> {
             wave_active_calls: self.s.m.written_call_args("dx.op.waveActiveOp"),
             #[cfg(test)]
             float_multiplies: self.s.m.written_bin_ops(self.s.t.f32, Bin::Mul),
+            #[cfg(test)]
+            output_stores: [
+                self.s.m.written_call_places("dx.op.storeOutput."),
+                self.s.m.written_call_places("dx.op.storeVertexOutput."),
+                self.s.m.written_call_places("dx.op.storePrimitiveOutput."),
+            ]
+            .concat(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -13237,6 +13248,13 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Every component's value is made before the first store, and the stores then follow
+        // each other with nothing between them. Apple's Metal Shader Converter gathers the
+        // component stores of one output into a vector at the first of them: a value made
+        // between two stores (a float cast, an f16 conversion) was then used before its
+        // definition in the converted library, and Metal's compiler failed on the mesh
+        // programs whose outputs a pixel stage reads.
+        let mut ready: Vec<(usize, u8, &'static str, V)> = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13322,15 +13340,17 @@ impl<'a> Lower<'a> {
                 }
                 _ => x,
             };
+            ready.push((id, col, suffix, x));
+        }
+        let thread = mesh.then(|| self.mesh_thread());
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
             ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
+            args.extend(thread);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,

@@ -423,3 +423,50 @@ fn a_parameter_of_halves_only_reaches_the_pixel_program() {
     super::run(&t.host, &[&list]);
     assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 128, 255]), "{:?}", pixels(&t, &color));
 }
+
+/// The library the converter writes for a mesh program is valid IR: the triangle program also
+/// exports the lane's number, a value of the run, as param0's two dwords, so each store of that
+/// output takes a cast or a 16-bit conversion made for it. The converter gathers the stores of
+/// one output into a vector at the first of them; with a value made between two stores the
+/// library used it before its definition ("Instruction does not dominate all uses" from
+/// `metal-as`, and compiler failures in Metal for larger programs). The library is taken apart
+/// with `metal-objdump` and put together again with `metal-as`, which verifies it. Skipped
+/// without the converter or those tools.
+#[test]
+fn a_converted_mesh_program_with_run_time_parameters_is_valid_ir() {
+    use std::process::Command;
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0xF800_0203, 0x0000_0101, // exp param0 v1, v1
+    ]);
+    let ms = translate(HwStage::Vs, &words);
+    assert_eq!(ms.stage, HwStage::Ms);
+    let Ok(msc) = victory_metal::msc::Msc::try_open_default() else {
+        eprintln!("skipped: Metal Shader Converter not installed");
+        return;
+    };
+    let tool = |name: &str| {
+        let found = Command::new("xcrun").args(["-f", name]).output().ok()?;
+        found.status.success().then(|| String::from_utf8_lossy(&found.stdout).trim().to_owned())
+    };
+    let (Some(objdump), Some(assembler)) = (tool("metal-objdump"), tool("metal-as")) else {
+        eprintln!("skipped: no metal-objdump or metal-as (the Metal toolchain is not installed)");
+        return;
+    };
+    let layout = Binding::of(&ms).layout();
+    let (stage, lib) = msc.convert_with(&ms.dxil, None, layout.as_ref(), false).unwrap();
+    assert_eq!(stage, victory_metal::msc::STAGE_MESH);
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    std::fs::write(path("mesh.metallib"), lib).unwrap();
+    let listing = Command::new(objdump).arg("--disassemble").arg(path("mesh.metallib")).output().unwrap();
+    assert!(listing.status.success(), "{}", String::from_utf8_lossy(&listing.stderr));
+    // The module's text follows the tool's own heading.
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let module = &text[text.find("source_filename").expect("a module in the listing")..];
+    assert!(module.contains("air.set_vertex_data_mesh"), "{module}");
+    std::fs::write(path("mesh.ll"), module).unwrap();
+    let assembled = Command::new(assembler).arg(path("mesh.ll")).arg("-o").arg(path("mesh.air")).output().unwrap();
+    assert!(assembled.status.success(), "{}", String::from_utf8_lossy(&assembled.stderr));
+}

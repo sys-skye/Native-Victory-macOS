@@ -1375,3 +1375,19 @@ Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resou
 (and its destination keeps the copy when its title memory changes),
 `copy_texture_region_moves_plain_texels_into_compressed_blocks`,
 `resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.
+
+## Output stores follow their values (#181)
+
+The export lowering (`Lower::export`) makes every channel's value first and then emits the
+`storeOutput`, `storeVertexOutput` or `storePrimitiveOutput` calls of the export back to back. It
+used to store each channel as soon as its value was made, so a float cast or a 16-bit conversion
+of the next channel sat between two stores of one output. Apple's Metal Shader Converter gathers
+the component stores of one output into a vector at the first of them, and the library it wrote
+then used that later value before its definition: `metal-as` refuses such a module ("Instruction
+does not dominate all uses"), and Metal's compiler failed on mesh programs whose outputs a pixel
+stage reads. Only the order of instructions inside the export's block changes, so the DXIL of
+most programs with exports differs byte for byte from before while what they compute does not.
+Tests: `emit::export_tests` (the order, for pixel, vertex and mesh programs) and
+`native::mesh_tests::a_converted_mesh_program_with_run_time_parameters_is_valid_ir` (a converted
+mesh program listed with `metal-objdump` and assembled again with `metal-as`; skipped without the
+converter or the Metal toolchain).

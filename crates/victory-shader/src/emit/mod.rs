@@ -227,6 +227,8 @@ mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(test)]
+mod export_tests;
+#[cfg(test)]
 mod gfx_refusal_tests;
 #[cfg(test)]
 mod mask_tests;
