@@ -12497,6 +12497,37 @@ impl<'a> Lower<'a> {
         if let Some(so) = so {
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
+        // A raw buffer descriptor built around a table in the code (stride 0, the record count
+        // its size in bytes): each dword is the code's, as for scalar loads through it, and 0
+        // past the record count (the hardware's bounds check of a raw access).
+        if let Source::Built { address, bits, words } = src
+            && address.param == CODE
+        {
+            if typed || store || atomic.is_some() || sub.is_some() || bits >> 16 & 0x3FFF != 0 {
+                return Err("a descriptor built around a table in the code used for an unsupported buffer access");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let (base, extra) = self.built_offset(&src)?;
+            let b = self.s.m.i32(base);
+            let mut at = self.s.m.bin(c, Bin::Add, off, b);
+            if let Some(x) = extra {
+                at = self.s.m.bin(c, Bin::Add, at, x);
+            }
+            let records = self.s.m.i32(words[0]);
+            let zero = self.s.m.i32(0);
+            for k in 0..count {
+                let four_k = self.s.m.i32(4 * k as u32);
+                let byte = self.s.m.bin(c, Bin::Add, at, four_k);
+                let x = self.code_dword(byte)?;
+                let rel = self.s.m.bin(c, Bin::Add, off, four_k);
+                let inside = self.s.m.cmp(c, pred::IULT, rel, records);
+                let x = self.s.m.select(c, inside, x, zero);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         if let Some(slot) = self.vertex_table_slot(src) {
             return self.vertex_fetch(inst, slot, typed, count, *format, *offset, index.is_some() && !*offen, guard);
         }
