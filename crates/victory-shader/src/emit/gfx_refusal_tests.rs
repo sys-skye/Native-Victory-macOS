@@ -3173,6 +3173,48 @@ fn divergent_readlane_in_a_two_wave_group_is_refused() {
     );
 }
 
+/// A group-wide flag read back from shared memory: every thread reads the same dword past a
+/// barrier, so the SCC its first lane gives is the same in both host waves of a console wave, and
+/// the block it guards (with a barrier of its own) is reached by all of them together: a lane
+/// read there goes through the exchange. `write` goes between the read and that block's barrier.
+fn group_flag(write: &[u32]) -> Vec<u32> {
+    let mut words = vec![
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0100_0002, // ds_read_b32 v1, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E08_0501, // v_readfirstlane_b32 s4, v1
+    ];
+    words.extend(write);
+    words.extend([
+        0xBF0D_8004, // s_bitcmp1_b32 s4, 0
+        0xBF84_0007, // s_cbranch_scc0 end
+        0xBF8A_0000, // s_barrier
+        0xD760_0005,
+        0x0001_4700, // v_readlane_b32 s5, v0, 35
+        0x7E06_0205, // v_mov_b32 v3, s5
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0xBF81_0000, // end: s_endpgm
+    ]);
+    words
+}
+
+#[test]
+fn a_branch_on_a_group_wide_flag_in_shared_memory_keeps_the_exchange() {
+    if let Err(e) = emit_wave64_cs(&group_flag(&[]), 128, true) {
+        panic!("{e}");
+    }
+    // A thread may write the dword before another has read it: each host wave's flag is its own.
+    let err = emit_wave64_cs(&group_flag(&[0xD834_0000, 0x0000_0002]), 128, true).err(); // ds_write_b32 v2, v0
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
+        "expected a divergent exchange refusal, got {err:?}",
+    );
+}
+
 /// A guessed wave64 pixel shader whose waterfall loop reads an unshifted descriptor index with
 /// `v_readfirstlane_b32`, shifts it in 64-bit SALU (`s_lshl_b32` + `s_lshr_b32` + `s_addc_u32`)
 /// onto an undeclared SM 6.6 `ResourceHeap` SGPR, and loads from it translates on `wave32_host`
