@@ -393,6 +393,42 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
                 tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, max, mean = sum / count.max(1) as f64, lit = lit as f64 / (rgb.len() * 3).max(1) as f64, "target dumped");
                 continue;
             }
+            // Depth and one-channel targets (local diagnostic): grey, scaled to their finite range.
+            {
+                use victory_backend::resources::Format as F;
+                if let Some(fmt) = t.format_of(*key).filter(|f| matches!(f, F::D32Float | F::D32FloatS8 | F::R32Float | F::D16Unorm | F::R16Unorm | F::R16Float | F::R8Unorm)) {
+                    let Some(tex) = t.texture_of(*key) else { continue };
+                    let (vals, w) = if matches!(fmt, F::D32Float | F::D32FloatS8) {
+                        let Some(v) = t.host.backend.read_depth(&tex) else { continue };
+                        let tw = v.len() / h.max(1);
+                        (v, tw)
+                    } else {
+                        let bpp = match fmt { F::R32Float => 4, F::R8Unorm => 1, _ => 2 };
+                        let mut raw = vec![0u8; w * h * bpp];
+                        victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+                        let v: Vec<f32> = match fmt {
+                            F::R32Float => raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                            F::R8Unorm => raw.iter().map(|&b| f32::from(b) / 255.0).collect(),
+                            F::R16Float => raw.chunks_exact(2).map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+                            _ => raw.chunks_exact(2).map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])) / 65535.0).collect(),
+                        };
+                        (v, w)
+                    };
+                    let finite: Vec<f32> = vals.iter().copied().filter(|v| v.is_finite()).collect();
+                    let (lo, hi) = finite.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                    let span = (hi - lo).max(f32::MIN_POSITIVE);
+                    let distinct = finite.iter().map(|v| v.to_bits()).collect::<std::collections::HashSet<_>>().len();
+                    let hh = vals.len() / w.max(1);
+                    let mut out = format!("P6\n{w} {hh}\n255\n").into_bytes();
+                    out.extend(vals.iter().flat_map(|&v| {
+                        let g = if v.is_finite() { ((v - lo) / span * 255.0) as u8 } else { 0 };
+                        [g, g, g]
+                    }));
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_g.ppm", info.memory as usize)), out);
+                    tracing::info!(n, key = format!("{key:#x}"), w, h = hh, ?fmt, lo, hi, distinct, "target dumped");
+                    continue;
+                }
+            }
             if !matches!(info.format, 28 | 87 | 91 | 29) {
                 continue;
             }
@@ -2098,4 +2134,15 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+/// An IEEE half's value (target dumps).
+fn half_to_f32(h: u16) -> f32 {
+    let (sign, exp, frac) = (u32::from(h >> 15), u32::from(h >> 10 & 0x1F), u32::from(h & 0x3FF));
+    let v = match exp {
+        0 => frac as f32 * 2f32.powi(-24),
+        31 => if frac == 0 { f32::INFINITY } else { f32::NAN },
+        e => f32::from_bits(((e + 112) << 23) | (frac << 13)),
+    };
+    if sign == 1 { -v } else { v }
 }

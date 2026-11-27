@@ -3223,3 +3223,27 @@ mod heap_set_tests {
         assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
     }
 }
+
+impl Metal {
+    /// The depth of a 32-bit depth (or depth-stencil) texture's first mip as floats, read through
+    /// a blit on a queue of its own and waited for (local diagnostic: target dumps).
+    pub fn read_depth(&self, t: &Texture) -> Option<Vec<f32>> {
+        let (w, h) = (t.tex.width(), t.tex.height());
+        let buf = self.dev.newBufferWithLength_options(w * h * 4, MTLResourceOptions::StorageModeShared)?;
+        let q = self.dev.newCommandQueue()?;
+        let cb = q.commandBuffer()?;
+        let e = cb.blitCommandEncoder()?;
+        let opts = if t.tex.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 { MTLBlitOption::DepthFromDepthStencil } else { MTLBlitOption::empty() };
+        // SAFETY: the region is the texture's first mip; the buffer holds it at 4 bytes a texel.
+        unsafe {
+            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                &t.tex, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, size([w, h, 1]), &buf, 0, w * 4, w * h * 4, opts,
+            );
+        }
+        e.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        // SAFETY: the shared buffer holds w * h floats, written by the finished blit.
+        Some(unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<f32>(), w * h) }.to_vec())
+    }
+}
