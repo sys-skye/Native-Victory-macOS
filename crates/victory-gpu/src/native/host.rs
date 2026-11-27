@@ -1043,7 +1043,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     let base = h.start + *at as u64 * Self::step(h.kind);
                     let d = read(base, 32 * 4);
                     tracing::info!(slot = i, heap_start = format!("{:#x}", h.start), index = at, kind = ?h.kind, descriptors = d, "draw root table");
-                    for k in 0..4u64 {
+                    // `VICTORY_TRACE_TABLE_ENTRIES=<n>`: how many entries of each table (4 if unset).
+                    static ENTRIES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                    let n = *ENTRIES.get_or_init(|| {
+                        std::env::var("VICTORY_TRACE_TABLE_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+                    });
+                    for k in 0..n {
                         let handle = base + k * Self::step(h.kind);
                         match crate::descriptor::view(handle) {
                             Some(crate::descriptor::View::Constant(a, n)) => tracing::info!(entry = k, addr = format!("{a:#x}"), size = n, mem = read(a, 64), "table constant buffer"),

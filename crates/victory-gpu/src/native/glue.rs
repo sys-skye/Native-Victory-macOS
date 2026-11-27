@@ -534,10 +534,14 @@ fn records_are_counted_for_the_buffers_that_hold_their_first_record() {
 }
 
 fn trace_record_dispatch(t: &MetalTitle, l: &MetalList, outcome: &str) {
-    if !tracing_record_writers() {
+    if !tracing_record_writers() && trace_into_at().is_none() {
         return;
     }
     let (buffers, reads, writes) = t.host.table_views(l.list.compute_args());
+    trace_into(writes.iter().copied(), || format!("{:?} {outcome} (unordered access)", stage_hashes(l.pipeline)));
+    if !tracing_record_writers() {
+        return;
+    }
     let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
     let d = trace.get_or_insert_default().dispatches.entry(format!("{:?} {outcome}", stage_hashes(l.pipeline))).or_default();
     d.buffers.extend(buffers);
@@ -588,6 +592,9 @@ fn trace_present(resource: This) {
         pipes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         for (what, n) in &pipes {
             tracing::info!(n, what, "draws dropped (no host pipeline, or an indirect execution)");
+        }
+        for (what, n) in std::mem::take(&mut *INTO.lock().unwrap_or_else(|e| e.into_inner())) {
+            tracing::info!(n, what, "writes into the traced texture");
         }
         let described: Vec<String> = with_title(|t| {
             stats
@@ -665,6 +672,12 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     let shaders = stage_hashes(l.pipeline);
     let targets: Vec<String> = l.target_keys.iter().map(|k| format!("{k:#x}")).collect();
     tracing::info!(n, pipeline = format!("{:#x}", l.pipeline), ?shaders, ?targets, "present draw");
+    trace_draw_args(t, l);
+}
+
+/// A draw's static samplers, root parameters and binding, which textures its tables hold and how
+/// much of each is non-zero, and the first bytes of its constant buffers.
+fn trace_draw_args(t: &MetalTitle, l: &MetalList) {
     let (root, binding) = l.list.graphics_args();
     if let Some(b) = binding {
         // Filter, address u v w, mip LOD bias, anisotropy, comparison, border, min and max LOD.
@@ -1035,6 +1048,69 @@ static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// A draw into `l`'s targets that the host drops, counted per target for the trace.
 fn trace_drop(l: &MetalList) {
     l.target_keys.iter().for_each(|&k| trace_bump(k, 2));
+    trace_into(l.target_keys.iter().copied(), || format!("{:?} dropped", stage_hashes(l.pipeline)));
+}
+
+/// A draw went on to the host list: counted for each of its targets.
+fn trace_drawn(t: &MetalTitle, l: &MetalList) {
+    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+    let what = std::cell::Cell::new(None);
+    trace_into(l.target_keys.iter().copied(), || {
+        let w = format!("{:?} drawn", stage_hashes(l.pipeline));
+        what.set(Some(w.clone()));
+        w
+    });
+    let Some(what) = what.take() else { return };
+    // The first 3 draws of each kind from `<from seconds>` on: what they read.
+    static SHOWN: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    if present_start().elapsed().as_secs() < trace_into_at().map_or(0, |(_, from)| from) {
+        return;
+    }
+    {
+        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let i = shown.iter().position(|(w, _)| *w == what).unwrap_or_else(|| {
+            shown.push((what.clone(), 0));
+            shown.len() - 1
+        });
+        if shown[i].1 >= 3 {
+            return;
+        }
+        shown[i].1 += 1;
+    }
+    tracing::info!(what, "traced texture draw");
+    trace_draw_args(t, l);
+}
+
+/// `VICTORY_TRACE_INTO=<title address, hex>[,<from seconds>]`: the title texture memory whose
+/// writers to log, and from when to trace what its draws read.
+fn trace_into_at() -> Option<(u64, u64)> {
+    static AT: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *AT.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_INTO").ok()?;
+        let mut parts = v.split(',');
+        let at = u64::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+        let from = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        present_start();
+        Some((at, from))
+    })
+}
+
+/// Writes since the last present into the `VICTORY_TRACE_INTO` texture, by what wrote them.
+static INTO: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+/// With `VICTORY_TRACE_INTO`, counts `what` (made only then) when one of `keys` is the texture at
+/// that address.
+fn trace_into(mut keys: impl Iterator<Item = usize>, what: impl FnOnce() -> String) {
+    let Some((at, _)) = trace_into_at() else { return };
+    if !keys.any(|k| crate::resource::texture_info(k as This).is_some_and(|i| i.memory as u64 == at)) {
+        return;
+    }
+    let what = what();
+    let mut into = INTO.lock().unwrap_or_else(|e| e.into_inner());
+    match into.iter_mut().find(|(w, _)| *w == what) {
+        Some((_, n)) => *n += 1,
+        None => into.push((what, 1)),
+    }
 }
 
 /// A dropped draw or execution, by what it was (its shaders and targets), for the frame trace.
@@ -1570,7 +1646,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
                     trace_present_draw(t, l);
-                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                    trace_drawn(t, l);
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
             }
@@ -1592,7 +1668,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
                     trace_present_draw(t, l);
-                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                    trace_drawn(t, l);
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
             }
@@ -1635,7 +1711,7 @@ pub(crate) fn execute_indirect(
                     match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
                         Ok(()) => {
                             ENCODED.fetch_add(1, Ordering::Relaxed);
-                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                            trace_drawn(t, l);
                         }
                         Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
                     }
@@ -1683,7 +1759,7 @@ pub(crate) fn execute_indirect(
                         match r {
                             Ok(()) => {
                                 ENCODED.fetch_add(1, Ordering::Relaxed);
-                                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                                trace_drawn(t, l);
                             }
                             Err(e) => tracing::warn!(error = %e, "indirect draw"),
                         }
@@ -1850,6 +1926,7 @@ fn copied(t: &mut MetalTitle, what: &str, src: This, dst: Option<This>) {
     if let Some(d) = dst {
         t.gpu_written(d as usize);
         trace_bump(d as usize, 0);
+        trace_into(std::iter::once(d as usize), || format!("a copy ({what})"));
     }
     if tracing_targets() {
         static KINDS: Mutex<Vec<(String, Option<victory_backend::resources::Format>, Option<victory_backend::resources::Format>)>> = Mutex::new(Vec::new());
