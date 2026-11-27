@@ -13875,6 +13875,12 @@ impl<'a> Lower<'a> {
                     break;
                 }
                 let guard = st.guards[b][i];
+                // No lane on this path runs it (its EXEC is empty given the
+                // values here, as after a mask cleared on the path): it
+                // neither reads nor overwrites.
+                if guard.is_some_and(|g| !self.can_be(g, &env, &mut HashMap::new()).1) {
+                    continue;
+                }
                 if guard.is_some_and(|g| self.touches(g, &env, &tainted)) {
                     return false;
                 }
@@ -13882,16 +13888,25 @@ impl<'a> Lower<'a> {
                 if inst.reads.iter().any(|r| regs.contains(&r.0))
                     && !inst.name().starts_with("s_cbranch")
                 {
-                    // Scalar arithmetic only passes the value on.
-                    let pure = matches!(inst.fields, Fields::Sop { .. })
-                        && inst.write(Reg::S(EXEC)).is_none()
-                        && !inst.name().starts_with("s_setreg");
+                    // Scalar arithmetic only passes the value on, as does a
+                    // compare writing a lane mask (not EXEC: `v_cmpx`).
+                    let pure = (matches!(inst.fields, Fields::Sop { .. })
+                        && !inst.name().starts_with("s_setreg")
+                        || matches!(inst.fields, Fields::Valu(_))
+                            && inst.name().starts_with("v_cmp_"))
+                        && inst.write(Reg::S(EXEC)).is_none();
                     if !pure {
                         return false;
                     }
                     for &(r, w) in &inst.writes {
-                        regs.insert(r);
-                        tainted.insert(w);
+                        // A result constant on the path whatever the stale
+                        // value (an AND with a cleared mask) overwrites.
+                        if r != Reg::Scc && self.konst(&env, w).is_some() {
+                            regs.remove(&r);
+                        } else {
+                            regs.insert(r);
+                            tainted.insert(w);
+                        }
                     }
                 } else if guard.is_none() {
                     for w in &inst.writes {
@@ -13978,11 +13993,12 @@ impl<'a> Lower<'a> {
             return r;
         }
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
-        let v = match atom {
-            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+        let known = match atom {
+            Atom::Lane(v) | Atom::Uniform(v) => self.compared(env, v),
+            Atom::Phi(id) => self.phi_mask_constant(env, id),
             _ => None,
         };
-        let r = match v.and_then(|v| self.compared(env, v)) {
+        let r = match known {
             Some(true) => self.can_be(hi, env, memo),
             Some(false) => self.can_be(lo, env, memo),
             None => {
@@ -14103,9 +14119,78 @@ impl<'a> Lower<'a> {
             Fields::Sop { imm, .. } if inst.name() == "s_movk_i32" => {
                 return Some(i32::from((*imm)? as i16) as u32);
             }
+            // An integer inline constant moved to a register pair: each dword of its
+            // sign extension (`s_mov_b64 s[n:n+1], 0`, a mask cleared on one path).
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code, .. }),
+                src,
+                ..
+            } if inst.name() == "s_mov_b64" => {
+                let &[Operand::Const(c @ 128..=208)] = src.as_slice() else {
+                    return None;
+                };
+                let lo = crate::resource::inline(c)?;
+                return if inst.write(Reg::S(*code)) == Some(v) {
+                    Some(lo)
+                } else if inst.write(Reg::S(*code + 1)) == Some(v) {
+                    Some(if (lo as i32) < 0 { u32::MAX } else { 0 })
+                } else {
+                    None
+                };
+            }
+            // An AND with a dword constant 0 on the path is 0 (a mask
+            // narrowed by one cleared on the path), whatever the other side.
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code, .. }),
+                src,
+                ..
+            } if matches!(inst.name(), "s_and_b32" | "s_and_b64") && src.len() == 2 => {
+                let half = if inst.write(Reg::S(*code)) == Some(v) {
+                    0
+                } else if inst.name() == "s_and_b64" && inst.write(Reg::S(*code + 1)) == Some(v) {
+                    1
+                } else {
+                    return None;
+                };
+                let dword = |op: &Operand| match *op {
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        self.konst(env, inst.read(Reg::S(code + half))?)
+                    }
+                    _ => None,
+                };
+                return match (dword(&src[0]), dword(&src[1])) {
+                    (Some(0), _) | (_, Some(0)) => Some(0),
+                    (Some(a), Some(b)) => Some(a & b),
+                    _ => None,
+                };
+            }
             _ => return None,
         };
         self.konst_operand(env, inst, op)
+    }
+
+    /// The bit every lane holds of the lane mask joined at mask phi `id`
+    /// (its low dword's phi) when `env` makes the mask a constant: none or
+    /// all of the lanes set (a join where the edge taken brings a cleared or
+    /// full mask).
+    fn phi_mask_constant(&self, env: &HashMap<Value, u32>, id: Value) -> Option<bool> {
+        let &(b, i) = self.phi_at.get(&id)?;
+        let block = &self.x.p.blocks[b];
+        let Reg::S(code) = block.phis[i].reg else {
+            return None;
+        };
+        let lo = *env.get(&id)?;
+        let hi = if self.x.native.wave64 {
+            let high = block.phis.iter().find(|ph| ph.reg == Reg::S(code + 1))?;
+            *env.get(&high.value)?
+        } else {
+            lo
+        };
+        match (lo, hi) {
+            (0, 0) => Some(false),
+            (u32::MAX, u32::MAX) => Some(true),
+            _ => None,
+        }
     }
 
     fn konst_operand(&self, env: &HashMap<Value, u32>, inst: &Inst, op: &Operand) -> Option<u32> {

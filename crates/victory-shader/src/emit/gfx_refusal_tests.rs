@@ -2780,6 +2780,45 @@ fn a_pixel_program_joins_data_an_else_part_clears_with_its_exec() {
     assert!(err.contains("data, on the host's lanes"), "{err}");
 }
 
+/// A register pair holds a compare's lane mask, and a uniform branch's taken side loads data
+/// into it and sets a flag mask. The other side clears the flag (`s_mov_b64 0`). After the join,
+/// a compare of the data narrowed by the flag decides EXEC for the read of the data, so no lane
+/// coming from the side that kept the mask runs it. With the flag set there (`-1`) those lanes
+/// read the mask as data, and that stays refused.
+#[test]
+fn a_pixel_program_joins_a_mask_with_data_a_cleared_flag_keeps_unread() {
+    let program = |flag: u32| {
+        [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0xD404_001C, 0x0202_0300, // v_cmp_gt_f32 s[28:29], v0, v1
+            0xD501_0002, 0x0072_0300, // v_cndmask_b32 v2, v0, v1, s[28:29]
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF84_0005, // s_cbranch_scc0 skip
+            0xBE9C_0304, // s_mov_b32 s28, s4
+            0x901D_8804, // s_lshr_b32 s29, s4, 8
+            0xBF06_871C, // s_cmp_eq_u32 s28, 7
+            0x8586_80C1, // s_cselect_b64 s[6:7], -1, 0
+            0xBF82_0001, // s_branch join
+            // skip:
+            0xBE86_0400 | flag, // s_mov_b64 s[6:7], 0 (or -1)
+            // join:
+            0xD4C2_006A, 0x0202_001D, // v_cmp_eq_u32 vcc, s29, v0
+            0x8786_066A, // s_and_b64 s[6:7], vcc, s[6:7]
+            0x87FE_7E06, // s_and_b64 exec, s[6:7], exec
+            0xBF88_0001, // s_cbranch_execz end
+            0x7E04_221C, // v_cvt_f32_ubyte0 v2, s28
+            // end:
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+        ]
+    };
+    let ps = |code: &[u32]| lower_ps(code, true, vec![], vec![], 0, 0, vec![], false);
+    ps(&program(0x80)).unwrap_or_else(|e| panic!("0: {e}"));
+    let err = ps(&program(0xC1)).err().expect("-1 lets the lanes read the mask").to_string();
+    assert!(err.contains("lane mask"), "{err}");
+}
+
 /// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
 fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};
