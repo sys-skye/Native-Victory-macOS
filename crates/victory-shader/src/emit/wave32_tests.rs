@@ -298,6 +298,38 @@ fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
     assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
 }
 
+#[test]
+fn a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site() {
+    // Two console waves (no lockstep): a branch on SCC skips a block holding the title's
+    // `s_barrier` and a lane read across the halves (an exchange).
+    let program = |scc: u32| {
+        vec![
+            0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+            0x7E10_0280, // v_mov_b32_e32 v8, 0
+            0x7E12_0280, // v_mov_b32_e32 v9, 0
+            scc,         // s2: a first lane read, or a constant
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF84_0006, // s_cbranch_scc0 6
+            0xBF8A_0000, // s_barrier
+            0xD760_0004,
+            0x0001_5101, // v_readlane_b32 s4, v1, 40
+            0x7E0A_0204, // v_mov_b32_e32 v5, s4
+            0xDC70_8000,
+            0x007D_0508, // global_store_dword v[8:9], v5, off (a dead read is not made)
+            S_ENDPGM,
+        ]
+    };
+    // A constant SCC: every half takes the branch alike, the block is an exchange site.
+    let l = host32(&program(0xBE82_0380), 128); // s_mov_b32 s2, 0
+    assert!(l.exchanges);
+    // `v_readfirstlane_b32 s2, v0`: 0 in the lower half, 32 in the upper, which would skip the
+    // block while the lower half waits at the exchange's barrier.
+    let r = lowered(&program(0x7E04_0500), 128, false, true);
+    assert!(
+        matches!(r, Err(crate::ShaderError::Unsupported { what, .. }) if what == lower::DIVERGENT_EXCHANGE)
+    );
+}
+
 /// A sum over the 64 lanes the way a compiler expands `WaveActiveSum`: all
 /// lanes on, butterflies inside each row of 16, then the rows' sums by lane.
 const REDUCE: &[u32] = &[

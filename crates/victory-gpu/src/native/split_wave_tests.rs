@@ -269,6 +269,84 @@ fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
     assert_eq!(got[64..], [(64..96).sum::<u32>() - 1; 32]);
 }
 
+/// The shape of the G-buffer culling shaders' group flag (#182), as a synthetic program written
+/// for this test, in groups of two console waves (128 lanes, `s5` the info SGPR, LDS on): LDS
+/// word 0 cleared and a barrier, then (with `end_wave_1`) the second console wave ends, as a
+/// culled one does. Each wave ORs its lanes' flags in a whole-wave section (row rotations, then
+/// `v_permlanex16_b32`, then lanes 31 and 32 into every lane), lane 0 alone ORs lane 63's total
+/// into LDS word 0, and after the barrier every lane stores that word. Thread 5 (the lower host
+/// half) flags 2 and thread 40 (the upper) 4, so the total needs both halves; thread 70 flags 8.
+fn group_flag(end_wave_1: bool) -> Vec<u32> {
+    let mut w = vec![
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000, 0x0000_0909, // ds_write_b32 v9, v9
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+    ];
+    if end_wave_1 {
+        w.extend([
+            0x9010_8605, // s_lshr_b32 s16, s5, 6
+            0x8710_BF10, // s_and_b32 s16, s16, 63 (the wave's number in the group)
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0xBF85_0031, // s_cbranch_scc1 (the s_endpgm)
+        ]);
+    }
+    w.extend([
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7D84_0085, // v_cmp_eq_u32 vcc, 5, v0
+        0xD501_0004, 0x01A9_0504, // v_cndmask_b32_e64 v4, v4, 2, vcc
+        0x7D84_00A8, // v_cmp_eq_u32 vcc, 40, v0
+        0xD501_0004, 0x01A9_0904, // v_cndmask_b32_e64 v4, v4, 4, vcc
+        0x7D84_00FF, 70, // v_cmp_eq_u32 vcc, 70, v0
+        0xD501_0004, 0x01A9_1104, // v_cndmask_b32_e64 v4, v4, 8, vcc
+        // The whole-wave OR.
+        0xBE98_25C1, // s_or_saveexec_b64 s[24:25], -1
+        0xD501_000C, 0x0062_0880, // v_cndmask_b32_e64 v12, 0, v4, s[24:25]
+        0x3818_18FA, 0xFF01_210C, // v_or_b32_dpp v12, v12, v12 row_ror:1
+        0x3818_18FA, 0xFF01_220C, // v_or_b32_dpp v12, v12, v12 row_ror:2
+        0x3818_18FA, 0xFF01_240C, // v_or_b32_dpp v12, v12, v12 row_ror:4
+        0x3818_18FA, 0xFF01_280C, // v_or_b32_dpp v12, v12, v12 row_ror:8
+        0xD778_000D, 0x0305_830C, // v_permlanex16_b32 v13, v12, -1, -1
+        0x3818_190D, // v_or_b32_e32 v12, v13, v12
+        0xD760_0009, 0x0201_3F0C, // v_readlane_b32 s9, v12, 31
+        0x3818_1809, // v_or_b32_e32 v12, s9, v12
+        0xD760_000B, 0x0201_410C, // v_readlane_b32 s11, v12, 32
+        0x3818_180B, // v_or_b32_e32 v12, s11, v12
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        // Lane 0 alone puts lane 63's total in LDS word 0.
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0xD760_000A, 0x0201_7F0C, // v_readlane_b32 s10, v12, 63
+        0x7E1C_0280, // v_mov_b32 v14, 0
+        0x7E1E_020A, // v_mov_b32 v15, s10
+        0xD828_0000, 0x0000_0F0E, // ds_or_b32 v14, v15
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        // Every lane stores LDS word 0.
+        0x7E20_0280, // v_mov_b32 v16, 0
+        0xD8D8_0000, 0x1000_0010, // ds_read_b32 v16, v16
+        S_WAITCNT_LGKM,
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000, 0x0002_1001, // global_store_dword v1, v16, s[2:3]
+        S_ENDPGM,
+    ]);
+    run_io(&w, 1 << 10 | 1 << 15, 128, 0)
+}
+
+#[test]
+fn a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier() {
+    // Without the barrier in the block, the exchanges were refused there: the block is reached
+    // by uniform branches, and a culled wave may already have ended.
+    let got = group_flag(true);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [6; 64]);
+    assert_eq!(got[64..], [CANARY; 64]);
+    // Both console waves there: each ORs its own flags in.
+    assert_eq!(group_flag(false), [14; 128]);
+}
+
 /// A whole-wave product (`WaveActiveProduct`): lanes 0..34 hold 2.0, the rest 1.0, so both
 /// halves contribute and every lane must see 2^35.
 #[test]

@@ -1235,12 +1235,27 @@ were refused, so their dispatches were dropped and every count stayed 0.
   the value at the gather went through the write's block. All three translate. In game they run, and
   the first non-zero group counts appear (`[1, 1, 1]`, `[5, 1, 1]`, `[24, 1, 1]`). Test:
   `sample_tests::gathers_at_a_level_whole_in_the_lanes_that_gather_translate`.
-- The second of each pair is still refused: "a cross-lane operation between host waves in divergent
+- The second of each pair was refused as "a cross-lane operation between host waves in divergent
   code". Each is a group of 128 threads (two console waves, so not the lockstep fallback) that ORs a
   flag over its wave (a whole-wave section: `s_or_saveexec_b64 -1`, DPP, `v_permlanex16_b32`,
   `v_readlane_b32` of lane 0). It then reads lane 63 with EXEC set to lane 0 alone, ORs the result
-  into LDS word 0, and reads it back after a group barrier. Until these run, the G-buffer stays almost
-  black (0-0.8% in the same run).
+  into LDS word 0, and reads it back after the title's own `s_barrier`. Those reads cross the host
+  waves, so they need group barriers, which went only in blocks every thread runs once. This block
+  is reached by uniform branches, and a culled wave ends early (`s_cbranch_scc1` to `s_endpgm`). But
+  the title's barrier in the same block already needs every live wave there together (the console's
+  waits for each wave that has not ended, and the host's group barrier for it relies on the same).
+  So a block outside any loop that holds one of the title's `s_barrier`s is now an exchange site too
+  (`barrier_blocks`). All three translate. Over the same 3,338 dumped containers, four more compute
+  shaders translate and no other outcome changes. Test, on the GPU:
+  `split_wave_tests::a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier` (a
+  synthetic program of the culler's shape, the second console wave ending early, flags in both
+  host halves). Not a block
+  reached past a branch on an SCC computed from a `v_readfirstlane` (`split_scc`), which
+  `wave_blocks` already excludes: the console wave takes such a branch whole, so a title may put one
+  before its barrier, but each host wave reads its own first lane, so one half could skip the block
+  while the other waits at the exchange's group barrier, a hang (test
+  `wave32_tests::a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site`). Once the first
+  lane read is the console wave's (#254), the exclusion is only conservative for compute.
 
 `VICTORY_TRACE_TARGETS=1` cannot show this: an indirect draw counts as drawn when it is encoded,
 whatever the GPU later reads as its count.

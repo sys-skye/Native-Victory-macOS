@@ -28,6 +28,11 @@
 //! ([`once_blocks`](super::once_blocks)), or, in a group that is one console
 //! wave, in one reached by uniform (SCC) branches alone and outside any loop
 //! ([`wave_blocks`](super::wave_blocks)): both halves then arrive together.
+//! A block outside any loop that holds one of the title's own `s_barrier`s
+//! counts too ([`barrier_blocks`](super::barrier_blocks)): the console's
+//! barrier waits for every wave that has not ended, so the title brings every
+//! live wave there together, and the host's group barrier for it already
+//! relies on that (not past a branch on an SCC from a `v_readfirstlane`).
 //! An SCC computed from a `v_readfirstlane` is not uniform here: each half
 //! reads its own first lane. Elsewhere (in a branch of EXEC, a
 //! per-lane loop) the translation is refused. Cost: two barriers and a
