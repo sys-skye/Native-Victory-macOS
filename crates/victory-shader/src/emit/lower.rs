@@ -1673,9 +1673,6 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
                 }
-                if self.halves {
-                    return Err("a 16-bit wave reduction across the host's waves");
-                }
                 let c = self.cur;
                 let &m = self
                     .x
@@ -1704,10 +1701,25 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                // A console wave of two host waves: their sums added through the exchange.
+                let r = if self.halves {
+                    self.halves_reduce(Op::AddF, r, None)?
+                } else {
+                    r
+                };
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
+                let high = self.s.m.i32(0xFFFF_0000);
+                if self.halves {
+                    // Lane `hi` (identity where off) read across the console wave.
+                    let lane = self.s.m.i32(hi);
+                    let top = self.wide_read_lane(x, lane)?;
+                    let c = self.cur;
+                    let top = self.s.m.bin(c, Bin::And, top, high);
+                    return Ok(self.s.m.bin(c, Bin::Or, top, r));
+                }
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
                 let i32t = self.s.t.i32;
@@ -1723,7 +1735,6 @@ impl<'a> Lower<'a> {
                 let lane = self.s.m.i32(hi);
                 let at = self.read_lane(x, lane);
                 let top = self.s.m.select(c, there, at, id);
-                let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
                 return Ok(self.s.m.bin(c, Bin::Or, top, r));
             }
@@ -14815,10 +14826,85 @@ pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
         .collect()
 }
 
+/// Values every thread of the group reads alike: a `ds_read_b32` of one constant address (a
+/// `v_mov_b32` of a constant, in its block) past an `s_barrier` of its block, with an `s_barrier`
+/// before any shared-memory write on every path on from it, so no thread can change the dword
+/// while another has yet to read it (the G-buffer culling shaders' group-wide flag: an `ds_or`
+/// of each wave's vote, a barrier, then every thread's read of it).
+fn group_uniform(p: &Program) -> Set<Value> {
+    let writes_lds = |i: &Inst| {
+        matches!(&i.fields, Fields::Ds { .. })
+            && !i.name().starts_with("ds_read")
+            && !matches!(i.name(), "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32")
+    };
+    // No shared-memory write before a barrier on any path from instruction `i` of block `b` on.
+    let fenced = |b: usize, i: usize| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![(b, i)];
+        while let Some((b, from)) = stack.pop() {
+            let mut ended = false;
+            for inst in &p.blocks[b].insts[from..] {
+                if inst.name() == "s_barrier" {
+                    ended = true;
+                    break;
+                }
+                if writes_lds(inst) {
+                    return false;
+                }
+            }
+            if !ended {
+                for n in p.blocks[b].exit.successors() {
+                    if !std::mem::replace(&mut seen[n], true) {
+                        stack.push((n, 0));
+                    }
+                }
+            }
+        }
+        true
+    };
+    let mut out = Set::default();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            if inst.name() != "ds_read_b32" {
+                continue;
+            }
+            let Some(at) = inst.read(Reg::V(*reg)) else {
+                continue;
+            };
+            let constant = block.insts[..i].iter().any(|d| {
+                d.name() == "v_mov_b32"
+                    && d.writes.iter().any(|w| w.1 == at)
+                    && matches!(&d.fields, Fields::Valu(v)
+                        if matches!(v.src.first(), Some(Operand::Const(_) | Operand::Literal(_))))
+            });
+            let barrier = block.insts[..i].iter().any(|d| d.name() == "s_barrier");
+            if constant && barrier && fenced(b, i + 1) {
+                out.extend(inst.writes.iter().map(|w| w.1));
+            }
+        }
+    }
+    out
+}
+
 /// SCC values that can differ between the host waves of one console wave:
 /// those computed from a `v_readfirstlane_b32` result, which each host wave
-/// reads of its own first lane.
+/// reads of its own first lane (not of a value the whole group reads alike).
 fn split_scc(p: &Program) -> Set<Value> {
+    let alike = group_uniform(p);
+    let first_lane = |i: &Inst| {
+        i.name() == "v_readfirstlane_b32"
+            && !matches!(&i.fields, Fields::Valu(v)
+                if matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                    if i.read(Reg::V(reg)).is_some_and(|x| alike.contains(&x))))
+    };
     let mut from = Set::default();
     loop {
         let n = from.len();
@@ -14829,7 +14915,7 @@ fn split_scc(p: &Program) -> Set<Value> {
                 }
             }
             for i in &b.insts {
-                if i.name() == "v_readfirstlane_b32" || i.reads.iter().any(|r| from.contains(&r.1)) {
+                if first_lane(i) || i.reads.iter().any(|r| from.contains(&r.1)) {
                     from.extend(i.writes.iter().map(|w| w.1));
                 }
             }

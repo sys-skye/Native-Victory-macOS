@@ -385,6 +385,45 @@ fn a_whole_wave_product_combines_the_two_halves() {
     assert_eq!(l.barriers, 2);
 }
 
+/// [`REDUCE`] in 16-bit floats, as the title's compute programs sum a wave64 of halves: the rows'
+/// sums added in lane 0's, then lane 63 read after the section, whose low half holds the sum. The
+/// two host waves of the console wave add their sums through the exchange, and lane 63's high
+/// half comes from the console lane.
+#[test]
+fn a_whole_wave_16_bit_sum_combines_the_two_halves() {
+    let words = [
+        0xBE82_25C1, // s_or_saveexec_b64 s[2:3], -1
+        0xD501_0001,
+        0x000A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[2:3]
+        0x6402_02FA,
+        0xFF00_B101, // v_add_f16_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x6402_02FA,
+        0xFF00_4E01, // v_add_f16_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x6402_02FA,
+        0xFF01_4101, // v_add_f16_dpp v1, v1, v1 row_half_mirror
+        0x6402_02FA,
+        0xFF01_4001, // v_add_f16_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x6402_0501, // v_add_f16_e32 v1, v1, v2
+        0xD760_0004,
+        0x0001_0101, // v_readlane_b32 s4, v1, 0
+        0x6402_0204, // v_add_f16_e32 v1, s4, v1
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0xD760_0005,
+        0x0001_7F01, // v_readlane_b32 s5, v1, 63
+        0x7E0A_0205, // v_mov_b32_e32 v5, s5
+        S_ENDPGM,
+    ];
+    let l = host32(&words, 64);
+    assert_eq!(l.wave_size, Some(32));
+    // The sum's exchange and lane 63's read: write, barrier, read, barrier each.
+    assert_eq!(l.barriers, 4);
+    // Without the halves (one host wave per console wave) neither exchange is needed.
+    let one = lowered(&words, 64, true, false).unwrap();
+    assert_eq!(one.barriers, 0);
+}
+
 #[test]
 fn whole_wave_float_prefix_products() {
     for inclusive in [false, true] {
