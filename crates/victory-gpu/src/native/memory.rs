@@ -128,6 +128,29 @@ impl PoolTable {
         ))
     }
 
+    /// What the title maps at `[addr, addr + len)`, as a number that changes when any mapping in
+    /// it does: a hash of the mappings it crosses (title address, length, pool, offset), which
+    /// must follow one another in title addresses. `None` where part of it is not mapped.
+    pub fn signature(&self, addr: u64, len: u64) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let (addr, len) = (usize::try_from(addr).ok()?, usize::try_from(len.max(1)).ok()?);
+        let end = addr.checked_add(len)?;
+        let g = self.lock();
+        let (&at, m) = g.maps.range(..=addr).next_back()?;
+        if addr >= at + m.len {
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (at, m.len, m.pool, m.offset).hash(&mut h);
+        let mut title_end = at + m.len;
+        while end > title_end {
+            let next = g.maps.get(&title_end).filter(|n| n.len > 0)?;
+            (title_end, next.len, next.pool, next.offset).hash(&mut h);
+            title_end += next.len;
+        }
+        Some(h.finish())
+    }
+
     /// A number that changes whenever a pool or a mapping does: what a table built from
     /// [`PoolTable::mappings`] is current for.
     pub fn generation(&self) -> u64 {
