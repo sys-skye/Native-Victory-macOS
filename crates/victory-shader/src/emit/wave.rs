@@ -176,7 +176,10 @@ pub(super) fn register_only(inst: &Inst) -> bool {
     match &inst.fields {
         Fields::Valu(v) => v.dst.is_some(),
         Fields::Sop { .. } => {
-            matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
+            matches!(
+                inst.name(),
+                "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64" | "s_bfm_b32" | "s_bfm_b64"
+            )
                 || Op::salu_of(inst.name()).is_some()
         }
         _ => false,
@@ -418,15 +421,12 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
             // the simulation can follow.
-            let lo = name
-                .starts_with("s_mov_b")
-                .then(|| constant(inst))
-                .flatten();
+            let lo = constant(inst);
             let Some(k) = lo else {
                 let (shapes, lane_shapes) = shapes(vec, uni, wave);
                 return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
-            exec = (if name == "s_mov_b64" {
+            exec = (if matches!(name, "s_mov_b64" | "s_bfm_b64") {
                 k
             } else {
                 (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
@@ -434,11 +434,7 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
-            let Some(k) = name
-                .starts_with("s_mov_b")
-                .then(|| constant(inst))
-                .flatten()
-            else {
+            let Some(k) = constant(inst) else {
                 let (shapes, lane_shapes) = shapes(vec, uni, wave);
                 return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
@@ -779,6 +775,22 @@ fn constant(inst: &Inst) -> Option<u64> {
     let Fields::Sop { src, .. } = &inst.fields else {
         return None;
     };
+    if let ("s_bfm_b32" | "s_bfm_b64", [w, at]) = (inst.name(), src.as_slice()) {
+        // A field of constant width and place (`s_bfm_b32 exec_lo, 16, 16`: the upper half's
+        // lanes of a wave32 prefix sum).
+        let bits = if inst.name() == "s_bfm_b32" { 31 } else { 63 };
+        let field = |o: &Operand| match *o {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c - 128) & bits),
+            Operand::Literal(x) => Some(x & bits),
+            _ => None,
+        };
+        let (w, at) = (field(w)?, field(at)?);
+        let m = ((1u64 << w) - 1) << at;
+        return Some(if bits == 31 { m & 0xFFFF_FFFF } else { m });
+    }
+    if !inst.name().starts_with("s_mov_b") {
+        return None;
+    }
     let wide = inst.name() == "s_mov_b64";
     match *src.first()? {
         Operand::Scalar { code: NULL, .. } => Some(0),
@@ -1072,6 +1084,12 @@ mod tests {
             Some(0x1234_5678)
         );
         assert_eq!(check(&[sop1(EXEC, b32, 0)], false), None);
+
+        // s_bfm: a field of constant width and place.
+        assert_eq!(check(&[0x927E_9090], false), Some(0xFFFF_0000)); // s_bfm_b32 exec_lo, 16, 16
+        assert_eq!(check(&[0x92FE_8488], true), Some(0xFF0)); // s_bfm_b64 exec, 8, 4
+        assert_eq!(check(&[0x927E_9F9F], false), Some(0x8000_0000)); // s_bfm_b32 exec_lo, 31, 31
+        assert_eq!(check(&[0x927E_0090], false), None); // s_bfm_b32 exec_lo, 16, s0
     }
 
     #[test]
