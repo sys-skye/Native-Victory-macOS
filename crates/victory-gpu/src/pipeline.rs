@@ -264,7 +264,15 @@ impl Shader {
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
     pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
+        let made = crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new);
+        if made.is_err()
+            && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
+        {
+            let copy: String = copy.iter().map(|b| format!("{b:02x}")).collect();
+            let name = format!("extra_{}_{}_{extra:08x}_{copy}.bin", self.hash, u8::from(rect));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(name), &*container);
+        }
+        made
     }
 
     /// The translation for rectangle-list draws, made on first use.
