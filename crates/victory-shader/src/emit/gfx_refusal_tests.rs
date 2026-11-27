@@ -2819,6 +2819,44 @@ fn a_pixel_program_joins_a_mask_with_data_a_cleared_flag_keeps_unread() {
     assert!(err.contains("lane mask"), "{err}");
 }
 
+/// A register holding a first interpolation half gets an f16 in its low half (`mixlo`, the
+/// high half kept) and then in its high half (`mixhi`, the low half kept): the register is whole
+/// again and exports. A `mixhi` over the first half alone keeps its unknown low half: refused.
+#[test]
+fn a_mixhi_over_a_mixlo_over_a_first_interpolation_half_is_whole() {
+    let ps_in = vec![PsInput {
+        usage: Usage::Generic,
+        row: 0,
+        mask: 3,
+        attr: 0,
+        flat: false,
+        fp16: false,
+        pack2: false,
+        row2: 0,
+    }];
+    let sig_in = vec![sig_el("TEXCOORD", 0, 0, 9, 0, Some(0), 4)];
+    let program = |mixlo: [u32; 2]| {
+        [
+            0xBEFC_0300, // s_mov_b32 m0, s0
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+            0xD742_0002, 0x0202_0040, // v_interp_p1ll_f16 v2, v0, attr0.y
+            0xD75A_0003, 0x040A_0240, // v_interp_p2_f16 v3, v1, attr0.y, v2
+            mixlo[0],
+            mixlo[1],    // v_fma_mixlo_f16 v2, v4, 1.0, 0 (or two s_nop)
+            0xCC22_0002, 0x0201_E904, // v_fma_mixhi_f16 v2, v4, 2.0, 0
+            0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+        ]
+    };
+    let ps = |code: &[u32]| {
+        lower_ps(code, true, vec![], ps_in.clone(), 1 << 1, 0, sig_in.clone(), false)
+    };
+    ps(&program([0xCC21_0002, 0x0201_E504])).unwrap_or_else(|e| panic!("mixlo: {e}"));
+    let err = ps(&program([0xBF80_0000; 2])).err().expect("no mixlo").to_string();
+    assert!(err.contains("the first half of an interpolation"), "{err}");
+}
+
 /// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
 fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};

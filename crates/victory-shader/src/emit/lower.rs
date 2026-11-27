@@ -9064,6 +9064,15 @@ impl<'a> Lower<'a> {
                             unknown = Some(w);
                             self.s.m.i32(0)
                         }
+                        // The low half a mixlo made over such a value is
+                        // known, and it is all a mixhi keeps: the register
+                        // is whole again.
+                        Err(w) if name == "v_fma_mixhi_f16" && guard.is_none() => {
+                            match self.low16.get(&o).copied() {
+                                Some(x) => x,
+                                None => return Err(w),
+                            }
+                        }
                         Err(w) => return Err(w),
                     },
                     None => self.s.m.i32(0),
