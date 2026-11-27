@@ -8041,8 +8041,8 @@ impl<'a> Lower<'a> {
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
             let r = match v.dpp {
                 None => self.compare(inst, rest),
-                // 16-bit compares read their halves elsewhere (`half_src`).
-                Some(_) if rest.ends_with("16") => Err("a 16-bit compare with DPP"),
+                // 64-bit compares read a VGPR pair (`src64`), which DPP does not permute.
+                Some(_) if rest.ends_with("64") => Err("a 64-bit compare with DPP"),
                 Some(d) => match self.dpp(inst, d, self.x.st.guards[b][i]) {
                     // Lanes DPP leaves out keep their old bit: not modelled.
                     Ok((_, Some(_))) => Err("a compare with DPP row masks or bounds"),

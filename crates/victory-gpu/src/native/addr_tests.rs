@@ -382,6 +382,120 @@ fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
 }
 
 #[test]
+fn compares_with_16bit_dpp_vcmpx_and_class_run_on_the_gpu() {
+    // Input words at `VA_A + 0x1000` (`s[2:3]`): each lane loads its own pre-built dword into `v2`
+    // (with junk in the upper 16 bits to verify `half_src` masks low 16 bits), and writes its
+    // result to `VA_A` (`s[0:1]`). Expected outputs are fixed constants, independent of lowering.
+    //
+    // 1. `v_cmp_gt_f16 vcc, v2, v2 quad_perm:[2,3,0,1]`:
+    //    Quad inputs `[1.0h, 2.0h, 4.0h, 0.5h]` -> permuted `[4.0h, 0.5h, 1.0h, 2.0h]`:
+    //    `4.0 > 1.0` (1), `0.5 > 2.0` (0), `1.0 > 4.0` (0), `2.0 > 0.5` (1) -> `[1, 0, 0, 1]`.
+    const DPP_CMP_F16: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xDC30_8000,
+        0x0202_0001, // global_load_dword v2, v1, s[2:3]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D98_04FA,
+        0xFF0C_4E02, // v_cmp_gt_f16 vcc, v2, v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+        0xD501_0002,
+        0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    // 2. `v_cmp_lt_i16 vcc, v2, v2 row_shr:1 bound_ctrl:1`:
+    //    Alternating `[-5i16 (0xFFFB), +7i16 (0x0007)]`:
+    //    Row-start lanes `0, 16, 32, 48` compare `0 < -5` (0); other even lanes compare `7 < -5`
+    //    (0); odd lanes compare `-5 < 7` (1) -> `[0, 1]` repeated across all 64 lanes.
+    const DPP_CMP_I16: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xDC30_8000,
+        0x0202_0001, // global_load_dword v2, v1, s[2:3]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D12_04FA,
+        0xFF08_1102, // v_cmp_lt_i16 vcc, v2, v2 row_shr:1 bound_ctrl:1
+        0xD501_0002,
+        0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    // 3. `v_cmp_class_f16 vcc, v2, v3 quad_perm:[3,2,1,0]`:
+    //    Quad inputs `[1.0h (0x3C00), +inf (0x7C00), -inf (0xFC00), -0.0h (0x8000)]`, class mask
+    //    `0x204` (`+inf` bit 9 | `-inf` bit 2). Reversed quad `[-0.0h, -inf, +inf, 1.0h]` matches
+    //    `+-inf` in lanes 1 and 2 of each quad -> `[0, 1, 1, 0]`.
+    const DPP_CLASS_F16: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xDC30_8000,
+        0x0202_0001, // global_load_dword v2, v1, s[2:3]
+        0x7E06_02FF,
+        0x0000_0204, // v_mov_b32 v3, 0x204
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D1E_06FA,
+        0xFF0C_1B02, // v_cmp_class_f16 vcc, v2, v3 quad_perm:[3,2,1,0] bound_ctrl:1 fi:1
+        0xD501_0002,
+        0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    // 4. `v_cmpx_eq_u16 v2, v2 quad_perm:[1,0,3,2]`:
+    //    Quad inputs `[11u16, 11u16, 22u16, 33u16]` -> swapped `[11, 11, 33, 22]`: only lanes 0
+    //    and 1 of each quad stay active in `EXEC` and store `77`; lanes 2 and 3 keep `CANARY`.
+    const DPP_CMPX_U16: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xDC30_8000,
+        0x0202_0001, // global_load_dword v2, v1, s[2:3]
+        0x7E06_02FF,
+        0x0000_004D, // v_mov_b32 v3, 77
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE84_047E, // s_mov_b64 s[4:5], exec
+        0x7D74_04FA,
+        0xFF0C_B102, // v_cmpx_eq_u16 v2, v2 quad_perm:[1,0,3,2] bound_ctrl:1 fi:1
+        0xDC70_8000,
+        0x0000_0301, // global_store_dword v1, v3, s[0:1]
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let [out_lo, out_hi] = halves(VA_A);
+    let [in_lo, in_hi] = halves(VA_A + 0x1000);
+    let args = [out_lo, out_hi, in_lo, in_hi];
+
+    f.put(0x2_0000, &[CANARY; 64]);
+    let in_f16: Vec<u32> = [0xCAFE_3C00u32, 0xBEEF_4000, 0x1234_4400, 0x9999_3800].repeat(16);
+    f.put(0x2_1000, &in_f16);
+    let cs_f16 = shader(DPP_CMP_F16, 4);
+    dispatch(&mut t, &cs_f16, &args, false);
+    assert_eq!(f.get(0x2_0000, 64), [1u32, 0, 0, 1].repeat(16));
+
+    f.put(0x2_0000, &[CANARY; 64]);
+    let in_i16: Vec<u32> = [0xDEAD_FFFBu32, 0x0001_0007].repeat(32);
+    f.put(0x2_1000, &in_i16);
+    let cs_i16 = shader(DPP_CMP_I16, 4);
+    dispatch(&mut t, &cs_i16, &args, false);
+    assert_eq!(f.get(0x2_0000, 64), [0u32, 1].repeat(32));
+
+    f.put(0x2_0000, &[CANARY; 64]);
+    let in_class: Vec<u32> = [0x7FFF_3C00u32, 0x0000_7C00, 0x1111_FC00, 0xFFFF_8000].repeat(16);
+    f.put(0x2_1000, &in_class);
+    let cs_class = shader(DPP_CLASS_F16, 4);
+    dispatch(&mut t, &cs_class, &args, false);
+    assert_eq!(f.get(0x2_0000, 64), [0u32, 1, 1, 0].repeat(16));
+
+    f.put(0x2_0000, &[CANARY; 64]);
+    let in_cmpx: Vec<u32> = [0xAAAA_000Bu32, 0xBBBB_000B, 0xCCCC_0016, 0xDDDD_0021].repeat(16);
+    f.put(0x2_1000, &in_cmpx);
+    let cs_cmpx = shader(DPP_CMPX_U16, 4);
+    dispatch(&mut t, &cs_cmpx, &args, false);
+    assert_eq!(f.get(0x2_0000, 64), [77u32, 77, CANARY, CANARY].repeat(16));
+
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+#[test]
 fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     let vertex = [
         0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0

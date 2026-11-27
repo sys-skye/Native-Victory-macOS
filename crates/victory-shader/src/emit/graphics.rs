@@ -1554,6 +1554,59 @@ mod tests {
         super::super::translate_with(&c, options).unwrap();
     }
 
+    #[test]
+    fn pixel_compares_with_16bit_dpp_and_64bit_or_partial_mask_refusals() {
+        let options = super::super::Options { wave32_host: true, ..Default::default() };
+        let run = |cmp: [u32; 2], restore_exec: bool| {
+            let mut code = vec![
+                0x7E04_02FF,
+                0x0000_3C00, // v_mov_b32 v2, 0x3c00 (1.0f16)
+                0x7E06_02FF,
+                0x0000_0204, // v_mov_b32 v3, 0x204 (+inf | -inf class mask)
+            ];
+            if restore_exec {
+                code.extend([
+                    0x7E06_0280, // v_mov_b32 v3, 0
+                    0xBE84_037E, // s_mov_b32 s4, exec_lo
+                    cmp[0],
+                    cmp[1],
+                    0x7E06_02F2, // v_mov_b32 v3, 1.0
+                    0xBEFE_0304, // s_mov_b32 exec_lo, s4
+                    0xF800_180F,
+                    0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+                    ENDPGM,
+                ]);
+            } else {
+                code.extend([
+                    cmp[0],
+                    cmp[1],
+                    0xD501_0003,
+                    0x01A9_E480, // v_cndmask_b32 v3, 0, 1.0, vcc
+                    0xF800_180F,
+                    0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+                    ENDPGM,
+                ]);
+            }
+            let c = container(HwStage::Ps, &words(&code), &meta_with(&[])).unwrap();
+            super::super::translate_with(&c, options)
+        };
+        // Full-mask 16-bit DPP compares (`v_cmp_gt_f16`, `v_cmp_lt_i16`, `v_cmp_class_f16`,
+        // `v_cmpx_eq_u16`) lower through `Lower::half_src`.
+        run([0x7D98_04FA, 0xFF4C_4E02], false).expect("v_cmp_gt_f16 dpp");
+        run([0x7D12_04FA, 0xFF08_1102], false).expect("v_cmp_lt_i16 row_shr:1 bound_ctrl:1");
+        run([0x7D1E_06FA, 0xFF0C_1B02], false).expect("v_cmp_class_f16 dpp");
+        run([0x7D74_04FA, 0xFF0C_B102], true).expect("v_cmpx_eq_u16 dpp");
+
+        // 64-bit compare with DPP and partial `row_mask`/`bank_mask` compares stay refused.
+        let err64 = run([0x7DC4_04FA, 0xFF0C_B102], false).unwrap_err();
+        assert!(err64.to_string().contains("a 64-bit compare with DPP"), "{err64}");
+        let err_mask = run([0x7D98_04FA, 0x530C_4E02], false).unwrap_err();
+        assert!(
+            err_mask.to_string().contains("a compare with DPP row masks or bounds"),
+            "{err_mask}"
+        );
+    }
+
     /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
     /// an EXEC region (lane < count), a VALU compare of an SGPR, ANDed with EXEC, its SCC kept in
     /// an SGPR and branched on later. The compare holds the same bit in every lane, so SCC (some
