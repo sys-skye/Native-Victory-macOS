@@ -2638,6 +2638,41 @@ fn a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction() {
     }
 }
 
+/// A scalar step amid a whole-wave section that reads neither EXEC nor VCC (`wave::passthrough`)
+/// computes what it does outside one: a shift of the lane read of an earlier reduction, as the
+/// title's pixel programs place it between the DPP steps of the next, lowers as itself. A shift
+/// of EXEC itself stays refused, naming the instruction.
+#[test]
+fn a_scalar_step_amid_a_whole_wave_section_lowers_as_itself() {
+    let program = |shift: u32| {
+        let mut code = vec![
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+            0xD501_0001, 0x000A_00C1, // v_cndmask_b32 v1, -1, v0, s2
+        ];
+        for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+            code.extend([0x2602_02FA, 0xFF00_0001 | ctrl << 8]); // v_min_u32_dpp v1, v1, v1
+        }
+        code.extend([
+            0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+            0x2602_0501, // v_min_u32 v1, v1, v2
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xBE83_3DC1, // s_or_saveexec_b32 s3, -1
+            0xD760_0004, 0x0001_3F01, // v_readlane_b32 s4, v1, 31
+            shift,       // s_lshr_b32 s5, s4 (or exec_lo), 5
+            0xBEFE_0303, // s_mov_b32 exec_lo, s3
+            0x7E02_0205, // v_mov_b32 v1, s5
+            0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        code
+    };
+    let ps = |code: &[u32]| lower_ps(code, false, vec![], vec![], 0, 0, vec![], false);
+    let l = ps(&program(0x9005_8504)).unwrap_or_else(|e| panic!("s4: {e}"));
+    assert!(!l.wave_active_calls.is_empty());
+    let err = ps(&program(0x9005_857E)).err().expect("a shift of EXEC").to_string();
+    assert!(err.contains("s_lshr_b32"), "{err}");
+}
+
 /// A wave64 pixel program's loop carries a mask that is SCC's all-or-nothing on entry and
 /// `s_mov_b64 -1` on the way round. The structure cannot join it (it is not a function of fixed
 /// lane bits), and the host's lanes are not the console's, but data of every lane or none is that

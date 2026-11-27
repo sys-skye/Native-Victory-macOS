@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::ir::{EXEC, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, VCC, Value};
 
 /// An associative operation and its identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +163,39 @@ pub(super) fn register_only(inst: &Inst) -> bool {
         }
         _ => false,
     }
+}
+
+/// A scalar ALU step of a whole-wave section that neither reads nor writes EXEC or VCC, so it
+/// computes the same as outside the section: lowered as itself there (`Lower::section_inst`),
+/// from what the section's earlier steps leave, its result a value of its own to the
+/// simulation. The console compiler interleaves such steps with a reduction, as the next
+/// reduction's operand: `v_readlane_b32 s64, v110, 31` of one, then `s_lshr_b32 s68, s64, 5`
+/// amid the DPP steps of the next (the title's pixel programs).
+pub(super) fn passthrough(inst: &Inst) -> bool {
+    let lane_mask = |r: &Reg| matches!(*r, Reg::S(n) if n == EXEC || n == EXEC + 1 || n == VCC || n == VCC + 1);
+    matches!(inst.fields, Fields::Sop { .. })
+        && matches!(
+            inst.name(),
+            "s_lshr_b32"
+                | "s_lshl_b32"
+                | "s_ashr_i32"
+                | "s_bfm_b32"
+                | "s_bfe_u32"
+                | "s_bfe_i32"
+                | "s_add_u32"
+                | "s_add_i32"
+                | "s_sub_u32"
+                | "s_sub_i32"
+                | "s_mul_i32"
+                | "s_or_b32"
+                | "s_xor_b32"
+                | "s_min_u32"
+                | "s_max_u32"
+                | "s_min_i32"
+                | "s_max_i32"
+        )
+        && !inst.reads.iter().any(|(r, _)| lane_mask(r))
+        && !inst.writes.iter().any(|(r, _)| lane_mask(r))
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -409,6 +442,13 @@ fn simulate(
                 return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
+            continue;
+        }
+        if passthrough(inst) {
+            // Lowered as itself: its results are values of their own, uniform as all SGPRs.
+            for &(_, w) in &inst.writes {
+                uni.insert(w, Sym::Uni(w));
+            }
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {

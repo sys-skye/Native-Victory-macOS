@@ -1520,6 +1520,11 @@ impl<'a> Lower<'a> {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
+                    // A passthrough step's results are lowered as themselves, not made from
+                    // the simulation.
+                    if super::wave::passthrough(&p.blocks[b].insts[i]) {
+                        continue;
+                    }
                     for &(_, w) in &p.blocks[b].insts[i].writes {
                         inside.insert(w, (b, start, sec.end));
                     }
@@ -1538,9 +1543,11 @@ impl<'a> Lower<'a> {
                     .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
             }
             for (i, inst) in block.insts.iter().enumerate() {
+                // What a passthrough step reads leaves the section: it is lowered from it.
+                let passthrough = super::wave::passthrough(inst);
                 for &(_, r) in &inst.reads {
                     if let Some(&(sb, start, end)) = inside.get(&r)
-                        && !(sb == b && i > start && i < end)
+                        && (passthrough || !(sb == b && i > start && i < end))
                     {
                         self.section_out.insert(r);
                     }
@@ -1553,6 +1560,9 @@ impl<'a> Lower<'a> {
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
         let inst = &self.x.p.blocks[b].insts[i];
+        if super::wave::passthrough(inst) {
+            return self.inst(b, i);
+        }
         if !super::wave::register_only(inst) {
             return Err(unsupported(inst.machine.offset, inst.name()));
         }
