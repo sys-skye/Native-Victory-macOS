@@ -446,6 +446,11 @@ pub struct Options {
     /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
     /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
     pub copy_params: [u8; 32],
+    /// A pixel shader whose colour output n (bit n) goes to an unsigned-integer target: declared
+    /// a 32-bit unsigned integer, as Metal pairs such an attachment only with an integer output.
+    /// The bits the program exports are stored as they are (a guessed pipeline's outputs are
+    /// otherwise floats, whatever the target).
+    pub uint_targets: u8,
     /// A compute program for dispatches that give thread counts, not group counts (the console's
     /// `DispatchX` with thread dimensions): the last group in a dimension is partial. The host
     /// runs whole groups, rounded up, and passes the counts ([`DISPATCH_THREADS`]); every thread
@@ -549,6 +554,11 @@ fn emit_fast(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if pixel && options.uint_targets != 0 {
+        for e in outputs.iter_mut().filter(|e| e.kind == 16 && e.index < 8 && options.uint_targets >> e.index & 1 != 0) {
+            e.comp = 5;
+        }
+    }
     if !pixel && options.extra_params != 0 {
         let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
         for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {

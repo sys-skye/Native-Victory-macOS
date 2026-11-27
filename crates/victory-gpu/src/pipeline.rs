@@ -209,8 +209,9 @@ impl Shader {
                 {
                     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
                 }
-                // A vertex shader keeps its container: a rectangle-list draw translates it again.
-                if self.stage != "vertex" {
+                // A vertex shader keeps its container: a rectangle-list draw translates it again;
+                // so does a pixel shader, for a draw into unsigned-integer targets.
+                if !matches!(self.stage, "vertex" | "pixel") {
                     *container = Vec::new();
                 }
                 made
@@ -253,6 +254,19 @@ impl Shader {
                 crate::native::shaders::translate_threads(&container).map(Arc::new)
             })
             .clone()
+    }
+
+    /// A pixel shader's translation for draws into the unsigned-integer targets `uint` (bit n:
+    /// colour target n).
+    pub(crate) fn translate_uint(&self, uint: u8) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        crate::native::shaders::translate_uint(&container, uint).map(Arc::new)
+    }
+
+    /// Whether [`Self::translate_uint`] would find its translation on disk.
+    pub(crate) fn uint_cached(&self, uint: u8) -> bool {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        crate::native::shaders::uint_cached(&container, uint)
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.

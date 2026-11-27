@@ -60,6 +60,18 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
 }
 
 /// Whether [`translate_extra`]'s translation is in the disk cache already.
+/// A guessed pixel shader's container translated for draws into unsigned-integer targets (bit n:
+/// colour target n), which Metal pairs only with integer outputs (`Options::uint_targets`).
+pub fn translate_uint(container: &[u8], uint_targets: u8) -> Result<HostShader, String> {
+    translate_cached(container, Options { uint_targets, ..options() })
+}
+
+/// Whether [`translate_uint`] would find its translation on disk.
+pub fn uint_cached(container: &[u8], uint_targets: u8) -> bool {
+    let o = Options { uint_targets, ..options() };
+    crate::shader_cache::native_present(container, &format!("{o:?}"))
+}
+
 pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
     let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
     crate::shader_cache::native_present(container, &format!("{o:?}"))

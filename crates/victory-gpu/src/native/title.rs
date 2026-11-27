@@ -178,6 +178,9 @@ pub struct Guessed<B: GraphicsBackend> {
     /// The vertex shader's container, translated again for rectangle lists at the first such draw.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) vs_source: Arc<crate::pipeline::Shader>,
+    /// The pixel shader's container, translated again for draws into unsigned-integer targets.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) ps_source: Option<Arc<crate::pipeline::Shader>>,
     /// By the formats and strides they were made for.
     pub made: std::cell::RefCell<HashMap<String, Pipe<B>>>,
 }

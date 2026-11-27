@@ -13252,6 +13252,9 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            if half.is_some() && elements(self, primitive)[id].comp != 9 {
+                return Err("a 16-bit export to an integer output");
+            }
             let el = &mut elements(self, primitive)[id];
             let el_kind = el.kind;
             el.usage |= 1 << col;

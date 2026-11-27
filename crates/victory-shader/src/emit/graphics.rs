@@ -1333,6 +1333,34 @@ mod tests {
         assert_eq!(h.stage, HwStage::Ms);
     }
 
+    /// A guessed pixel program drawn into an unsigned-integer target (`Options::uint_targets`)
+    /// declares that colour output a 32-bit unsigned integer, the type Metal pairs with such an
+    /// attachment, and stores the bits it exports. A compressed (16-bit) export to it stays
+    /// refused: its halves are widened as floats.
+    #[test]
+    fn a_pixel_programs_output_to_an_unsigned_integer_target_is_an_unsigned_integer() {
+        let program = |export: [u32; 2]| {
+            let mut code = words(&[0x7E00_02FF, 0x0000_002A]); // v_mov_b32 v0, 42
+            code.extend(words(&export));
+            code.extend(words(&[ENDPGM]));
+            container(HwStage::Ps, &code, &meta_with(&[])).unwrap()
+        };
+        let plain = program([0xF800_180F, 0x0000_0000]); // exp mrt0 v0, v0, v0, v0 done vm
+        let options = |uint_targets| super::super::Options { wave32_host: true, zero_copy_memory: true, uint_targets, ..Default::default() };
+        let comp = |o| {
+            let h = super::super::translate_with(&plain, o).unwrap();
+            let c = super::super::Container::parse(&h.dxil).unwrap();
+            let outs = super::super::signature(c.part(super::super::FourCC::OSG1).unwrap().data).unwrap();
+            outs.iter().find(|e| e.kind == 16 && e.index == 0).expect("SV_Target0").comp
+        };
+        assert_eq!(comp(options(0)), 9, "a float by default");
+        assert_eq!(comp(options(1)), 5, "an unsigned integer for an unsigned-integer target");
+        let packed = program([0xF800_1C03, 0x0000_0100]); // exp mrt0 v0, v0 done compr vm
+        let Err(err) = super::super::translate_with(&packed, options(1)) else { panic!("16-bit halves translated") };
+        let err = err.to_string();
+        assert!(err.contains("a 16-bit export to an integer output"), "{err}");
+    }
+
     /// Only parameters that may hold two f16 halves get `HALF` outputs, those that can hold
     /// nothing else first and their `TEXCOORD` last: param0 is a 32-bit float product (plain),
     /// param1 a literal of two f16s (either), param2 a `v_cvt_pkrtz_f16_f32` or 0 (halves).

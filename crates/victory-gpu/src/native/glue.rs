@@ -1138,6 +1138,7 @@ fn make_host_pipe(
         Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
             Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
                 vs_source: stages.iter().find(|s| s.0 == "vertex").expect("a vertex stage").1.clone(),
+                ps_source: stages.iter().find(|s| s.0 == "pixel").map(|s| s.1.clone()),
                 vs: vs.clone(),
                 ps: hosts.iter().find(|h| h.0 == "pixel").map(|h| h.1.clone()),
                 name,
@@ -1311,7 +1312,9 @@ pub(crate) fn vertex_buffers(this: This, start: u32, count: u32, views: &[Vertex
 
 /// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
 fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> Pipe<Metal> {
-    let key = format!("{:?}{rect}", l.strides);
+    // Unsigned-integer colour targets, which take the pixel shader translated with integer outputs.
+    let uint = l.targets.color.iter().take(8).enumerate().filter(|(_, f)| f.is_integer()).fold(0u8, |m, (n, _)| m | 1 << n);
+    let key = format!("{:?}{rect}{uint}", l.strides);
     if let Some(p) = g.made.borrow().get(&key) {
         return p.clone();
     }
@@ -1365,11 +1368,29 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
         None
     };
     let vs = widened.as_deref().unwrap_or(base_vs);
+    let int_ps = match (&g.ps_source, uint) {
+        (Some(s), 1..) if g.ps.is_some() => {
+            if spent && !s.uint_cached(uint) {
+                let s = s.clone();
+                put_off(format!("{} uint {uint}", s.hash), move || drop(s.translate_uint(uint)));
+                return Pipe::Refused;
+            }
+            match s.translate_uint(uint) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    t.refused_translation(&g.name, format!("unsigned-integer targets: {e}"));
+                    return Pipe::Refused;
+                }
+            }
+        }
+        _ => None,
+    };
+    let ps = int_ps.as_deref().or(g.ps.as_deref());
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
     t.compile_wait = compile_wait(t);
     let put_off = t.shaders.put_off;
-    let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
+    let made = t.render_pipe(vs, ps, &state, &g.name);
     // Put off, it is asked for again at every draw until Metal has made it: logged once made.
     if t.shaders.put_off == put_off {
         tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
