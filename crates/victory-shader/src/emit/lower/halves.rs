@@ -179,8 +179,16 @@ impl Lower<'_> {
             l.mask_ok = was;
             x
         };
-        let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+        let lo = word(self, EXEC)?;
         let i32t = self.s.t.i32;
+        // A wave32 program's EXEC is its low register: its lowest set bit, 0 when none is.
+        if !self.x.native.wave64 {
+            let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+            let z = self.s.m.i32(0);
+            let any = self.s.m.cmp(c, pred::NE, lo, z);
+            return Ok(self.s.m.select(c, any, flo, z));
+        }
+        let hi = word(self, EXEC + 1)?;
         let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
         let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
         let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));

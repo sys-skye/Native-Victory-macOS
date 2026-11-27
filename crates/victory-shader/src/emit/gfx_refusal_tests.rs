@@ -2922,16 +2922,27 @@ fn whole_wave_sections_refuse_unmodeled_effects_at_the_instruction() {
 /// A wave64 compute program of `threads` lanes with five root-constant SGPRs (`s[2:3]` an
 /// address), through `emit_with` as `translate_with` runs it on a 32-lane host.
 fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
+    emit_cs(words, threads, lds, true, false)
+}
+
+/// A compute program of `threads` lanes on a 32-lane host; `lockstep` skips the fast path.
+fn emit_cs(
+    words: &[u32],
+    threads: u32,
+    lds: bool,
+    wave64: bool,
+    lockstep: bool,
+) -> Result<super::HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![root_const(0, 5)],
         used: vec![],
         io: StageIo::Cs(ComputeIo { rsrc2: u32::from(lds) << 15 | 5 << 1, threads: [threads, 1, 1] }),
         code: bytes_of(words),
     };
-    let p = ir::build(&native.code, true, native.vgprs)?;
+    let p = ir::build(&native.code, wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
@@ -2941,7 +2952,12 @@ fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostS
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     let c = Container::parse(&empty)?;
-    super::emit_with(&c, &native, &p, &st, &io, &res, Options { wave32_host: true, ..Options::default() })
+    let options = Options { wave32_host: true, ..Options::default() };
+    if lockstep {
+        assert!(super::lockstep::fits(&native, &st, &options), "fits lockstep");
+        return super::lockstep::retry(&c, &native, &p, &io, &res, options);
+    }
+    super::emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// Lanes below 40 read lane 35 and `exec_hi` as data behind an EXEC branch (`lockstep.rs`): the
@@ -2969,6 +2985,79 @@ pub(crate) const LOCKSTEP_READLANE: &[u32] = &[
 fn a_lane_read_behind_an_exec_branch_translates_in_lockstep() {
     if let Err(e) = emit_wave64_cs(LOCKSTEP_READLANE, 64, false) {
         panic!("{e}");
+    }
+}
+
+/// [`LOCKSTEP_READLANE`] in a wave32 group of one console wave: lanes below 10 read lane 5,
+/// `exec_lo` and their first lane behind an `exec_lo` branch, which in lockstep compares the one
+/// mask dword (the first lane comes from `exec_lo` alone); all lanes then store the EXEC they
+/// entered with, read as data from the saveexec's copy.
+pub(crate) const LOCKSTEP_WAVE32: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7D88_008A, // v_cmp_gt_u32 vcc_lo, 10, v0
+    0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+    0xBF88_000C, // s_cbranch_execz 12
+    0xD760_0006,
+    0x0201_0B03, // v_readlane_b32 s6, v3, 5
+    0x7E04_0206, // v_mov_b32 v2, s6
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0x7E04_027E, // v_mov_b32 v2, exec_lo
+    0xDC70_8100,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:256
+    0x7E10_0503, // v_readfirstlane_b32 s8, v3
+    0x7E04_0208, // v_mov_b32 v2, s8
+    0xDC70_8300,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:768
+    0x887E_047E, // s_or_b32 exec_lo, exec_lo, s4
+    0x7E04_0204, // v_mov_b32 v2, s4
+    0xDC70_8200,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:512
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_wave32_single_wave_group_translates_in_lockstep() {
+    for lockstep in [false, true] {
+        if let Err(e) = emit_cs(LOCKSTEP_WAVE32, 32, false, false, lockstep) {
+            panic!("lockstep {lockstep}: {e}");
+        }
+    }
+}
+
+/// `s4` joins a loaded dword (a stale descriptor dword in the lighting programs) with a lane mask,
+/// and `s7` says which edge came: only lanes from the mask's edge use `s4` as EXEC, so on the
+/// other edge it is dead and the join need not make it.
+pub(crate) const STALE_MASK_JOIN: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xF400_0101,
+    0xFA00_0000, // s_load_dword s4, s[2:3], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE87_0381, // s_mov_b32 s7, 1
+    0xBF06_8004, // s_cmp_eq_u32 s4, 0
+    0xBF85_0003, // s_cbranch_scc1 join
+    0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+    0xBE84_036A, // s_mov_b32 s4, vcc_lo
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xBF07_8007, // join: s_cmp_lg_u32 s7, 0
+    0xBF85_0003, // s_cbranch_scc1 end
+    0xBE88_3C04, // s_and_saveexec_b32 s8, s4
+    0x7E04_0281, // v_mov_b32 v2, 1
+    0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+    0xDC70_8000,
+    0x0002_0201, // end: global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_mask_joined_with_a_stale_dword_its_edge_never_reads_translates() {
+    for lockstep in [false, true] {
+        if let Err(e) = emit_cs(STALE_MASK_JOIN, 32, false, false, lockstep) {
+            panic!("lockstep {lockstep}: {e}");
+        }
     }
 }
 

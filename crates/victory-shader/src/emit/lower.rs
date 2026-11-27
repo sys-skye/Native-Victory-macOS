@@ -14651,6 +14651,14 @@ impl<'a> Lower<'a> {
                     (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
                         self.s.m.bool(false)
                     }
+                    // A register stale on this edge (data the compiler left there, a descriptor
+                    // dword say) that no lane coming along it reads before overwriting it.
+                    (None, _)
+                        if self.dead_on_edge(b, n, phi.reg)
+                            && high.is_none_or(|h| self.dead_on_edge(b, n, h.reg)) =>
+                    {
+                        self.s.m.bool(false)
+                    }
                     // A lane function the structure knows though no mask tracks it (a constant,
                     // SCC, a join that resolved): each lane's bit of it, unless another edge's
                     // mask may differ from it in the lanes of this one (`mask_differs_on_edge`).

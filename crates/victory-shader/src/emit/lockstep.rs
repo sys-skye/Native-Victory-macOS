@@ -9,15 +9,15 @@
 //!
 //! Here every branch the console takes on a lane mask (`s_cbranch_execz`, `execnz`, `vccz`,
 //! `vccnz`, SCC of a mask operation) becomes a test of the whole mask as a number, which
-//! [`branches`] makes explicit (`s_cmp_{eq,lg}_u64 mask, 0` before an SCC branch). The mask's
-//! number is the console's ballot (`wide_ballot`), the same in every thread, so every branch is
-//! uniform across the group: all threads reach every block, and every group barrier, the same
-//! number of times, loops included. EXEC is then only a predicate: what reaching a block no longer
-//! proves stays each vector instruction's guard (a per-thread `if` around it, with the old value
-//! kept where it is skipped), and every scalar value stays the same in all threads because each
-//! lane-to-scalar operation goes through the exchange: ballots, `v_readlane_b32`, and
-//! `v_readfirstlane_b32` (the first lane of the wide EXEC). LDS gets a group barrier after each
-//! write, outside its guard.
+//! [`branches`] makes explicit (`s_cmp_{eq,lg}_u64 mask, 0` before an SCC branch, `_u32` on a
+//! wave32 program's one mask dword). The mask's number is the console's ballot (`wide_ballot`),
+//! the same in every thread, so every branch is uniform across the group: all threads reach every
+//! block, and every group barrier, the same number of times, loops included. EXEC is then only a
+//! predicate: what reaching a block no longer proves stays each vector instruction's guard (a
+//! per-thread `if` around it, with the old value kept where it is skipped), and every scalar value
+//! stays the same in all threads because each lane-to-scalar operation goes through the exchange:
+//! ballots, `v_readlane_b32`, and `v_readfirstlane_b32` (the first lane of the wide EXEC, or of
+//! `exec_lo` in wave32). LDS gets a group barrier after each write, outside its guard.
 //!
 //! Only programs whose group is one console wave (64 lanes or fewer) run this way: in a group of
 //! several waves, one wave's branches are not the others'.
@@ -35,15 +35,14 @@ use crate::resource::Resources;
 /// A branch the lockstep structuriser could not make uniform.
 pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave run in lockstep";
 
-/// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host whose group is
-/// one console wave.
+/// Whether a refused program may run in lockstep: compute (wave64 or wave32) on a 32-lane host
+/// whose group is one console wave.
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
     let StageIo::Cs(cs) = &native.io else { return false };
     options.wave32_host
         && native.stage == HwStage::Cs
-        && native.wave64
         && !st.lockstep
-        && cs.threads.iter().product::<u32>() <= 64
+        && cs.threads.iter().product::<u32>() <= if native.wave64 { 64 } else { 32 }
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
@@ -157,8 +156,8 @@ pub(crate) fn split_branch(
     })
 }
 
-/// `p` with each branch on EXEC or VCC (`s_cbranch_execz` and the like) made a 64-bit compare of
-/// the mask with 0 and a branch on its SCC.
+/// `p` with each branch on EXEC or VCC (`s_cbranch_execz` and the like) made a compare of the mask
+/// (64-bit, or 32-bit in a wave32 program) with 0 and a branch on its SCC.
 pub(crate) fn branches(p: &Program) -> Program {
     let mut q = p.clone();
     let mut next = max_value(p).map_or(0, |v| v.0 + 1);
@@ -174,13 +173,16 @@ pub(crate) fn branches(p: &Program) -> Program {
             "s_cbranch_vccnz" => (VCC, false),
             _ => continue,
         };
-        let (Some(lo), Some(hi)) = (last.read(Reg::S(reg)), last.read(Reg::S(reg + 1))) else {
-            continue;
+        // A wave64 program's mask is a register pair, a wave32 program's the low register alone.
+        let (op, mask) = match (last.read(Reg::S(reg)), last.read(Reg::S(reg + 1))) {
+            (Some(lo), Some(hi)) => (0x12, vec![(Reg::S(reg), lo), (Reg::S(reg + 1), hi)]),
+            (Some(lo), None) => (0x06, vec![(Reg::S(reg), lo)]),
+            _ => continue,
         };
         let scc = Value(next);
         next += 1;
-        // s_cmp_eq_u64 / s_cmp_lg_u64 reg, 0; s_cbranch_scc1, the branch's distance kept.
-        let cmp = 0xBF00_8000 | u32::from(0x12 + u8::from(!eq)) << 16 | u32::from(reg);
+        // s_cmp_eq / s_cmp_lg (u64, or u32) reg, 0; s_cbranch_scc1, the branch's distance kept.
+        let cmp = 0xBF00_8000 | u32::from(op + u8::from(!eq)) << 16 | u32::from(reg);
         let branch = 0xBF85_0000 | last.machine.words[0] & 0xFFFF;
         let offset = last.machine.offset;
         let made = |word: u32, reads: Vec<(Reg, Value)>, writes: Vec<(Reg, Value)>| {
@@ -193,7 +195,7 @@ pub(crate) fn branches(p: &Program) -> Program {
             Some(Inst { machine, fields, reads, writes })
         };
         // The distance decodes from offset 0: made at a distance of 0, then given the branch's.
-        let Some(cmp) = made(cmp, vec![(Reg::S(reg), lo), (Reg::S(reg + 1), hi)], vec![(Reg::Scc, scc)])
+        let Some(cmp) = made(cmp, mask, vec![(Reg::Scc, scc)])
         else {
             continue;
         };
