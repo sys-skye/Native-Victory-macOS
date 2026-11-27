@@ -621,19 +621,37 @@ fn trace_present(resource: This) {
 /// `VICTORY_TRACE_PRESENT=<every>`: the title resources `PresentX` has shown.
 static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-fn present_every() -> Option<u32> {
-    static EVERY: OnceLock<Option<u32>> = OnceLock::new();
-    *EVERY.get_or_init(|| std::env::var("VICTORY_TRACE_PRESENT").ok().and_then(|v| v.parse().ok()))
+/// When the title first presented (or a present trace first asked).
+fn present_start() -> std::time::Instant {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
 }
 
-/// `VICTORY_TRACE_PRESENT=<every>`: a draw into a texture the title has presented (its present
-/// pass), the first and then every `<every>`th, at most 12: its pipeline's shaders, root
+/// `VICTORY_TRACE_PRESENT=<every>[,<from seconds>]`.
+fn present_every() -> Option<(u32, u64)> {
+    static EVERY: OnceLock<Option<(u32, u64)>> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_PRESENT").ok()?;
+        let mut parts = v.split(',');
+        let every = parts.next()?.trim().parse().ok()?;
+        let from = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        Some((every, from))
+    })
+}
+
+/// `VICTORY_TRACE_PRESENT=<every>[,<from seconds>]`: a draw into a texture the title has
+/// presented (its present pass), from `<from seconds>` after the first present on (0 when left
+/// out), the first and then every `<every>`th, at most 12: its pipeline's shaders, root
 /// parameters and binding, which textures its tables hold and how much of each is non-zero, and
 /// the first bytes of its constant buffers, all as the draw is recorded.
 fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     use std::sync::atomic::AtomicU32;
     static N: AtomicU32 = AtomicU32::new(0);
-    let Some(every) = present_every().map(|e| e.max(1)) else { return };
+    let Some((every, from)) = present_every() else { return };
+    let every = every.max(1);
+    if present_start().elapsed().as_secs() < from {
+        return;
+    }
     {
         let shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
         if !l.target_keys.iter().any(|k| shown.contains(k)) {
@@ -659,6 +677,7 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
     if present_every().is_some() {
+        present_start();
         let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
         if !shown.contains(&(resource as usize)) {
             shown.push(resource as usize);
