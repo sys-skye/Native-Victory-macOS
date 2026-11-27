@@ -730,7 +730,8 @@ impl<'a> Tracer<'a> {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => self
-                                .identity_op(inst, k, &o)
+                                .restored_origin(inst, &o)
+                                .or_else(|| self.identity_op(inst, k, &o))
                                 .or_else(|| self.xor_undone(inst, k, &o))
                                 .or(Some(Term::Value(v))),
                         };
@@ -4302,6 +4303,75 @@ impl Tracer<'_> {
             .flatten()
     }
 
+    /// For `v_readlane_b32` of a constant lane whose spills differ by path: the one origin
+    /// (`o`, copy propagation's) every `v_writelane_b32` reaching it wrote. The title's compiler
+    /// spills a descriptor dword it moved or swapped on one path and the same dword on another.
+    fn restored_origin(&self, inst: &Inst, o: &[Option<Term>]) -> Option<Term> {
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_readlane_b32" {
+            return None;
+        }
+        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+            return None;
+        };
+        self.spilled_origin(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new(), o)
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::spilled`] by origin: what lane `lane` of VGPR value `v` holds, as its origin in
+    /// `o`. `Ok(None)` for a phi in `seen`; `Err` if not a spilled SGPR, if spills disagree, or if
+    /// a spilled value has no origin yet.
+    fn spilled_origin(
+        &self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+        o: &[Option<Term>],
+    ) -> Result<Option<Term>, ()> {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(t) = self.spilled_origin(a, lane, seen, o)? {
+                    if found.is_some_and(|f| f != t) {
+                        return Err(());
+                    }
+                    found = Some(t);
+                }
+            }
+            return Ok(found);
+        }
+        let inst = self.def(v).ok_or(())?;
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled_origin(inst.read(Reg::V(reg)).ok_or(())?, lane, seen, o);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).and_then(|s| o[s.0 as usize])
+            }
+            Operand::Literal(x) => Some(Term::Const(x)),
+            Operand::Const(c) => inline(c).map(Term::Const),
+            _ => None,
+        }
+        .map(Some)
+        .ok_or(())
+    }
+
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
     /// `seen` (already being resolved), `Err` if not a spilled SGPR.
     fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
@@ -4608,6 +4678,34 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    /// One path spills the table address, the other a copy of it, to the same lane: the restore
+    /// is that address either way.
+    #[test]
+    fn a_lane_restore_of_copies_spilled_on_each_path_is_their_origin() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0003, // s_cbranch_scc1 other
+                0xD761_0000,
+                0x0201_0602, // v_writelane_b32 v0, s2, 3
+                0xBF82_0003, // s_branch join
+                0xBE84_0302, // other: s_mov_b32 s4, s2
+                0xD761_0000,
+                0x0201_0604, // v_writelane_b32 v0, s4, 3
+                0xD760_0002,
+                0x0201_0700, // join: v_readlane_b32 s2, v0, 3
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert!(matches!(r.scalar[..], [(_, a)] if a == at(0, 0x20)), "{:?}", r.scalar);
     }
 
     #[test]
