@@ -3135,6 +3135,33 @@ fn a_mask_a_loop_gathers_from_a_cleared_start_translates() {
     }
 }
 
+/// The VCC the program entered with joins, at an `execz` branch's target, the compare its arm
+/// wrote, and is read there only ANDed with EXEC: in lockstep the branch tests `exec_lo == 0`, so
+/// on that edge the AND is 0 and the entry VCC is dead.
+pub(crate) const ENTRY_VCC_AT_EXECZ_JOIN: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xD4C4_0004,
+    0x0202_008A, // v_cmp_gt_u32 s4, 10, v0
+    0xBE85_3C04, // s_and_saveexec_b32 s5, s4
+    0xBF88_0001, // s_cbranch_execz join
+    0x7D82_0085, // v_cmp_lt_u32 vcc_lo, 5, v0
+    0x8707_7E6A, // join: s_and_b32 s7, vcc_lo, exec_lo
+    0xBEFE_0305, // s_mov_b32 exec_lo, s5
+    0xD501_0002,
+    0x001D_0280, // v_cndmask_b32 v2, 0, 1, s7
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn the_entry_vcc_anded_with_an_empty_exec_at_its_join_translates_in_lockstep() {
+    if let Err(e) = emit_cs(ENTRY_VCC_AT_EXECZ_JOIN, 32, false, false, true) {
+        panic!("{e}");
+    }
+}
+
 #[test]
 fn divergent_readlane_in_a_two_wave_group_is_refused() {
     // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;

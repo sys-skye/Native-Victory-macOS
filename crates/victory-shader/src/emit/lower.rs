@@ -13839,7 +13839,17 @@ impl<'a> Lower<'a> {
         let st = self.x.st;
         // Values computed from the stale one on some path followed.
         let mut tainted = HashSet::new();
-        let mut work = vec![(b, n, HashMap::new(), BTreeSet::from([reg]))];
+        // What the edge's own branch tells (EXEC empty on a lockstep `execz` edge, say).
+        let q = p.blocks[b].preds[n];
+        let mut start = HashMap::new();
+        if let LaneExit::Branch { taken, not_taken, .. } = st.exits[q]
+            && taken != not_taken
+            && let Some((on, words)) = Self::zero_on_branch(&p.blocks[q])
+            && (if on { taken } else { not_taken }) == b
+        {
+            start.extend(words.into_iter().map(|w| (w, 0)));
+        }
+        let mut work = vec![(b, n, start, BTreeSet::from([reg]))];
         // Per block reached and registers holding tainted values on entry:
         // the phi values known there, over the paths so far.
         let mut at: HashMap<(usize, BTreeSet<Reg>), HashMap<Value, u32>> = HashMap::new();
@@ -13929,31 +13939,7 @@ impl<'a> Lower<'a> {
             if regs.is_empty() {
                 continue;
             }
-            // A branch on a register compared with 0 (`s_cmp_eq_u64 exec, 0`, how lockstep tests
-            // a mask): on the edge where it is 0, so is each of its dwords.
-            let zero = (|| {
-                let [.., cmp, br] = block.insts.as_slice() else { return None };
-                let on_scc1 = match br.name() {
-                    "s_cbranch_scc1" => true,
-                    "s_cbranch_scc0" => false,
-                    _ => return None,
-                };
-                let eq = match cmp.name() {
-                    "s_cmp_eq_u64" | "s_cmp_eq_u32" => true,
-                    "s_cmp_lg_u64" | "s_cmp_lg_u32" => false,
-                    _ => return None,
-                };
-                let Fields::Sop { src, .. } = &cmp.fields else { return None };
-                let (&Operand::Scalar { code, .. }, Some(0)) =
-                    (src.first()?, src.get(1).copied().and_then(scalar_constant))
-                else {
-                    return None;
-                };
-                let dwords = if cmp.name().ends_with("_u64") { 2 } else { 1 };
-                let words: Option<Vec<Value>> =
-                    (0..dwords).map(|h| cmp.read(Reg::S(code + h))).collect();
-                Some((on_scc1 == eq, words?))
-            })();
+            let zero = Self::zero_on_branch(block);
             let zeroed = |mut env: HashMap<Value, u32>, taken: bool| {
                 if let Some((on, words)) = &zero
                     && *on == taken
@@ -13990,6 +13976,32 @@ impl<'a> Lower<'a> {
             }
         }
         true
+    }
+
+    /// A block ending in a branch on a register compared with 0 (`s_cmp_eq_u64 exec, 0`, how
+    /// lockstep tests a mask): whether that register is 0 on the taken edge (else the other),
+    /// and its dwords.
+    fn zero_on_branch(block: &crate::ir::Block) -> Option<(bool, Vec<Value>)> {
+        let [.., cmp, br] = block.insts.as_slice() else { return None };
+        let on_scc1 = match br.name() {
+            "s_cbranch_scc1" => true,
+            "s_cbranch_scc0" => false,
+            _ => return None,
+        };
+        let eq = match cmp.name() {
+            "s_cmp_eq_u64" | "s_cmp_eq_u32" => true,
+            "s_cmp_lg_u64" | "s_cmp_lg_u32" => false,
+            _ => return None,
+        };
+        let Fields::Sop { src, .. } = &cmp.fields else { return None };
+        let (&Operand::Scalar { code, .. }, Some(0)) =
+            (src.first()?, src.get(1).copied().and_then(scalar_constant))
+        else {
+            return None;
+        };
+        let dwords = if cmp.name().ends_with("_u64") { 2 } else { 1 };
+        let words: Option<Vec<Value>> = (0..dwords).map(|h| cmp.read(Reg::S(code + h))).collect();
+        Some((on_scc1 == eq, words?))
     }
 
     /// Whether deciding `b`, given the values in `env`, may test an atom
