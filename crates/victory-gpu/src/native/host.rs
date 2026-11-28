@@ -1588,6 +1588,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let (generation, maps) = self.mapping_list();
         let mut c = self.contract.borrow_mut();
         let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
+        if std::env::var_os("VICTORY_TRACE_TABLE_HOLES").is_some() {
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            let (pages, bytes) = addr::split_pages(&maps);
+            if LAST.swap(bytes, std::sync::atomic::Ordering::Relaxed) != bytes {
+                tracing::info!(pages, bytes, mappings = maps.len(), "title pages mapped in part or in pieces read as zeros through the page table");
+            }
+        }
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
         table.write(&words);
         // The table it replaces stays with the submissions that read it ([`Pages`]).

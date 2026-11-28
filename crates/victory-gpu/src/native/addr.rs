@@ -169,6 +169,25 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
     words
 }
 
+/// `VICTORY_TRACE_TABLE_HOLES`: the 64 KiB title pages that hold mapped bytes but no mapping
+/// wholly (the null pages of [`build`] that the title maps in part or in pieces), and how many of
+/// their bytes are mapped.
+pub fn split_pages(maps: &[Mapping]) -> (usize, u64) {
+    let mut part: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for m in maps {
+        let end = m.at + m.len;
+        let mut page = m.at & !(PAGE - 1);
+        while page < end {
+            let (lo, hi) = (page.max(m.at), (page + PAGE).min(end));
+            if hi - lo < PAGE {
+                *part.entry(page).or_default() += hi - lo;
+            }
+            page += PAGE;
+        }
+    }
+    (part.len(), part.values().sum())
+}
+
 /// A root SRV or UAV address as the translator's root views want it (`emit`, "Root SRVs and root
 /// UAVs"): the heap index of the view pair's SRV (the UAV is the next entry) and the byte offset of
 /// the address in the view. The first containing mapping wins. An unmapped address gets the null
@@ -423,6 +442,20 @@ mod tests {
             assert!(u64::from(o) + 4 <= u64::from(size), "{off:#x}");
         }
         assert_eq!(pairs.keys.len(), 4);
+    }
+
+    #[test]
+    fn split_pages_counts_pages_mapped_in_pieces() {
+        // One whole page; a page in four 16 KiB mappings; a mapping ending 16 KiB into a page.
+        let maps = [
+            map(0x10000, 0x10000, 10, 1 << 20, 0),
+            map(0x20000, 0x4000, 10, 1 << 20, 0x40000),
+            map(0x24000, 0x4000, 11, 1 << 20, 0),
+            map(0x28000, 0x4000, 10, 1 << 20, 0x8000),
+            map(0x2c000, 0x4000, 12, 1 << 20, 0),
+            map(0x30000, 0x14000, 10, 1 << 20, 0x80000),
+        ];
+        assert_eq!(split_pages(&maps), (2, 0x10000 + 0x4000));
     }
 
     #[test]
