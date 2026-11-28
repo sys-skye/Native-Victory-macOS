@@ -817,6 +817,15 @@ lighting (8x16 and 16x16).
   pair syncs themselves are cheap: a test dispatch of 14,400 groups of 256 threads, with lane
   reads in per-lane loops and the title's barrier, took 5 to 8 ms. Loop-free programs such as
   `eee76bf6265f33bb` still translate.
+- A program with more than `lockstep::MAX_WAVES_BRANCHES` (16) EXEC branches
+  (`s_cbranch_execz`, `s_cbranch_execnz`) is refused with "more EXEC branches than lockstep takes
+  in a group of several console waves". Each such branch is a pair sync, and a host wave waits at
+  one by spinning on the same core as its other half. In run 59, with the loops refused,
+  `e2a55bc9fd02a4ef` (7,000 instructions, 138 EXEC branches, about 8,000 groups) took 2.5 s of GPU
+  time in each of three frames and then held the GPU until the guard stopped the run. The test
+  dispatches above are light, so their spins are short. Why the cost grows so much with a heavy
+  program was not measured; the limit is a measured one (`eee76bf6265f33bb` has 5 EXEC branches,
+  the light-tile programs refused by it 62 to 140).
 
 Tests (`victory-gpu`, Metal), in `split_wave_tests`:
 
@@ -828,8 +837,8 @@ half meeting its own other half) before the loop rule; they now check the refusa
 `ds_append` test below runs multi-wave lockstep on the GPU. The fast path's refusal tests now use groups of five console waves, more than lockstep
 takes.
 
-Of the 12 programs, 6 translate with the loop rule (9 did before it). Two keep a barrier in a
-block a console wave may skip, and four have loops.
+Of the 12 programs, 2 translate with the loop and branch rules (9 did before them). Two keep a
+barrier in a block a console wave may skip, four have loops and four too many EXEC branches.
 
 `ds_append` and `ds_consume` in lockstep where the host splits the console wave
 (`Lower::split_append`) were refused with "ds_append or ds_consume in a console wave the host

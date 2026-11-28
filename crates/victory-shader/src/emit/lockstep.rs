@@ -40,6 +40,14 @@ use crate::resource::Resources;
 /// "If-conversion for groups of several console waves": a bound to measure before raising).
 pub(crate) const MAX_WAVES: u32 = 4;
 
+/// The most EXEC branches lockstep takes in a group of several console waves (`retry`).
+pub(crate) const MAX_WAVES_BRANCHES: usize = 16;
+
+/// Lockstep refuses more EXEC branches than [`MAX_WAVES_BRANCHES`] in a group of several console
+/// waves (`retry`).
+pub(crate) const WAVES_BRANCHES: &str =
+    "more EXEC branches than lockstep takes in a group of several console waves";
+
 /// Lockstep refuses a loop in a group of several console waves (`retry`).
 pub(crate) const WAVES_LOOP: &str = "a loop in lockstep in a group of several console waves";
 
@@ -97,6 +105,16 @@ pub(super) fn retry(
         if let Some(b) = back {
             let offset = q.blocks[b].insts.first().map_or(0, |i| i.machine.offset);
             return Err(ShaderError::Unsupported { offset, what: WAVES_LOOP });
+        }
+        // EXEC branches: each is a pair sync, where a host wave waits for its other half by
+        // spinning beside it. `e2a55bc9fd02a4ef` (138 of them, 8,000 groups of 8x16 threads)
+        // took 2.5 s of GPU time a frame and later held the GPU.
+        let mut exec = p.blocks.iter().flat_map(|b| &b.insts).filter(|i| {
+            matches!(i.name(), "s_cbranch_execz" | "s_cbranch_execnz")
+        });
+        if let Some(i) = exec.nth(MAX_WAVES_BRANCHES) {
+            let offset = i.machine.offset;
+            return Err(ShaderError::Unsupported { offset, what: WAVES_BRANCHES });
         }
     }
     let st = structure::lockstep(&q)?;
