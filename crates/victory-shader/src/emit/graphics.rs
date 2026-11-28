@@ -244,8 +244,10 @@ fn infer_with(
     // (the metadata names only their first), as compute's reach its user SGPR count
     // (`constants_to_the_end`): up to the primitive mask, which follows the user SGPRs and only
     // reaches M0, when the program reads one (observed: b500 in s10 to s14, the mask in s15, s13
-    // read on entry); else as far as it reads them on entry (the upscale program's b500 in s9 to
-    // s12, with no interpolation).
+    // read on entry); else up to the last it reads on entry, past any it writes first (the
+    // upscale program's b500 in s9 to s12, with no interpolation; a hole-filling program's in s9
+    // to s12, s11 written before it is read: stopping at s11 refused it, and its target kept
+    // stale memory, NaNs the next pass spread).
     if stage == HwStage::Ps
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
@@ -256,7 +258,7 @@ fn infer_with(
         let start = u32::from(last.user_data) + last.sgprs;
         let end = match (start..32).find(|&s| mask(s)) {
             Some(m) => m,
-            None => (start..32).find(|&s| live(s).is_none()).unwrap_or(32),
+            None => (start..32).rev().find(|&s| live(s).is_some()).map_or(start, |s| s + 1),
         };
         last.sgprs = end - u32::from(last.user_data);
     }
@@ -1763,6 +1765,21 @@ mod tests {
         let (p, _) = infer(HwStage::Ps, &words(&gap), &meta).unwrap();
         assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 4), "{:?}", p.layout);
         let c = container(HwStage::Ps, &words(&gap), &meta).unwrap();
+        super::super::translate_with(&c, super::super::Options::default()).unwrap();
+        // With no interpolation, the constants reach the last SGPR read on entry, past one the
+        // program writes first (s11): the title's hole-filling pixel program reads s9 and s10
+        // as floats and s12 as packed image sizes.
+        let hole = [
+            0xBE8B_0309, // s_mov_b32 s11, s9
+            0x7E00_020A, // v_mov_b32 v0, s10
+            0x7E02_020B, // v_mov_b32 v1, s11
+            0x7E04_020C, // v_mov_b32 v2, s12
+            0xF800_0807, 0x0002_0100, // exp mrt0 v0, v1, v2 done
+            ENDPGM,
+        ];
+        let (p, _) = infer(HwStage::Ps, &words(&hole), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 4), "{:?}", p.layout);
+        let c = container(HwStage::Ps, &words(&hole), &meta).unwrap();
         super::super::translate_with(&c, super::super::Options::default()).unwrap();
     }
 
