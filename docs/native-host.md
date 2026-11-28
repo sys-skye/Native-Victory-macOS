@@ -759,6 +759,29 @@ Three more rules from the same programs (all of them in `Lower`):
 - VCC read before any write holds what the last wave left, as SGPRs above the initialised ones
   do, and reads 0 (`inputs`; a wave32 program's VCC_HI joined into a lane mask).
 
+Masks no mask tracks, in lockstep (`Lower::untracked_numbers`). Some lockstep wave32 programs
+join lane bits that no mask tracks: a compare's or carry's result, or the low dword of an
+`s_xor_b64` / `s_mov_b64` of mask pairs, which the console compiler uses to swap registers.
+These were refused with "lane-mask join of an untracked mask: a value the translation could not
+make". Every thread runs every block, so such a value's number is exact:
+
+- a compare's or carry's bits are its ballot where it ran, ANDed with its guard
+  (`untracked_lane_bit`);
+- a scalar operation's result is the operation on its operands' numbers (`mask_number`, read
+  through `get`);
+- a join of either kind with data reads that number (`lockstep_number`).
+
+A lockstep join whose edge cannot give a number is marked in its own set (`no_number`, retry
+reason `NO_NUMBER`). Reading the join's number then answers `NUMBER_JOIN`, and that error going
+up through a data read is not mistaken for the mark. Before this split, a data phi carrying the
+error was marked as a join, and the lowering ended in "a phi that does not settle".
+
+These numbers can fail in programs that translated without them: a failed speculative number
+marks joins that used to work. So the rules run only on a second try, after a first lowering
+without them refuses on a lane-mask join or a phi that does not settle (`lower_graphics`). The
+first try is the lowering as before. Over the 236 frame compute programs (`refused` example),
+190 translate (was 181), and none that translated regress.
+
 ### If-conversion for groups of several console waves (#376, design note)
 
 Lockstep makes control flow uniform across the group because the group is one console wave: the wave's ballot is the same number in every thread, so a branch on it is taken by all or none. A group of W console waves has W different ballots, so one program counter cannot follow them; making the group's control flow uniform means removing the branches, not testing them differently. Proposed shape (a predication pass, not an extension of `structure::lockstep` — the single-wave ballot trick is what lockstep *is*, and multi-wave branches have no group-wide scalar to branch on):

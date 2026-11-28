@@ -177,7 +177,22 @@ thread_local! {
 }
 
 pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
+    match lower_passes(parts, guessed, false) {
+        // A lockstep wave32 program whose lane-mask joins need numbers of masks no mask tracks:
+        // again, making those ([`Lower::untracked_numbers`]).
+        Err(ShaderError::Unsupported { what, .. })
+            if what.contains("lane-mask join") || what == "a phi that does not settle" =>
+        {
+            lower_passes(parts, guessed, true)
+        }
+        r => r,
+    }
+}
+
+fn lower_passes(parts: &Parts, guessed: bool, untracked: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // Lockstep lane-mask joins whose number an edge could not make ([`NUMBER_JOIN`]).
+    let mut no_number = Set::default();
     #[cfg(test)]
     PASSES.set(0);
     // Compute programs hold masks the structurisation cannot see into
@@ -187,11 +202,18 @@ pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, Sh
     loop {
         #[cfg(test)]
         PASSES.set(PASSES.get() + 1);
-        match Lower::new(parts, &bad, console, guessed).run() {
+        let mut lower = Lower::new(parts, &bad, &no_number, console, guessed);
+        lower.untracked_numbers = untracked;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(phis)) => {
                 for (v, why) in phis {
-                    if bad.insert(v, why).is_some() {
+                    let again = if why == NO_NUMBER {
+                        !no_number.insert(v)
+                    } else {
+                        bad.insert(v, why).is_some()
+                    };
+                    if again {
                         return Err(ShaderError::Unsupported {
                             offset: 0,
                             what: "a phi that does not settle",
@@ -282,6 +304,11 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     guessed: bool,
     bad: &'a HashMap<Value, Why>,
+    /// Lockstep lane-mask joins whose number an edge could not make in an earlier pass.
+    no_number: &'a Set<Value>,
+    /// Lockstep, wave32: read a scalar result on masks no mask tracks as a number ([`Lower::get`]);
+    /// only on a second try ([`lower_graphics`]), as its numbers may fail where others did not.
+    untracked_numbers: bool,
     lane_fail: Map<Value, Why>,
     vals: Map<Value, Val>,
     floats: Map<Value, V>,
@@ -571,6 +598,12 @@ type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// A lockstep lane-mask join one of whose edges' numbers the translation could not make
+/// ([`Lower::next_pending_mask`]).
+const NUMBER_JOIN: Why = "a lane-mask join whose number an edge could not make";
+/// [`Stop::Retry`] of a lockstep join whose number an edge could not make: the next pass
+/// leaves it without one ([`NUMBER_JOIN`] is what reading its number then answers).
+const NO_NUMBER: Why = "a lane-mask join without a number";
 
 /// `VICTORY_DEBUG_PS=id`: the colour every float export of a pixel program writes, the low three
 /// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
@@ -949,7 +982,13 @@ impl<'a> InterpUses<'a> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, console: bool, guessed: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        no_number: &'a Set<Value>,
+        console: bool,
+        guessed: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1134,6 +1173,8 @@ impl<'a> Lower<'a> {
             x,
             guessed,
             bad,
+            no_number,
+            untracked_numbers: false,
             lane_fail: Map::default(),
             vals: Map::default(),
             floats: Map::default(),
@@ -2592,6 +2633,38 @@ impl<'a> Lower<'a> {
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
         }
+        // Lockstep: a compare's or carry's lane bits no mask tracks, read as a number: the
+        // ballot where the instruction ran, every thread being there.
+        if self.untracked_numbers
+            && self.x.st.lockstep
+            && matches!(found, Some(Val::Missing(LANE_MASK)))
+            && self.lane_bits.contains_key(&v)
+        {
+            if let Some(&(x, _)) = self.ballots.get(&v) {
+                return Ok(Val::I32(x));
+            }
+            let &b = self.def_block.get(&v).ok_or(LANE_MASK)?;
+            let at = if b == self.cur_ir {
+                self.cur
+            } else {
+                self.tail[b].ok_or("a lane mask written after its use")?
+            };
+            let bit = self.untracked_lane_bit(v, at)?;
+            let xy = self.wide_ballot(at, b, bit)?;
+            self.ballots.insert(v, xy);
+            return Ok(Val::I32(xy.0));
+        }
+        // Lockstep, wave32: a scalar operation's result on lane masks no mask tracks (the
+        // console compiler's 64-bit XOR swaps of mask pairs), read as a number: the operation
+        // on its operands' numbers ([`Lower::mask_number`]).
+        if self.untracked_numbers
+            && self.x.st.lockstep
+            && !self.x.native.wave64
+            && matches!(found, Some(Val::Missing(LANE_MASK)))
+            && let Some(x) = self.mask_word(v)
+        {
+            return Ok(Val::I32(x));
+        }
         if let (Some(Val::Missing(_)), Some(&u)) = (found, self.uniform_scc.get(&v)) {
             let at = match self.def_block.get(&v) {
                 None => self.s.entry,
@@ -2917,7 +2990,11 @@ impl<'a> Lower<'a> {
             && let Some(&(b, i)) = self.phi_at.get(&lo)
         {
             // An edge's number the translation could not make (a pass before this one).
-            if let Some(&why) = self.bad.get(&lo) {
+            if self.untracked_numbers {
+                if self.no_number.contains(&lo) {
+                    return Err(NUMBER_JOIN);
+                }
+            } else if let Some(&why) = self.bad.get(&lo) {
                 return Err(why);
             }
             let blk = self.block[b].ok_or("an unreachable join")?;
@@ -15655,6 +15732,16 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
+                    // Lockstep: lane bits no mask tracks (a compare's, a wave32 program's 64-bit
+                    // copy of masks) joined with data: their number, the wave taking one edge.
+                    (Some(Val::Missing(LANE_MASK)), false)
+                        if read
+                            && self.untracked_numbers
+                            && self.x.st.lockstep
+                            && let Some(x) = self.lockstep_number(arg) =>
+                    {
+                        x
+                    }
                     // Every edge brings one value round copies (a value swapped through a mask's
                     // register and back on one arm): it, whichever edges the lanes took.
                     (Some(Val::Missing(_)), false)
@@ -15755,6 +15842,21 @@ impl<'a> Lower<'a> {
                 } else {
                     self.x.st.masks.get(&arg).copied()
                 };
+                // The number of a wave32 program's 64-bit mask copy (below), made only where no
+                // arm before that one takes the edge.
+                let word64 = if self.untracked_numbers
+                    && mask.is_none()
+                    && number
+                    && !self.x.native.wave64
+                    && matches!(self.vals.get(&arg), Some(Val::Missing(_)))
+                    && !self.unneeded_edges().contains(&(phi.value, n))
+                    && !self.dead_on_edge(b, n, phi.reg)
+                    && !(self.x.st.lockstep && self.lane_bits.contains_key(&arg))
+                {
+                    self.mask_word(arg)
+                } else {
+                    None
+                };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     // In lockstep every thread runs every block, so EXEC joined at a block
@@ -15827,6 +15929,24 @@ impl<'a> Lower<'a> {
                     (None, Some(Val::I32(_))) => return Err(unsupported(offset, DIVERGENT)),
                     // Descriptor bits joined with a mask: the compiler's register reuse.
                     (None, Some(&Val::Missing(why))) if descriptor_bits(why) => self.s.m.bool(false),
+                    // Lockstep: a compare's or carry's lane bits no mask tracks. The instruction
+                    // sets a lane's bit where the lane ran it, and clears it elsewhere.
+                    (None, Some(&Val::Missing(LANE_MASK)))
+                        if self.untracked_numbers
+                            && self.x.st.lockstep
+                            && self.lane_bits.contains_key(&arg) =>
+                    {
+                        let miss = || unsupported(offset, MISSING);
+                        let &db = self.def_block.get(&arg).ok_or_else(miss)?;
+                        let at = self.tail[db].ok_or_else(miss)?;
+                        self.untracked_lane_bit(arg, at).map_err(|w| unsupported(offset, w))?
+                    }
+                    // A wave32 program's 64-bit copies and XORs of masks, which the structure
+                    // does not follow: the lane's bit of the number they make (`mask_number`),
+                    // at a join every lane enters along one edge.
+                    (None, Some(Val::Missing(_))) if let Some(word) = word64 => {
+                        self.lane_bit(qb, word, None)
+                    }
                     (None, Some(Val::Missing(_))) => return Err(unsupported(offset, MISSING)),
                     (None, Some(Val::Bit(_))) => return Err(unsupported(offset, BIT)),
                     (None, None) => return Err(unsupported(offset, NONE)),
@@ -15836,6 +15956,45 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+
+    /// A lane's bit of `v`, a compare's or carry's result in [`Lower::lane_bits`] that no mask
+    /// tracks: the bit the instruction computed, ANDed with its guard (a lane outside EXEC there
+    /// gets a 0), at `at`, in the block that ran it or one it dominates.
+    fn untracked_lane_bit(&mut self, v: Value, at: usize) -> Result<V, Why> {
+        let p = self.x.p;
+        let &bit = self.lane_bits.get(&v).ok_or(LANE_MASK)?;
+        let &b = self.def_block.get(&v).ok_or(LANE_MASK)?;
+        let i = p.blocks[b]
+            .insts
+            .iter()
+            .position(|i| i.writes.iter().any(|w| w.1 == v))
+            .ok_or(LANE_MASK)?;
+        let Some(guard) = self.x.st.guards[b][i] else { return Ok(bit) };
+        let on = self.boolean(guard, at)?;
+        Ok(self.s.m.bin(at, Bin::And, bit, on))
+    }
+
+    /// Lockstep: the number of lane bits no mask tracks, `None` if it cannot be made: a
+    /// compare's or carry's ballot ([`Lower::get`]), or a wave32 program's 64-bit copy of masks.
+    fn lockstep_number(&mut self, v: Value) -> Option<V> {
+        if self.lane_bits.contains_key(&v) {
+            return match self.get(v) {
+                Ok(Val::I32(x)) => Some(x),
+                _ => None,
+            };
+        }
+        if self.x.native.wave64 { None } else { self.mask_word(v) }
+    }
+
+    /// [`Lower::mask_number`]'s low dword of `v`, kept as its ballot; `None` if it cannot be made.
+    fn mask_word(&mut self, v: Value) -> Option<V> {
+        if let Some(&(x, _)) = self.ballots.get(&v) {
+            return Some(x);
+        }
+        let xy = self.mask_number(v).ok()?;
+        self.ballots.insert(v, xy);
+        Some(xy.0)
     }
 
     /// The next lane-mask join to fill; when none is left, the lockstep joins' numbers are
@@ -15855,7 +16014,10 @@ impl<'a> Lower<'a> {
                     self.mask_dword(arg).and_then(|_| self.ballots.get(&arg).ok_or(LANE_MASK));
                 let &(ax, ay) = match made {
                     Ok(xy) => xy,
-                    Err(why) => return Err(Stop::Retry(vec![(p.blocks[b].phis[i].value, why)])),
+                    Err(why) => {
+                        let why = if self.untracked_numbers { NO_NUMBER } else { why };
+                        return Err(Stop::Retry(vec![(p.blocks[b].phis[i].value, why)]));
+                    }
                 };
                 xs.push((ax, qb));
                 ys.push((ay, qb));
