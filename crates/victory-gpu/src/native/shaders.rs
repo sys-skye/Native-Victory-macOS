@@ -187,12 +187,30 @@ pub struct ShaderStats {
     pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
+    /// Pipelines whose compile died with Metal's compiler, by name, with how often
+    /// ([`Self::crashed`]).
+    pub crashes: HashMap<String, u32>,
 }
 
 impl ShaderStats {
     /// All refusals.
     pub fn refusals(&self) -> u64 {
         self.refused.iter().map(|r| r.1).sum()
+    }
+
+    /// Whether the compile of pipeline `what` that ended in `error` is put off rather than
+    /// refused: Metal's compiler died on it (`victory_metal::is_compiler_crash`) fewer than
+    /// `victory_metal::CRASHES_REMEMBERED` times. One crash of the compiler service fails every
+    /// compile it had in flight, most of them pipelines it would have compiled, so those are
+    /// tried again on a later use and only a pipeline that keeps crashing it is refused.
+    #[cfg(target_os = "macos")]
+    fn crashed(&mut self, what: &str, error: &str) -> bool {
+        if !victory_metal::is_compiler_crash(error) {
+            return false;
+        }
+        let n = self.crashes.entry(what.to_string()).or_insert(0);
+        *n += 1;
+        *n < victory_metal::CRASHES_REMEMBERED
     }
 
     fn refuse(&mut self, what: &str, reason: String) {
@@ -269,7 +287,12 @@ impl<B: PresentBackend> Title<B> {
             }
             Err(e) => {
                 #[cfg(target_os = "macos")]
-                self.compile_failed(name, &e);
+                {
+                    self.compile_failed(name, &e);
+                    if self.shaders.crashed(name, &e) {
+                        return self.put_off();
+                    }
+                }
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -408,7 +431,12 @@ impl<B: PresentBackend> Title<B> {
             }
             Err(e) => {
                 #[cfg(target_os = "macos")]
-                self.compile_failed(name, &e);
+                {
+                    self.compile_failed(name, &e);
+                    if self.shaders.crashed(name, &e) {
+                        return self.put_off();
+                    }
+                }
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -428,4 +456,19 @@ impl<B: PresentBackend> Title<B> {
     pub(crate) fn compile_failed(&mut self, name: &str, error: &str) {
         super::glue::compile_failed(name, error);
     }
+}
+
+/// A pipeline whose compile died with Metal's compiler is put off, not refused, until it has done
+/// so `CRASHES_REMEMBERED` times: one crash of the compiler service fails every compile it had in
+/// flight. Any other compile error is refused at once.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn compiles_the_compiler_crash_took_down_are_tried_again() {
+    let crash = "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED.";
+    let mut s = ShaderStats::default();
+    let tries: Vec<bool> = (0..victory_metal::CRASHES_REMEMBERED).map(|_| s.crashed("pipeline a", crash)).collect();
+    assert_eq!(tries.iter().filter(|&&t| t).count() as u32, victory_metal::CRASHES_REMEMBERED - 1);
+    assert!(!tries.last().unwrap(), "the last crash refuses it");
+    assert!(s.crashed("pipeline b", crash), "counted per pipeline");
+    assert!(!s.crashed("pipeline c", "Fragment input mismatching vertex shader output type"));
 }

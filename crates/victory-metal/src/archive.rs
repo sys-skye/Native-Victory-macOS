@@ -283,11 +283,26 @@ fn note(started: Instant, what: &str) {
     }
 }
 
+/// Crashes of Metal's compiler on one pipeline in this run before it is remembered on disk
+/// ([`crate::disk::remember_crash`]). One crash of the compiler service fails every compile it
+/// had in flight, so a single crash does not say which pipeline caused it: GTA VI's G-buffer lost
+/// a dozen pipelines a run with one crash report, and remembered at the first failure each was
+/// refused for good on every later run.
+pub const CRASHES_REMEMBERED: u32 = 3;
+
 fn remember_crash<T>(r: &Result<T, String>, key: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
     if let Err(e) = r
         && is_compiler_crash(e)
     {
-        crate::disk::remember_crash(key.as_bytes());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = seen.get_or_insert_with(HashMap::new).entry(key.to_string()).or_insert(0);
+        *n += 1;
+        if *n == CRASHES_REMEMBERED {
+            crate::disk::remember_crash(key.as_bytes());
+        }
     }
 }
 
