@@ -147,6 +147,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: false,
     })?;
 
@@ -1386,6 +1387,7 @@ fn lower_cs32_with(
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: false,
     })
     .expect("lower");

@@ -599,6 +599,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: false,
     })
     .expect("lower");

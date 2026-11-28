@@ -83,9 +83,10 @@ pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
-/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
-pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
-    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
+/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write;
+/// with `reads`, only the parameter elements its pixel shader reads (`Options::pixel_reads`).
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32], reads: Option<(u32, u64)>) -> Result<HostShader, String> {
+    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, pixel_reads: reads, ..options() })
 }
 
 /// Whether [`translate_extra`]'s translation is in the disk cache already.
@@ -101,13 +102,13 @@ pub fn uint_cached(container: &[u8], uint_targets: u8) -> bool {
     crate::shader_cache::native_present(container, &format!("{o:?}"))
 }
 
-pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
-    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32], reads: Option<(u32, u64)>) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, pixel_reads: reads, ..options() };
     #[cfg(any(windows, target_os = "macos"))]
     return crate::shader_cache::native_present(container, &format!("{o:?}"));
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (container, rect, extra, copy_params, o);
+        let _ = (container, rect, extra, copy_params, reads, o);
         false
     }
 }

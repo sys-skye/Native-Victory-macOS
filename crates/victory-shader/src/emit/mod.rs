@@ -503,6 +503,15 @@ pub struct Options {
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
     pub extra_params: u32,
+    /// A guessed vertex or mesh program whose pixel shader reads a parameter half
+    /// (`graphics::HALF`) it does not export: the `TEXCOORD` (bit n) and `HALF` (bit k) elements
+    /// that pixel shader reads. The program then exports those (and the parameters
+    /// `extra_params` and `copy_params` name) and no other parameter element. A mesh program's
+    /// outputs take 16 bytes an element for each vertex in 32 KiB, so the halves `graphics`
+    /// gives it by likelihood can leave out one its pixel shader reads, and Metal's compiler
+    /// crashes on a mesh pipeline whose fragment function reads a user input the mesh function
+    /// lacks.
+    pub pixel_reads: Option<(u32, u64)>,
     /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
     /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
     pub copy_params: [u8; 32],
@@ -639,6 +648,37 @@ fn emit_fast(
             outputs.push(container::SigElement {
                 name: "TEXCOORD".into(),
                 index: n,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+            row += 1;
+        }
+    }
+    // A guessed program paired with a pixel shader that reads halves it lacks (`Options::pixel_reads`):
+    // the parameter elements that pixel shader reads, and the ones the extra and copied parameters
+    // need, no others; exports to an element left out are not stored (`Lower::export`).
+    if !pixel && let Some((texcoords, halves)) = options.pixel_reads {
+        let copied = options.copy_params.iter().filter(|&&f| f != 0).fold(0u32, |m, &f| m | 1 << (f - 1));
+        let keep = texcoords | options.extra_params | copied;
+        outputs.retain(|e| match (e.kind, e.name.as_str()) {
+            (0, "TEXCOORD") => e.index >= 32 || keep >> e.index & 1 != 0,
+            (0, graphics::HALF) => e.index >= 64 || halves >> e.index & 1 != 0,
+            _ => true,
+        });
+        let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        for k in (0..64u32).filter(|k| halves >> k & 1 != 0) {
+            if outputs.iter().any(|e| e.kind == 0 && e.name == graphics::HALF && e.index == k) {
+                continue;
+            }
+            outputs.push(container::SigElement {
+                name: graphics::HALF.into(),
+                index: k,
                 kind: 0,
                 comp: 9,
                 interp: 0,

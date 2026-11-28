@@ -201,6 +201,7 @@ fn program() -> HostShader {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: false,
     })
     .expect("lower");
@@ -439,6 +440,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: false,
     })
     .expect("lower");
@@ -590,6 +592,7 @@ fn writes_through_views_mark_their_pages() {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        pixel_reads: None,
         view_marks: true,
     })
     .expect("lower");
@@ -716,6 +719,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            pixel_reads: None,
         })
         .expect("lower")
     };

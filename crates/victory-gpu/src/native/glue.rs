@@ -1985,19 +1985,28 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
         super::state::texcoords(&ps.dxil, victory_shader::FourCC::ISG1)
             & !super::state::texcoords(&base_vs.dxil, victory_shader::FourCC::OSG1)
     });
-    let widened = if extra != 0 {
+    // Parameter halves the pixel shader reads and the vertex or mesh shader does not export (a mesh
+    // shader's outputs have room for only some): the parameters that pixel shader reads, and no
+    // others (`Options::pixel_reads`). Metal's compiler crashes on a mesh pipeline whose fragment
+    // function reads a user input the mesh function lacks.
+    let reads = g.ps.as_ref().and_then(|ps| {
+        let halves = super::state::halves(&ps.dxil, victory_shader::FourCC::ISG1);
+        (halves & !super::state::halves(&base_vs.dxil, victory_shader::FourCC::OSG1) != 0)
+            .then(|| (super::state::texcoords(&ps.dxil, victory_shader::FourCC::ISG1), halves))
+    });
+    let widened = if extra != 0 || reads.is_some() {
         let mut copy = [0u8; 32];
         for &(orig, new) in g.ps.as_ref().map_or(&[][..], |ps| &ps.splits[..]) {
             if orig < 32 && new < 32 {
                 copy[new as usize] = orig as u8 + 1;
             }
         }
-        if spent && !g.vs_source.extra_cached(rect, extra, copy) {
+        if spent && !g.vs_source.extra_cached(rect, extra, copy, reads) {
             let s = g.vs_source.clone();
-            put_off(format!("{} {rect} {extra} {copy:?}", s.hash), move || drop(s.translate_extra(rect, extra, copy)));
+            put_off(format!("{} {rect} {extra} {copy:?} {reads:?}", s.hash), move || drop(s.translate_extra(rect, extra, copy, reads)));
             return Pipe::Refused;
         }
-        match g.vs_source.translate_extra(rect, extra, copy) {
+        match g.vs_source.translate_extra(rect, extra, copy, reads) {
             Ok(h) => Some(h),
             Err(e) => {
                 t.refused_translation(&g.name, format!("extra outputs: {e}"));

@@ -1624,6 +1624,34 @@ mod tests {
         assert_eq!(named("TEXCOORD"), [0, 1, 2], "{outs:?}");
     }
 
+    /// With the parameter elements its pixel shader reads (`Options::pixel_reads`), a guessed
+    /// program exports those and no other: a half it would not export (param0's low one) is
+    /// added, and the ones the pixel shader does not read (param1's low half and its 32 bits) are
+    /// left out. A mesh program's outputs have room for 16 elements at 128 vertices, and GTA VI's
+    /// G-buffer pixel shaders read halves of a ninth parameter its mesh programs had no room for:
+    /// Metal's compiler crashed on those pipelines (`getBasePointer`, in its software mesh pass).
+    #[test]
+    fn a_guessed_program_exports_the_parameter_elements_its_pixel_shader_reads() {
+        let code = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E06_02FF, 0x3C00_3800, // v_mov_b32 v3, 0x3c003800
+            0xF800_0201, 0x0000_0001, // exp param0 v1
+            0xF800_0211, 0x0000_0003, // exp param1 v3 (HALF2, HALF3)
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let c = container(HwStage::Vs, &words(&code), &meta_with(&[])).unwrap();
+        let reads = Some((1 << 0, 1 << 0 | 1 << 3));
+        let options = super::super::Options { pixel_reads: reads, ..Default::default() };
+        let h = super::super::translate_with(&c, options).unwrap();
+        let c = crate::Container::parse(&h.dxil).unwrap();
+        let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let named = |name: &str| -> Vec<u32> { outs.iter().filter(|o| o.name == name).map(|o| o.index).collect() };
+        assert_eq!(named(HALF), [3, 0], "{outs:?}");
+        assert_eq!(named("TEXCOORD"), [0], "{outs:?}");
+        assert!(outs.iter().any(|o| o.kind == 3), "the position stays: {outs:?}");
+    }
+
     /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
     /// mesh program).
     fn mesh(code: &[u32]) -> Result<super::super::HostShader, ShaderError> {

@@ -12,7 +12,7 @@ use victory_shader::{emit::graphics, native::HwStage};
 fn translate(stage: HwStage, words: &[u32], rect: bool) -> victory_shader::emit::HostShader {
     let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let container = graphics::container(stage, &bytes, &[0; 0x10]).unwrap();
-    shaders::translate_extra(&container, rect, 0, [0; 32]).unwrap()
+    shaders::translate_extra(&container, rect, 0, [0; 32], None).unwrap()
 }
 
 // Assembled with llvm-mc -triple=amdgcn -mcpu=gfx1030 -show-encoding.

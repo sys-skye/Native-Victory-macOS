@@ -805,6 +805,26 @@ pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
     mask
 }
 
+/// The parameter halves (`HALF` elements, bit k: `HALF` k) of a guessed stage's DXIL container's
+/// `fourcc` signature part: those a pixel shader reads (`ISG1`) or a vertex or mesh shader
+/// exports (`OSG1`).
+pub fn halves(dxil: &[u8], fourcc: victory_shader::FourCC) -> u64 {
+    use victory_shader::Container;
+    let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(fourcc).map(|p| p.data.to_vec())) else {
+        return 0;
+    };
+    let word = |at: usize| part.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+    let mut mask = 0;
+    for i in 0..word(0) as usize {
+        let at = 8 + 32 * i;
+        let name = part.get(word(at + 4) as usize..).and_then(|t| t.split(|&b| b == 0).next()).unwrap_or(&[]);
+        if name == b"HALF" && word(at + 12) == 0 && word(at + 8) < 64 {
+            mask |= 1 << word(at + 8);
+        }
+    }
+    mask
+}
+
 /// The render targets a pixel shader writes (`SV_Target` index and write mask), from its DXIL
 /// container's `OSG1` part.
 pub fn pixel_targets(dxil: &[u8]) -> Vec<(u32, u8)> {

@@ -141,7 +141,7 @@ fn an_extra_parameter_beside_a_half_of_its_index_links_with_its_own_values() {
     let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
     let mut copy = [0; 32];
     copy[6] = 3; // TEXCOORD2 + 1
-    let vs = shaders::translate_extra(&c, false, 1 << 6, copy).unwrap();
+    let vs = shaders::translate_extra(&c, false, 1 << 6, copy, None).unwrap();
     let ps = translate(HwStage::Ps, &ps_words);
     let Some(mut t) = title() else { return };
     let heap = Heap::new(&t);

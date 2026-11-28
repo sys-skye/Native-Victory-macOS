@@ -301,15 +301,22 @@ impl Shader {
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.
-    pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32]) -> bool {
+    pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32], reads: Option<(u32, u64)>) -> bool {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::shaders::extra_cached(&container, rect, extra, copy)
+        crate::native::shaders::extra_cached(&container, rect, extra, copy, reads)
     }
 
-    /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
-    pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+    /// A translation that also writes the `TEXCOORD` parameters in `extra`, and with `reads` only
+    /// the parameter elements its pixel shader reads (not cached).
+    pub(crate) fn translate_extra(
+        &self,
+        rect: bool,
+        extra: u32,
+        copy: [u8; 32],
+        reads: Option<(u32, u64)>,
+    ) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        let made = crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new);
+        let made = crate::native::shaders::translate_extra(&container, rect, extra, copy, reads).map(Arc::new);
         if made.is_err()
             && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
         {
