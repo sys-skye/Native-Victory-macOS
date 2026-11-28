@@ -2354,9 +2354,11 @@ mod tests {
         );
         let s = structure(&p).unwrap();
         let insts = &p.blocks[0].insts;
-        let saved = insts[1].write(Reg::S(0)).unwrap();
-        let restored = insts[3].write(Reg::S(5)).unwrap();
-        assert_eq!(s.restored.get(&restored), Some(&saved));
+        // The spill and the read back are copies through a spill slot (`ir::spill_slots`).
+        let slot = Reg::S(crate::ir::SPILL_SLOTS);
+        assert_eq!(insts[2].name(), "s_mov_b32");
+        assert_eq!(insts[2].read(Reg::S(0)), insts[1].write(Reg::S(0)));
+        assert_eq!(insts[3].read(slot), insts[2].write(slot));
         // Skipped exactly where the compare fails, as without the spill.
         let LaneExit::Branch { when, .. } = s.exits[0] else {
             panic!("{:?}", s.exits)

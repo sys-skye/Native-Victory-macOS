@@ -35,15 +35,16 @@ use crate::resource::Resources;
 /// A branch the lockstep structuriser could not make uniform.
 pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave run in lockstep";
 
-/// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host whose group is
-/// one console wave.
+/// Whether a refused program may run in lockstep: compute on a 32-lane host whose group is one
+/// console wave (wave64: two host waves; wave32: one, which ballots and lane reads need no
+/// exchange for).
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
     let StageIo::Cs(cs) = &native.io else { return false };
+    let wave = if native.wave64 { 64 } else { 32 };
     options.wave32_host
         && native.stage == HwStage::Cs
-        && native.wave64
         && !st.lockstep
-        && cs.threads.iter().product::<u32>() <= 64
+        && cs.threads.iter().product::<u32>() <= wave
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
@@ -157,8 +158,8 @@ pub(crate) fn split_branch(
     })
 }
 
-/// `p` with each branch on EXEC or VCC (`s_cbranch_execz` and the like) made a 64-bit compare of
-/// the mask with 0 and a branch on its SCC.
+/// `p` with each branch on EXEC or VCC (`s_cbranch_execz` and the like) made a compare of the mask
+/// with 0 (64-bit, or 32-bit in a wave32 program) and a branch on its SCC.
 pub(crate) fn branches(p: &Program) -> Program {
     let mut q = p.clone();
     let mut next = max_value(p).map_or(0, |v| v.0 + 1);
@@ -174,13 +175,18 @@ pub(crate) fn branches(p: &Program) -> Program {
             "s_cbranch_vccnz" => (VCC, false),
             _ => continue,
         };
-        let (Some(lo), Some(hi)) = (last.read(Reg::S(reg)), last.read(Reg::S(reg + 1))) else {
-            continue;
-        };
+        let Some(lo) = last.read(Reg::S(reg)) else { continue };
+        let mut mask = vec![(Reg::S(reg), lo)];
+        if p.wave64 {
+            let Some(hi) = last.read(Reg::S(reg + 1)) else { continue };
+            mask.push((Reg::S(reg + 1), hi));
+        }
         let scc = Value(next);
         next += 1;
-        // s_cmp_eq_u64 / s_cmp_lg_u64 reg, 0; s_cbranch_scc1, the branch's distance kept.
-        let cmp = 0xBF00_8000 | u32::from(0x12 + u8::from(!eq)) << 16 | u32::from(reg);
+        // s_cmp_eq_u64 / s_cmp_lg_u64 reg, 0 (_u32 in wave32); s_cbranch_scc1, the branch's
+        // distance kept.
+        let op = if p.wave64 { 0x12 } else { 0x06 } + u8::from(!eq);
+        let cmp = 0xBF00_8000 | u32::from(op) << 16 | u32::from(reg);
         let branch = 0xBF85_0000 | last.machine.words[0] & 0xFFFF;
         let offset = last.machine.offset;
         let made = |word: u32, reads: Vec<(Reg, Value)>, writes: Vec<(Reg, Value)>| {
@@ -189,17 +195,16 @@ pub(crate) fn branches(p: &Program) -> Program {
                 .swap_remove(0);
             machine.offset = offset;
             machine.words[0] = word;
-            let fields: Fields = machine.fields(true);
+            let fields: Fields = machine.fields(p.wave64);
             Some(Inst { machine, fields, reads, writes })
         };
         // The distance decodes from offset 0: made at a distance of 0, then given the branch's.
-        let Some(cmp) = made(cmp, vec![(Reg::S(reg), lo), (Reg::S(reg + 1), hi)], vec![(Reg::Scc, scc)])
-        else {
+        let Some(cmp) = made(cmp, mask, vec![(Reg::Scc, scc)]) else {
             continue;
         };
         let Some(mut br) = made(0xBF85_0000, vec![(Reg::Scc, scc)], vec![]) else { continue };
         br.machine.words[0] = branch;
-        br.fields = br.machine.fields(true);
+        br.fields = br.machine.fields(p.wave64);
         block.insts.pop();
         block.insts.extend([cmp, br]);
     }

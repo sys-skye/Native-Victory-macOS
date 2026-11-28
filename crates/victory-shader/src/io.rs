@@ -548,6 +548,8 @@ impl<'a> PrimMaskUses<'a> {
     // recognised scalar operations if a new compiler pattern still uses the value only for M0.
     pub(crate) fn is_prim_mask_only(&self, init_v: Value, guessed: bool) -> bool {
         let m0 = crate::ir::M0;
+        // SGPRs and spill slots (`ir::spill_slots`: spills read back are copies through them).
+        let sgpr = |d: u8| !(106..crate::ir::SPILL_SLOTS).contains(&d);
         let mut scalar_vals = Set::default();
         scalar_vals.insert(init_v);
         let mut scalar_q = vec![init_v];
@@ -562,7 +564,7 @@ impl<'a> PrimMaskUses<'a> {
                     #[cfg(test)]
                     self.visits.set(self.visits.get() + 1);
                     match phi.reg {
-                        Reg::S(d) if d < 106 => {
+                        Reg::S(d) if sgpr(d) => {
                             if scalar_vals.insert(phi.value) {
                                 scalar_q.push(phi.value);
                             }
@@ -599,7 +601,7 @@ impl<'a> PrimMaskUses<'a> {
                                 if m0_vals.insert(dv) {
                                     m0_q.push(dv);
                                 }
-                            } else if *d < 106 {
+                            } else if sgpr(*d) {
                                 if scalar_vals.insert(dv) {
                                     scalar_q.push(dv);
                                 }

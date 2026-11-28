@@ -674,6 +674,27 @@ stays refused.
 
 `Lower::live_edges` decides which incoming edges of a join can bring a value to a read: it walks back from the read phis, carrying the last four branch conditions a lane took (`MAX_KNOWN`), and an edge is dead if they contradict. It kept every distinct set of conditions it had walked a phi with and compared each new one with all of them. Six of the title's pixel shaders (`0c138380aac06bee`, `1dc240e3ad667c4a`, `3b005093d9f023ac`, `6569ab9190d883bc`, `b84cdfce7b2dcc1e`, `cf5c1203d7f09fa0`) are branchy enough that a phi gathered thousands of sets (150 phis, 3,520 sets on one after 32,768 steps) and the translation never finished. Once the root-view and descriptor changes of late November let these shaders get that far, the world frame's pipeline of vertex `fd0cfdb9141c858c` and pixel `b84cdfce7b2dcc1e` stopped every run: the thread making it waited on the translation under the title lock, nothing else logged but the audio thread, and the title's watchdog fired 30 s later (+120-133 s, warm or cold). Now a phi walked with 64 sets (`MAX_PATHS`) is walked once more knowing nothing, which covers every later set; knowing less only keeps more edges live (a refusal at worst, never wrong code), as the existing rule of four conditions already does. Over the 12,279 containers one run translated (dumped to a scratch folder, translated offline by the `guess` example, arm64 release), the six now finish in 2 s each (two translate, four are refused for a lane mask read as data) and the other 12,273 give byte-identical results; the slowest translation is a compute shader of 10-11 s, before and after. Test: `emit::lower::tests::liveness_through_joins_of_many_conditions_ends` (six joins of twelve branches each: 0.02 s, 80 s without the bound).
 
+## SGPR spills as scalar registers
+
+The console compiler spills SGPRs it runs short of to the lanes of VGPRs that nothing else
+touches (`v_writelane_b32 vN, sX, k` and `v_readlane_b32 sY, vN, k`), and on different paths it
+parks different values in the same lane. As lanes of one vector value, no join can tell those
+apart: `structure`'s `restored` and `Lower::spill_slot` follow a lane back to one value, or a phi
+of the spilled SGPRs, but a mask spilled on two paths came back as an untracked value ("a lane
+mask holding lanes elsewhere read as data: a program input", "a lane-mask join of an untracked
+mask: ..."). `ir::build` now makes each lane of such a VGPR a scalar register of its own (a spill
+slot, codes from `ir::SPILL_SLOTS` = 128 up; `ir::spill_slots`): the spill becomes
+`s_mov_b32 slot, sX` and the read back `s_mov_b32 sY, slot`, so SSA joins the spilled values
+like any other SGPR's, and the mask analyses follow them as copies. Only VGPRs every access to
+which is a spill or read back of a constant lane qualify, and only if every lane read back is
+written by some spill (a lane read with no spill holds the VGPR's own data, an input say); up to
+128 slots, VGPR by VGPR. A slot read before any spill on some path reads 0, as an unset VGPR does
+(`Lower::inputs`, `mask_number`). The pixel prim-mask analysis (`io::PrimMaskUses`) follows the
+copies through slots. Measured on the world's deferred-light programs (wave32, 32 threads, two
+or three spill VGPRs of 58 to 72 lanes in all): see "Lockstep for one wave32 wave" below for
+the totals with the other changes of 28 November. Test:
+`structure::tests::a_mask_spilled_to_a_vgpr_lane_comes_back_as_itself` (now through a slot).
+
 ## Lockstep: refused one-wave compute on a 32-lane host
 
 The fast translation runs a program as one lane does (`structure`, decision 0003): a branch on EXEC is a branch on the lane's own bit. On a 32-lane host a console wave of 64 lanes is two host waves, and a cross-lane operation reaching across them (`lower/halves.rs`) needs both at a group barrier, which lanes that went separate ways never reach together; each such shape needed its own proof, and the rest were refused ("a cross-lane operation between host waves in divergent code", "LDS shared in a wave the host splits, in divergent code" and others).
@@ -685,6 +706,41 @@ A wave64 compute program refused that way whose group is one console wave (64 th
 `VICTORY_NO_LOCKSTEP=1` turns the fallback off (refusals as before), to compare. Tests (`victory-gpu`, Metal): `split_wave_tests::a_lane_read_behind_an_exec_branch_runs_in_lockstep`, `a_first_lane_read_in_lockstep_is_the_console_waves_first_lane`, `a_per_lane_loop_shares_lds_across_the_halves_in_lockstep`, `a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep`, `whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep`; no GPU: `gfx_refusal_tests::a_lane_read_behind_an_exec_branch_translates_in_lockstep`, `lockstep::tests::a_branch_on_a_waterfall_read_would_split_the_halves_and_is_refused`.
 
 Measured offline (27 November) on the 1,765 compute containers the HDR and prologue runs dumped as refused (Series S, `wave32_host` and `zero_copy_memory` as the game translates): main translates 189 of them today; with lockstep 285 (96 more, all wave64 groups of 64 threads or fewer; none of the 189 changes, since lockstep runs only after a refusal). Of the 96, 35 were refused for a cross-lane operation or LDS after the split, 34 for lane-mask joins "on the host's lanes" or "at a join of several edges" (every join is uniform in lockstep) and 27 for whole-wave code the section simulation did not follow (run literally in lockstep). What lockstep still refuses in that class (188): lane masks as data it cannot express, "a lane-mask join of an untracked mask: a value the translation could not make" (53) and "a lane mask holding lanes elsewhere read as data: a scalar operation not modelled" (51), both from masks still being per-lane booleans in the structuriser; then "a hardware SGPR input" (15), others under 8 each. Not run this way: 74 refused programs whose group is several console waves (64 not for a descriptor), and 93 wave32 programs (one host wave each, no split; their refusals are lane-mask joins and descriptors).
+
+### Lockstep for one wave32 wave
+
+A wave32 compute program whose group is one console wave (32 threads or fewer) runs in lockstep
+too (`lockstep::fits`, 28 November): there the console wave is exactly one host wave, so ballots
+and lane reads need no exchange, and every branch on a mask, being a test of the ballot, is the
+same in all of the group's threads. `lockstep::branches` makes a wave32 program's EXEC and VCC
+branches `s_cmp_{eq,lg}_u32 mask, 0`. In lockstep every thread runs every block, so EXEC joined
+at a block is the join of the EXEC masks coming in, not "the lanes that are here": a lane-mask
+join whose edge brings such an EXEC phi (a loop's back edge) takes it as `Atom::Phi` of it
+(`fill_phis`) where it was "a lane-mask join of an untracked mask: a value the translation could
+not make". This gives the console's own meaning to what the fast path, running each lane on its
+own path, has to refuse: SGPRs a wave writes on one side of a divergent branch hold the same
+number in every lane after the join, here as on the console.
+
+The world's deferred-light programs are such groups: 200 of the 236 compute programs one world
+frame (run 54) refused are wave32 with 32 threads (`[32, 1, 1]`), and they dropped some 470 of
+the frame's dispatches (the passes into its 1280x720 lighting targets, about 80 programs run 1 to
+11 times each). With this, the spill slots and the descriptor dwords above, 146 of the 236
+translate offline (with the game's options, `wave32_host` and `zero_copy_memory`); they ran 343
+of the frame's dropped dispatches. Lockstep translations of these programs take up to 78 s each
+(eight at once on an M2 Max), after the fast path's refusal: the warm-up's cache takes them off
+the game's path. Left refused, by count: "a lane-mask join of an untracked mask: a value the
+translation could not make" 48, "a cross-lane operation between host waves in divergent code"
+12, then six reasons of 2 to 6 each. Tests: `gfx_refusal_tests::a_join_of_copies_of_two_values_stays_refused`
+(refused in a group of two waves, translated in lockstep in a group of one).
+
+A lockstep program's masks are console numbers (`console_lanes`, wave32 too), and a lane-mask
+join reads data joined into it as the mask's number (`fill_phis`). Such data was not counted as
+read (`live_edges` started only from instructions' reads), so the join under it took the edge as
+dead and joined 0: a loop copying another mask into VCC on one arm (`s_mov_b64 vcc, s[22:23]`)
+lost every lane after its first pass, in wave64 lockstep as well. `live_edges` now starts from
+the data phis mask joins take too. Test:
+`split_wave_tests::a_mask_copied_back_in_a_lockstep_loop_holds_its_lanes_on_every_pass` (wave64
+and wave32, on the GPU).
 
 ### If-conversion for groups of several console waves (#376, design note)
 
@@ -1936,7 +1992,21 @@ the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of
 every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
 for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
 (the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
-read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+read as null); buffer dwords 2-3, which no host table holds.
+
+Image dwords 5 to 7 (array pitch, metadata address, compression) now read 0 (`descriptor_data`,
+shortcut, 28 November), and so does any descriptor dword read as data where it meets other values
+at a join (`descriptor_bits`: the reasons above, "a descriptor read only as data" and "a constant
+buffer's descriptor read as data"), in a data join and in a lane-mask join. No HLSL reads
+descriptor bits; the reads the console compiler makes of them (sizes, raw views of a buffer) sit
+on the path of the load, so a dword that reaches a join is a register the compiler reused. The
+world's deferred-light programs (wave32, 32 threads, about 120 KB each) park live SGPRs in
+descriptor registers and copy them back around each `image_sample`, and load a light record with
+`s_buffer_load_dwordx8` into registers the same code uses as an image descriptor on another
+path: in `0e117205dde09753` `vcc_hi` is tested (`s_bitcmp0_b32 vcc_hi, 20`) after a join with
+dwords left from earlier descriptor loads, on an edge a flag set to 0 keeps from reaching the
+test, which `dead_on_edge` does not follow that far. Wrong only if a program did read a
+descriptor dword past a join (it would read 0 there).
 
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 

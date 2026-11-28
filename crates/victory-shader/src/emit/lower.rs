@@ -676,6 +676,17 @@ const ATOMIC_SUB: u32 = u32::MAX - 1;
 /// Integer operations whose clamp bit `Lower::integer` follows (unsigned saturation).
 const SATURATING: [&str; 3] = ["v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32"];
 
+/// Whether a value the translation could not make is a descriptor's dwords read as data
+/// ([`Lower::descriptor_data`]). Where one meets other values at a join it is left over from the
+/// compiler's reuse of the register, so the join takes it as 0: no HLSL reads descriptor bits, and
+/// the reads the compiler makes of them (sizes, raw views of a buffer) sit on the load's own path.
+// shortcut: a descriptor dword the code did read past a join would read 0 there.
+fn descriptor_bits(why: Why) -> bool {
+    why.starts_with("a descriptor's address or format read as data")
+        || why == "a descriptor read only as data"
+        || why == "a constant buffer's descriptor read as data"
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -972,7 +983,10 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            // Lockstep: masks are the console's numbers (`lockstep.rs`), each lane testing its
+            // own bit of EXEC.
             console_lanes = console
+                || x.st.lockstep
                 || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("ds_swizzle")
@@ -2200,6 +2214,9 @@ impl<'a> Lower<'a> {
                     None if n == crate::ir::M0 && self.x.native.stage == HwStage::Cs => {
                         Val::I32(self.s.m.i32(0))
                     }
+                    // A spill slot read before any spill: its VGPR lane, which reads zero as
+                    // registers no one set do (below).
+                    None if n >= crate::ir::SPILL_SLOTS => Val::I32(self.s.m.i32(0)),
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -2880,6 +2897,11 @@ impl<'a> Lower<'a> {
                 .any(|a| !self.x.st.masks.contains_key(a))
         {
             return Err("a register joining a lane mask and data, read as data");
+        }
+        // A spill slot read before any spill (its VGPR lane on entry, see `inputs`): zero.
+        if p.inputs.iter().any(|&(r, v)| v == lo && matches!(r, Reg::S(c) if c >= crate::ir::SPILL_SLOTS)) {
+            let z = self.s.m.i32(0);
+            return Ok((z, z));
         }
         let &b = self.def_block.get(&lo).ok_or(INPUT)?;
         let inst = p.blocks[b]
@@ -6637,8 +6659,6 @@ impl<'a> Lower<'a> {
             "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
         const IMAGE_ADDRESS: Why =
             "a descriptor's address or format read as data: an image's base address (dword 0)";
-        const IMAGE_REST: Why =
-            "a descriptor's address or format read as data: an image's dwords 5 to 7";
         const OUTSIDE: Why =
             "a descriptor's address or format read as data: a dword outside the descriptor";
         let Fields::Smem {
@@ -6812,13 +6832,20 @@ impl<'a> Lower<'a> {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                // shortcut: an image's dwords 5 to 7 (array pitch, metadata address and
+                // compression) read 0. The console compiler parks live values in descriptor
+                // registers and copies them back, so these dwords reach joins and copies on
+                // paths that never use them; no host view has them.
+                None if image.is_some() && (5..=7).contains(&rel) => {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::S(code + k as u8), zero, None);
+                }
                 None => {
                     let why = match (image.is_some(), rel) {
                         (false, 0) => BUFFER_ADDRESS,
                         (false, 1) => BUFFER_DWORD1,
                         (false, 3) => BUFFER_FORMAT,
                         (true, 0) => IMAGE_ADDRESS,
-                        (true, 5..=7) => IMAGE_REST,
                         _ => OUTSIDE,
                     };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
@@ -15269,6 +15296,19 @@ impl<'a> Lower<'a> {
         let (p, st) = (self.x.p, &self.x.st);
         let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        // A lane-mask join reads data joined into it as the mask's number with console lanes
+        // (`fill_phis`: a lockstep loop's mask copied back from another register on one arm).
+        if self.console_lanes {
+            for block in &p.blocks {
+                for phi in block.phis.iter().filter(|f| st.masks.contains_key(&f.value)) {
+                    for &a in &phi.args {
+                        if self.phi_at.contains_key(&a) && !st.masks.contains_key(&a) {
+                            work.push((a, Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
         let mut live = Set::default();
         let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
         while let Some((v, known)) = work.pop() {
@@ -15546,6 +15586,10 @@ impl<'a> Lower<'a> {
                     {
                         x
                     }
+                    // Descriptor bits joined with other values: the compiler's register reuse.
+                    (Some(Val::Missing(why)), false) if read && descriptor_bits(why) => {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Missing(why)), _) if read => {
                         retry.push((phi.value, why));
                         continue 'phi;
@@ -15637,6 +15681,17 @@ impl<'a> Lower<'a> {
                 };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // In lockstep every thread runs every block, so EXEC joined at a block
+                    // (here coming in on this edge, a loop's back edge say) is the join of the
+                    // EXEC masks coming in, not "the lanes that are here".
+                    (None, _)
+                        if self.x.st.lockstep
+                            && self.phi_at.get(&arg).is_some_and(|&(ab, ai)| {
+                                p.blocks[ab].phis[ai].reg == Reg::S(EXEC)
+                            }) =>
+                    {
+                        self.atom(Atom::Phi(arg), qb).map_err(|w| unsupported(offset, w))?
+                    }
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
                     // but by joins that do not need it: any bit will do, so what the edge brings
                     // (data, or a value not made) is not needed, not even as a number.
@@ -15694,6 +15749,8 @@ impl<'a> Lower<'a> {
                         return Err(unsupported(offset, HOST_LANES));
                     }
                     (None, Some(Val::I32(_))) => return Err(unsupported(offset, DIVERGENT)),
+                    // Descriptor bits joined with a mask: the compiler's register reuse.
+                    (None, Some(&Val::Missing(why))) if descriptor_bits(why) => self.s.m.bool(false),
                     (None, Some(Val::Missing(_))) => return Err(unsupported(offset, MISSING)),
                     (None, Some(Val::Bit(_))) => return Err(unsupported(offset, BIT)),
                     (None, None) => return Err(unsupported(offset, NONE)),

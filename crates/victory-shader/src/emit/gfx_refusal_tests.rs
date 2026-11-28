@@ -52,7 +52,8 @@ fn packed_fmac_takes_constant_operands() {
 /// Joins of values with no DXIL form are all found by one lowering pass, however many there are:
 /// a pass for each made pixel shaders with some hundreds of them take 40 s instead of 0.2 s.
 /// Here a branch's arm copies a descriptor's dword (nothing the host has) to 32 SGPRs, each
-/// joined after it with what it held on entry and copied to a VGPR nothing reads.
+/// joined after it with what it held on entry and copied to a VGPR nothing reads. (Such a join
+/// now takes the dword as 0, `descriptor_bits`, so no pass is made again at all.)
 #[test]
 fn joins_without_a_value_are_found_in_one_pass() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -78,7 +79,7 @@ fn joins_without_a_value_are_found_in_one_pass() {
     };
     for joins in [1, 32] {
         translate_with(&program(joins), Options::default()).unwrap();
-        assert_eq!(lower::PASSES.get(), 2, "{joins} joins");
+        assert!(lower::PASSES.get() <= 2, "{joins} joins: {} passes", lower::PASSES.get());
     }
 }
 
@@ -3521,14 +3522,19 @@ fn a_join_of_swapped_copies_of_one_value_is_that_value() {
 }
 
 /// [`SWAPPED_COPIES`] with `s21` set to 8 before the branch: the edges bring 8 and 7, so what the
-/// register holds after the join depends on the path the wave ran last, and it stays refused.
+/// register holds after the join depends on the path the wave ran last, and it stays refused in a
+/// group of two waves. A group of one wave32 wave runs in lockstep instead (`lockstep.rs`), where
+/// every thread runs the arm the wave does and the join is uniform.
 #[test]
 fn a_join_of_copies_of_two_values_stays_refused() {
     let w: Vec<u32> =
         SWAPPED_COPIES.iter().map(|&x| if x == 0xBE95_0314 { 0xBE95_0388 } else { x }).collect();
     assert_ne!(w, SWAPPED_COPIES);
-    let err = emit_cs(&w, 32, false, false, false).err().map(|e| e.to_string()).unwrap_or_default();
+    let err = emit_cs(&w, 64, false, false, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("a lane mask read as data"), "{err:?}");
+    if let Err(e) = emit_cs(&w, 32, false, false, true) {
+        panic!("{e}");
+    }
 }
 
 /// [`SKIP`] with the skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1` and the region

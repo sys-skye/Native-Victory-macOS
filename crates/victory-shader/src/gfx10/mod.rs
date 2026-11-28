@@ -69,6 +69,21 @@ impl Instruction {
     pub fn name(&self) -> Option<&'static str> {
         self.name
     }
+
+    /// An `s_mov_b32` standing in for `self` at its offset and length; its operands are in the
+    /// [`Fields`] the caller gives it, not in its words (`ir`'s spill slots name registers no
+    /// encoding has).
+    pub(crate) fn as_scalar_move(&self) -> Instruction {
+        let mut words = vec![0; self.words.len()];
+        words[0] = 0xBE80_0300;
+        Instruction {
+            offset: self.offset,
+            encoding: Encoding::Sop1,
+            opcode: 0x003,
+            words,
+            name: Some("s_mov_b32"),
+        }
+    }
 }
 
 /// Decodes every instruction reachable from offset 0, sorted by offset.

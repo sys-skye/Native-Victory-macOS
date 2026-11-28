@@ -23,7 +23,8 @@ use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
-/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
+/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC; from
+/// [`SPILL_SLOTS`] up, a VGPR lane SGPRs are spilled to (see [`spill_slots`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     S(u8),
@@ -195,6 +196,20 @@ pub fn build_bounded(
         .is_ok_and(|v| v.starts_with("nanpc:") && v.ends_with(":math"));
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
+    let mut list = list;
+    let mut decoded: Vec<Fields> = list.iter().map(|m| m.fields(wave64)).collect();
+    let effects_of = |m: &Instruction, f: &Fields| {
+        let name = m.name().ok_or(ShaderError::Unsupported {
+            offset: m.offset,
+            what: "unknown opcode",
+        })?;
+        effects(m, f, name, lanes, vgprs, m0_max.get(&m.offset).copied())
+    };
+    let mut found: Vec<_> = list.iter().zip(&decoded).map(|(m, f)| effects_of(m, f)).collect();
+    for i in spill_slots(&list, &mut decoded, &found) {
+        list[i] = list[i].as_scalar_move();
+        found[i] = effects_of(&list[i], &decoded[i]);
+    }
 
     let mut flows = Vec::with_capacity(list.len());
     let mut leaders = vec![0];
@@ -233,13 +248,13 @@ pub fn build_bounded(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
+    let each = list.into_iter().zip(decoded).zip(found);
+    for ((((machine, fields), found), flow), next) in each.zip(flows).zip(next_offsets) {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let fields = machine.fields(wave64);
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
         // and contributes one edge to the join. Calls also use Flow::Branch
@@ -263,8 +278,7 @@ pub fn build_bounded(
                 Flow::Stop => Exit::End,
             };
         }
-        let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((mut reads, mut writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+        if let Some((mut reads, mut writes)) = found? {
             if let Some(r) = &probe {
                 let inside = r.contains(&machine.offset);
                 let loads_only = born || math && !nan_maker(name);
@@ -430,12 +444,13 @@ fn nan_probe_effects(
 
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+const REGS: usize = 128 + 1 + 256 + 128;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
     match reg {
-        Reg::S(c) => usize::from(c),
+        Reg::S(c) if c < SPILL_SLOTS => usize::from(c),
+        Reg::S(c) => 129 + 256 + usize::from(c - SPILL_SLOTS),
         Reg::Scc => 128,
         Reg::V(r) => 129 + usize::from(r),
     }
@@ -445,8 +460,106 @@ fn reg_at(i: usize) -> Reg {
     match i {
         0..128 => Reg::S(i as u8),
         128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        129..385 => Reg::V((i - 129) as u8),
+        _ => Reg::S((i - 385) as u8 + SPILL_SLOTS),
     }
+}
+
+/// The first scalar code of a spill slot: codes from here to 255 name the VGPR lanes
+/// [`spill_slots`] turns into scalar registers.
+pub const SPILL_SLOTS: u8 = 128;
+
+/// The instructions of `list` that only spill SGPRs to VGPR lanes and read them back
+/// (`v_writelane_b32` / `v_readlane_b32` of a constant lane), with `fields` changed to the
+/// `s_mov_b32` from or to a scalar register of their own for each lane (a spill slot, from
+/// [`SPILL_SLOTS`]): the console compiler parks SGPRs it runs short of in the lanes of VGPRs
+/// nothing else touches, and parks different values on different paths, which as lanes of one
+/// vector value no join can tell apart; as scalar registers they join like any other. Only
+/// VGPRs every access to which is such a spill or restore, of lanes some spill writes; up to 128
+/// slots, by VGPR.
+fn spill_slots(
+    list: &[Instruction],
+    fields: &mut [Fields],
+    found: &[Result<Option<Effects>, ShaderError>],
+) -> Vec<usize> {
+    let lane = |op: &Operand| crate::resource::lane_of(*op).filter(|&l| l < 64);
+    // The VGPR a constant-lane spill or restore keeps the lane in.
+    let slot_vgpr = |m: &Instruction, f: &Fields| {
+        let Fields::Valu(v) = f else { return None };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return None;
+        }
+        match (m.name()?, v.dst, &v.src[..]) {
+            ("v_writelane_b32", Some(Operand::Vector { reg, dwords: 1 }), &[_, ref at])
+            | ("v_readlane_b32", Some(Operand::Scalar { .. }), &[Operand::Vector { reg, .. }, ref at])
+                if lane(at).is_some() =>
+            {
+                Some((reg, lane(at)?))
+            }
+            _ => None,
+        }
+    };
+    // Per VGPR: 0 untouched, 1 only spills and restores, 2 anything else.
+    let mut kind = [0u8; 256];
+    // The lanes spilled to, and the lanes read back.
+    let mut lanes: Vec<Vec<u32>> = vec![Vec::new(); 256];
+    let mut read: Vec<Vec<u32>> = vec![Vec::new(); 256];
+    for ((m, f), e) in list.iter().zip(fields.iter()).zip(found) {
+        let Ok(Some((r, w))) = e else { continue };
+        let slot = slot_vgpr(m, f);
+        for &reg in r.iter().chain(w) {
+            if let Reg::V(n) = reg {
+                let n = usize::from(n);
+                kind[n] = match slot {
+                    Some((s, _)) if usize::from(s) == n && kind[n] != 2 => 1,
+                    _ => 2,
+                };
+            }
+        }
+        if let Some((s, l)) = slot {
+            let into = if m.name() == Some("v_writelane_b32") { &mut lanes } else { &mut read };
+            if !into[usize::from(s)].contains(&l) {
+                into[usize::from(s)].push(l);
+            }
+        }
+    }
+    // A lane read back that no spill writes holds the VGPR's own data (an input, say).
+    for n in 0..256 {
+        if read[n].iter().any(|l| !lanes[n].contains(l)) {
+            kind[n] = 2;
+        }
+    }
+    let mut code = HashMap::new();
+    let mut next = u16::from(SPILL_SLOTS);
+    for n in 0..256 {
+        if kind[n] != 1 || next + lanes[n].len() as u16 > 256 {
+            continue;
+        }
+        for &l in &lanes[n] {
+            code.insert((n as u8, l), next as u8);
+            next += 1;
+        }
+    }
+    let mut changed = Vec::new();
+    for (i, (m, f)) in list.iter().zip(fields.iter_mut()).enumerate() {
+        let Some(&slot) = slot_vgpr(m, f).and_then(|s| code.get(&s)) else {
+            continue;
+        };
+        let Fields::Valu(v) = f else { continue };
+        let scalar = Operand::Scalar { code: slot, dwords: 1 };
+        let (dst, src) = if m.name() == Some("v_writelane_b32") {
+            (scalar, v.src[0])
+        } else {
+            (v.dst.expect("a restore's SGPR"), scalar)
+        };
+        *f = Fields::Sop {
+            dst: Some(dst),
+            src: vec![src],
+            imm: None,
+        };
+        changed.push(i);
+    }
+    changed
 }
 
 fn insert(set: &mut RegSet, reg: Reg) {
@@ -459,16 +572,16 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
     set[i / 64] >> (i % 64) & 1 != 0
 }
 
-/// In [`Reg`] order, which is also index order.
+/// In index order ([`Reg`] order but for spill slots, which come last).
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     (0..REGS)
         .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
         .map(reg_at)
 }
 
-/// `outs` is sorted by register, and holds every register live out.
+/// `outs` is in index order, and holds every register live out.
 fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
-    outs.binary_search_by_key(&reg, |&(r, _)| r)
+    outs.binary_search_by_key(&index(reg), |&(r, _)| index(r))
         .map_or(NONE, |i| outs[i].1)
 }
 
@@ -1238,6 +1351,7 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
+        Operand::Scalar { code, dwords: 1 } if code >= SPILL_SLOTS => out.push(Reg::S(code)),
         Operand::Scalar { code, dwords } => {
             let end = u16::from(code) + u16::from(dwords);
             if end > 128 {
@@ -1321,6 +1435,65 @@ mod tests {
             assert_eq!(mov1.read(Reg::S(EXEC + 1)).is_some(), wave64);
             assert_eq!((end.name(), b2.exit), ("s_endpgm", Exit::End));
         }
+    }
+
+    #[test]
+    fn spilled_sgprs_join_through_a_spill_slot() {
+        // s3 on one path and s4 on the other spilled to lane 2 of v1, read back after the join:
+        // the lane is a scalar register of its own, joined by a phi like an SGPR.
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0003, // s_cbranch_scc1 -> other
+                0xD761_0001,
+                0x0001_0403, // v_writelane_b32 v1, s3, 2
+                0xBF82_0002, // s_branch -> join
+                0xD761_0001,
+                0x0001_0404, // other: v_writelane_b32 v1, s4, 2
+                0xD760_0005,
+                0x0001_0501, // join: v_readlane_b32 s5, v1, 2
+                0x7E00_0205, // v_mov_b32 v0, s5
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let slot = Reg::S(SPILL_SLOTS);
+        let join = p.blocks.last().unwrap();
+        let phi = join.phis.iter().find(|f| f.reg == slot).expect("a phi of the slot");
+        let mut spills: Vec<Value> = p.blocks[..p.blocks.len() - 1]
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "s_mov_b32")
+            .map(|i| i.write(slot).unwrap())
+            .collect();
+        let mut args = phi.args.clone();
+        spills.sort();
+        args.sort();
+        assert_eq!((spills.len(), args), (2, spills));
+        let back = &join.insts[0];
+        assert_eq!(back.name(), "s_mov_b32");
+        assert_eq!(back.read(slot), Some(phi.value));
+        assert_eq!(join.insts[1].read(Reg::S(5)), back.write(Reg::S(5)));
+        assert!(join.phis.iter().all(|f| f.reg != Reg::V(1)));
+    }
+
+    #[test]
+    fn a_lane_read_without_a_spill_stays_a_lane() {
+        // Lane 5 of v1 is read but only lane 2 written: v1 holds data of its own, no slot.
+        let p = build_words(
+            &[
+                0xD761_0001,
+                0x0001_0403, // v_writelane_b32 v1, s3, 2
+                0xD760_0005,
+                0x0001_0B01, // v_readlane_b32 s5, v1, 5
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let insts = &p.blocks[0].insts;
+        assert_eq!(insts[0].name(), "v_writelane_b32");
+        assert_eq!(insts[1].name(), "v_readlane_b32");
+        assert_eq!(insts[1].read(Reg::V(1)), insts[0].write(Reg::V(1)));
     }
 
     #[test]

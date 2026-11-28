@@ -1708,7 +1708,9 @@ mod pieces_tests {
                 0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
                 0xBF81_0000, // s_endpgm
             ]);
-            container_of(&code, &[uav])
+            // Two console waves a group: a group of one runs in lockstep, whole-wave code
+            // literally.
+            test_compute_container_of(&code, &[uav], 5, 64, false)
         };
         let prefix = "a whole-wave section step the simulation does not follow: ";
         for (step, why) in [

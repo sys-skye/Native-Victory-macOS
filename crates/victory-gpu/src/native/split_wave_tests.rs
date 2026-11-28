@@ -1372,9 +1372,10 @@ fn a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a
     w.push(S_ENDPGM);
     assert_eq!(refusal32(&w), None);
     // Look-alike: a third XOR with another pair is no swap; `s8` is the mask XORed with data.
+    // Refused in a group of two waves (a group of one runs in lockstep, as the console does).
     let mut other = swapped_mask(0x8988_0208).to_vec(); // s_xor_b64 s[8:9], s[8:9], s[2:3]
     other.push(S_ENDPGM);
-    let why = refusal32(&other);
+    let why = try_translate_wave(&other, 5, 0, 64, false, shaders::options()).err().map(|e| e.to_string());
     assert!(why.as_ref().is_some_and(|r| r.contains("at a join of several edges")), "{why:?}");
     let got = run32(&w, 0);
     if got.is_empty() {
@@ -2106,4 +2107,74 @@ fn float_edge_cases_come_out_as_the_hardware_gives_them() {
         0, 0, 0x7FC0_0000, 0, // legacy inf x 0, rcp inf, rsq -1 x 1e6, sqrt 0
     ];
     assert_eq!(got[..24], want, "{:x?}", &got[..24]);
+}
+
+#[test]
+fn a_mask_copied_back_in_a_lockstep_loop_holds_its_lanes_on_every_pass() {
+    // As `a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with`, with the
+    // lane read behind the branch that makes a wave64 group of one wave run in lockstep. The
+    // latch's VCC is data (the mask of the lanes below 10, or the loop's own on the skip edge)
+    // that the header's mask join reads as its number: it was taken as never read and joined as
+    // 0, so no lane counted after the first pass.
+    let w64 = [
+        0xD4C4_0016, 0x0002_008A, // v_cmp_gt_u32 s[22:23], 10, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        // loop:
+        0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+        0xBF88_0005, // s_cbranch_execz skip
+        0xBE94_046A, // s_mov_b64 s[20:21], vcc
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xD760_0012, 0x0001_4700, // v_readlane_b32 s18, v0, 35
+        0xBEEA_0416, // s_mov_b64 vcc, s[22:23]
+        // skip:
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06C0, // v_cmpx_gt_u32 64, v3
+        0xBF89_FFF5, // s_cbranch_execnz loop
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    // The fast path refuses it (a mask joined with data at a join of several edges).
+    assert!(refusal(&w64).is_some());
+    let got = run_lockstep(&w64, 0, 64);
+    if !got.is_empty() {
+        assert_eq!(got[..8], [8; 8]);
+        assert_eq!(got[8..10], [7; 2]);
+        assert_eq!(got[10..20], [1; 10]);
+        assert_eq!(got[20..], [0; 44]);
+    }
+    // The wave32 program in a group of one wave: lockstep, ballots on the one host wave.
+    let w32 = [
+        0xD4C4_0015, 0x0002_008A, // v_cmp_gt_u32 s21, 10, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_037E, // s_mov_b32 s10, exec_lo
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        // loop:
+        0xBE90_3C6A, // s_and_saveexec_b32 s16, vcc_lo
+        0xBF88_0002, // s_cbranch_execz skip
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xBEEA_0315, // s_mov_b32 vcc_lo, s21
+        // skip:
+        0xBEFE_0310, // s_mov_b32 exec_lo, s16
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+        0xBF89_FFF8, // s_cbranch_execnz loop
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run32(&w32, 0);
+    if !got.is_empty() {
+        assert_eq!(got[..8], [4; 8]);
+        assert_eq!(got[8..10], [3; 2]);
+        assert_eq!(got[10..20], [1; 10]);
+        assert_eq!(got[20..], [0; 12]);
+    }
 }
