@@ -26,10 +26,10 @@ const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F;
 /// Pool offset of `dst`, at `VA_A + 0x4_0000`.
 const DST: usize = 0x6_0000;
 
-/// What the fast path refuses `words` for (five user SGPRs, two wave64 waves a group, which
-/// lockstep does not take).
+/// What the fast path refuses `words` for (five user SGPRs, five wave64 waves a group, more
+/// than lockstep takes).
 fn refusal(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 128, true, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 320, true, shaders::options()).err().map(|e| e.to_string())
 }
 
 /// [`refusal`] of a program of 32-lane waves, one a group.
@@ -1103,6 +1103,108 @@ fn a_per_lane_loop_shares_lds_across_the_halves_in_lockstep() {
         for (&i, r) in on.iter().zip(read) {
             acc[i] += r;
             lds[i] = acc[i];
+        }
+    }
+    assert_eq!(got, acc);
+}
+
+/// Trips of thread `i` of a group of two wave64 waves in the tests below: the upper console
+/// wave loops two more times than the lower.
+fn trips(i: usize) -> usize {
+    2 * (i >> 6) + (i & 1) + 1
+}
+
+#[test]
+fn a_lane_read_in_per_lane_loops_of_two_console_waves_meets_its_own_halves() {
+    // A group of two console waves. Lane i of wave w loops `trips(i)` times, adding lane 35's
+    // `v3` (1000 + 64w + 35) each trip: refused on the fast path (the halves split), run in
+    // lockstep, where wave 1 makes two more lane reads than wave 0, so no group barrier fits.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x2C08_0086, // v_lshrrev_b32 v4, 6, v0
+        0x3408_0881, // v_lshlrev_b32 v4, 1, v4
+        0x360C_0081, // v_and_b32 v6, 1, v0
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        skip_execz(5),
+        0xD760_0008,
+        0x0001_4703, // v_readlane_b32 s8, v3, 35
+        0x4A0A_0A08, // v_add_nc_u32 v5, s8, v5
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xBF82_FFF8, // s_branch loop
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run_io(&w, 0, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    let want: Vec<u32> = (0..128).map(|i| (trips(i) * (1035 + 64 * (i >> 6))) as u32).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves() {
+    // `a_per_lane_loop_shares_lds_across_the_halves_in_lockstep` in a group of two console
+    // waves, lane i looping `i & 3` times and wave 1 two more, also adding lane 35's sum each
+    // trip (a lane read: refused on the fast path): each wave's halves meet around their LDS
+    // writes and lane reads, a different number of times in each wave.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x3A06_02FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v1: lane i ^ 32's slot
+        0x3608_0083, // v_and_b32 v4, 3, v0
+        0x2C0C_0086, // v_lshrrev_b32 v6, 6, v0
+        0x340C_0C81, // v_lshlrev_b32 v6, 1, v6
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0x7E0A_0300, // v_mov_b32 v5, v0
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        skip_execz(11),
+        0xD760_0008,
+        0x0001_4705, // v_readlane_b32 s8, v5, 35
+        DS_READ_V2_AT_V3[0],
+        DS_READ_V2_AT_V3[1],
+        S_WAITCNT_LGKM,
+        0x4A0A_0505, // v_add_nc_u32 v5, v5, v2
+        0x4A0A_0A08, // v_add_nc_u32 v5, s8, v5
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xBF82_FFF2, // s_branch loop
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run_io(&w, 1 << 15, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    // The console, each wave on its own: each trip, the wave reads lane 35's sum, every lane
+    // still looping reads LDS, then each writes.
+    let (mut acc, mut lds): (Vec<u32>, Vec<u32>) = ((0..128).collect(), (0..128).collect());
+    let n = |i: usize| (i & 3) + 2 * (i >> 6);
+    for trip in 0..5 {
+        for wave in 0..2 {
+            let on: Vec<usize> = (64 * wave..64 * wave + 64).filter(|&i| n(i) > trip).collect();
+            let lane35 = acc[64 * wave + 35];
+            let read: Vec<u32> = on.iter().map(|&i| lds[i ^ 32]).collect();
+            for (&i, r) in on.iter().zip(read) {
+                acc[i] += r + lane35;
+                lds[i] = acc[i];
+            }
         }
     }
     assert_eq!(got, acc);

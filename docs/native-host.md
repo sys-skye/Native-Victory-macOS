@@ -782,6 +782,46 @@ without them refuses on a lane-mask join or a phi that does not settle (`lower_g
 first try is the lowering as before. Over the 236 frame compute programs (`refused` example),
 190 translate (was 181), and none that translated regress.
 
+### Lockstep for groups of several console waves (pair syncs)
+
+Lockstep (`lockstep.rs`) now also takes wave64 groups of up to `lockstep::MAX_WAVES` (4) console
+waves. Before, these were refused with "a cross-lane operation between host waves in divergent
+code": 12 of the frame's compute programs, in groups of 128 to 256 threads, the shape of tiled
+lighting (8x16 and 16x16).
+
+- Each console wave's branches are its own numbers, so the group's threads split up by console
+  wave. A console wave's two host waves still run the same blocks, in the same order.
+- Where one console wave's halves met at a group barrier, they now meet each other alone
+  (`Lower::pair_sync`, `lower/halves.rs`). This covers the exchange around ballots, lane reads and
+  reductions, and the barriers around each LDS write.
+- Each host wave keeps a group-shared counter after the exchange slots. At each sync it adds one
+  and waits until its other half's counter reaches its own. Group-shared fences order the
+  exchange's stores and loads around the sync.
+- The counters are cleared at the entry under one group barrier, where every thread is.
+- A missing upper half (the group's lanes not a multiple of 64) is not waited for.
+- Waiting stops after 2^18 reads in any case. A sync the other half never reached would give
+  wrong values, not a GPU that never finishes.
+- The spin loop splits the DXIL block it is in (`bitcode::Module::split`): code added to the block
+  later, its terminator, and phi edges from it go to the block after the loop. Exchanges are also
+  emitted into earlier blocks (a ballot where its mask was made), so each is resolved there.
+- The title's own `s_barrier`s stay group barriers. In lockstep one console wave may skip a block
+  another runs, and a group barrier that only some threads reach could hang the GPU. On the
+  console, the barrier waits only for waves that have not ended. So a barrier must sit in a
+  block every lane runs exactly once (`once_blocks`), or the program is refused with "a barrier in
+  lockstep in a block one console wave may skip".
+
+Tests (`victory-gpu`, Metal), in `split_wave_tests`:
+
+- `a_lane_read_in_per_lane_loops_of_two_console_waves_meets_its_own_halves`
+- `lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves`
+
+In both, wave 1 makes more trips (and so more syncs) than wave 0. Both are refused without the
+change. The fast path's refusal tests now use groups of five console waves, more than lockstep
+takes.
+
+Of the 12 programs, 9 translate. Two keep a barrier in a block a console wave may skip, and one is
+refused for its `ds_append`.
+
 ### If-conversion for groups of several console waves (#376, design note)
 
 Lockstep makes control flow uniform across the group because the group is one console wave: the wave's ballot is the same number in every thread, so a branch on it is taken by all or none. A group of W console waves has W different ballots, so one program counter cannot follow them; making the group's control flow uniform means removing the branches, not testing them differently. Proposed shape (a predication pass, not an extension of `structure::lockstep` — the single-wave ballot trick is what lockstep *is*, and multi-wave branches have no group-wide scalar to branch on):

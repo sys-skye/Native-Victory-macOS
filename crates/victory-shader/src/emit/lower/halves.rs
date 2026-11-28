@@ -48,17 +48,90 @@
 //! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
 
 impl Lower<'_> {
-    /// A group barrier with a shared-memory fence in DXIL block `at`.
+    /// A group barrier with a shared-memory fence in DXIL block `at`; in a lockstep group of
+    /// several console waves, the meeting of the console wave's two host waves
+    /// ([`Self::pair_sync`]).
     pub(super) fn xchg_barrier(&mut self, at: usize) {
+        if self.pair_sync {
+            self.pair_sync(at);
+            return;
+        }
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// A pair sync's counter of host wave `half` (32 threads): after the exchange slots.
+    fn pair_counter(&mut self, at: usize, half: V) -> V {
+        let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        let base = self.s.m.i32(lanes.next_multiple_of(64));
+        let i = self.s.m.bin(at, Bin::Add, base, half);
+        self.xchg_slot(at, i)
+    }
+
+    /// The pair syncs' counters start at 0, before any thread meets its other half: every thread
+    /// clears its host wave's, and the group meets once (every thread is at the entry).
+    pub(super) fn pair_sync_start(&mut self) {
+        let at = self.s.entry;
+        let f = self.console_flat();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, f, five);
+        let own = self.pair_counter(at, half);
+        let z = self.s.m.i32(0);
+        self.s.m.store(at, own, z);
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// Lockstep in a group of several console waves (`lockstep.rs`): the two host waves of the
+    /// thread's console wave meet, in DXIL block `at` (whose code goes on after the meeting), as
+    /// a group barrier would bring them together; other console waves go their own ways, so no
+    /// group barrier could be placed. Both host waves run the same blocks (every branch is on the
+    /// console wave's numbers), so they meet at the same syncs in the same order: each host wave
+    /// counts its syncs in its group-shared counter and waits for the other's to reach its own.
+    /// Group-shared fences order the exchange's stores and loads around the meeting. A missing
+    /// upper half (the group's lanes are not a multiple of 64) is not waited for. Waiting stops
+    /// after `PAIR_SPINS` reads in any case: a sync the other host wave never reaches gives
+    /// wrong values, never a GPU that does not finish.
+    pub(super) fn pair_sync(&mut self, at: usize) {
+        const PAIR_SPINS: u32 = 1 << 18;
+        let i32t = self.s.t.i32;
+        let void = self.s.t.void;
+        let f = self.console_flat();
+        let (five, one) = (self.s.m.i32(5), self.s.m.i32(1));
+        let half = self.s.m.bin(at, Bin::LShr, f, five);
+        let other = self.s.m.bin(at, Bin::Xor, half, one);
+        let own = self.pair_counter(at, half);
+        let theirs = self.pair_counter(at, other);
+        let k = self.s.m.load(at, own);
+        let k = self.s.m.bin(at, Bin::Add, k, one);
+        let fence = self.s.m.i32(8);
+        self.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.s.m.atomic(at, Rmw::Xchg, own, k);
+        let there = self.xchg_written(at, other, 5);
+        let (spin, done) = (self.s.m.new_block(), self.s.m.new_block());
+        let head = self.s.m.split(at, Term::Br(spin), done);
+        let n = self.s.m.phi(spin, i32t);
+        let z = self.s.m.i32(0);
+        let seen = self.s.m.atomic(spin, Rmw::Or, theirs, z);
+        let next = self.s.m.bin(spin, Bin::Add, n, one);
+        self.s.m.set_phi_at(n, vec![(z, head), (next, spin)]);
+        let behind = self.s.m.cmp(spin, pred::IULT, seen, k);
+        let limit = self.s.m.i32(PAIR_SPINS);
+        let more = self.s.m.cmp(spin, pred::IULT, next, limit);
+        let mut wait = self.s.m.bin(spin, Bin::And, behind, more);
+        if let Some(there) = there {
+            wait = self.s.m.bin(spin, Bin::And, wait, there);
+        }
+        self.s.m.terminate(spin, Term::CondBr(wait, spin, done));
+        self.s.op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
     }
 
     /// Whether every thread of the group (both halves of a console wave)

@@ -19,8 +19,12 @@
 //! `v_readfirstlane_b32` (the first lane of the wide EXEC). LDS gets a group barrier after each
 //! write, outside its guard.
 //!
-//! Only programs whose group is one console wave (64 lanes or fewer) run this way: in a group of
-//! several waves, one wave's branches are not the others'.
+//! In a group of several console waves (wave64, up to [`MAX_WAVES`]), one wave's branches are not
+//! the others', so the group's threads split up by console wave, and no group barrier can bring a
+//! console wave's two host waves together. Those two still run the same blocks, so they meet each
+//! other alone, through group-shared counters (`Lower::pair_sync`), at each exchange and around
+//! each LDS write; the title's own `s_barrier`s stay group barriers, which every console wave
+//! reaches as on the console.
 
 use super::{HostShader, Options, emit_fast};
 use crate::dxbc::Container;
@@ -32,19 +36,30 @@ use crate::structure::{self, Atom, LaneExit, Structured};
 use crate::ShaderError;
 use crate::resource::Resources;
 
+/// Console waves of a wave64 group run in lockstep at most (design note in `native-host.md`,
+/// "If-conversion for groups of several console waves": a bound to measure before raising).
+pub(crate) const MAX_WAVES: u32 = 4;
+
+/// A title barrier in a lockstep group of several console waves, in a block not every console wave
+/// reaches as often as the others.
+pub(crate) const WAVE_SKIPS_BARRIER: &str =
+    "a barrier in lockstep in a block one console wave may skip";
+
 /// A branch the lockstep structuriser could not make uniform.
 pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave run in lockstep";
 
 /// Whether a refused program may run in lockstep: compute on a 32-lane host whose group is one
 /// console wave (wave64: two host waves; wave32: one, which ballots and lane reads need no
-/// exchange for).
+/// exchange for), or a wave64 group of up to [`MAX_WAVES`] console waves, each wave's two host
+/// waves meeting each other alone (`Lower::pair_sync`).
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
     let StageIo::Cs(cs) = &native.io else { return false };
     let wave = if native.wave64 { 64 } else { 32 };
+    let lanes = cs.threads.iter().product::<u32>();
     options.wave32_host
         && native.stage == HwStage::Cs
         && !st.lockstep
-        && cs.threads.iter().product::<u32>() <= wave
+        && (lanes <= wave || native.wave64 && lanes <= MAX_WAVES * 64)
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
@@ -59,6 +74,21 @@ pub(super) fn retry(
     options: Options,
 ) -> Result<HostShader, ShaderError> {
     let q = branches(p);
+    // Several console waves: the title's own barriers are group barriers, which every thread
+    // must reach, but one console wave may skip a block another runs (where the console's barrier
+    // waits only for the waves that have not ended). Only blocks every lane runs exactly once may
+    // hold one.
+    let StageIo::Cs(cs) = &native.io else { unreachable!("lockstep runs compute") };
+    if cs.threads.iter().product::<u32>() > 64 {
+        let once = super::lower::once_blocks(&q);
+        let barrier = q.blocks.iter().enumerate().find_map(|(b, block)| {
+            let i = block.insts.iter().find(|i| i.name() == "s_barrier")?;
+            (!once[b]).then_some(i.machine.offset)
+        });
+        if let Some(offset) = barrier {
+            return Err(ShaderError::Unsupported { offset, what: WAVE_SKIPS_BARRIER });
+        }
+    }
     let st = structure::lockstep(&q)?;
     if let Some(offset) = divergent(&q, &st) {
         return Err(ShaderError::Unsupported { offset, what: NOT_UNIFORM });

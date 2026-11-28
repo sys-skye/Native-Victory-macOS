@@ -3277,10 +3277,12 @@ pub(crate) const ENTRY_VCC_AT_EXECZ_JOIN: &[u32] = &[
 ];
 
 #[test]
-fn divergent_readlane_in_a_two_wave_group_is_refused() {
+fn divergent_readlane_in_a_group_of_more_waves_than_lockstep_takes_is_refused() {
     // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;
-    // the second console wave skips the branch and cannot join a group-wide barrier.
-    let err = emit_wave64_cs(LOCKSTEP_READLANE, 128, false).err();
+    // the other console waves skip the branch and cannot join a group-wide barrier. In a group
+    // of up to `lockstep::MAX_WAVES` console waves the program runs in lockstep.
+    let threads = 64 * (super::lockstep::MAX_WAVES + 1);
+    let err = emit_wave64_cs(LOCKSTEP_READLANE, threads, false).err();
     assert!(
         matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
         "expected a divergent exchange refusal, got {err:?}",
@@ -3322,10 +3324,14 @@ fn a_branch_on_a_group_wide_flag_in_shared_memory_keeps_the_exchange() {
         panic!("{e}");
     }
     // A thread may write the dword before another has read it: each host wave's flag is its own.
+    // In lockstep each console wave's is, and a wave whose flag is clear skips the barrier.
     let err = emit_wave64_cs(&group_flag(&[0xD834_0000, 0x0000_0002]), 128, true).err(); // ds_write_b32 v2, v0
     assert!(
-        matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
-        "expected a divergent exchange refusal, got {err:?}",
+        matches!(
+            err,
+            Some(ShaderError::Unsupported { what: super::lockstep::WAVE_SKIPS_BARRIER, .. })
+        ),
+        "expected a skipped barrier refusal, got {err:?}",
     );
 }
 

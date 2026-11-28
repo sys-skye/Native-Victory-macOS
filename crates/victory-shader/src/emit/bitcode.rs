@@ -168,6 +168,9 @@ struct Block {
     phis: Vec<u32>,
     body: Vec<u32>,
     term: Option<Term>,
+    /// Where the block's code goes on after [`Module::split`]: what is added to the block, its
+    /// terminator and the edges leaving it are this one's.
+    next: Option<usize>,
 }
 
 /// Function attributes of a `dx.op` declaration.
@@ -395,7 +398,35 @@ impl Module {
         }
     }
 
+    /// The block `block`'s code now ends in ([`Module::split`]).
+    fn last(&self, mut block: usize) -> usize {
+        while let Some(n) = self.blocks[block].next {
+            block = n;
+        }
+        block
+    }
+
+    /// Ends `block`'s code where it stands with `term` and goes on in the new block `rest`, which
+    /// takes the terminator `block` had (or gets the one it is given later) and its outgoing
+    /// edges: code added to `block` from now on, its terminator and phis' edges from it are
+    /// `rest`'s. Returns the block that `term` ends (for edges from it, [`Module::set_phi_at`]).
+    pub fn split(&mut self, block: usize, term: Term, rest: usize) -> usize {
+        let l = self.last(block);
+        self.blocks[rest].term = self.blocks[l].term.take();
+        self.blocks[l].term = Some(term);
+        self.blocks[l].next = Some(rest);
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                for edge in incoming.iter_mut().filter(|e| e.1 == l) {
+                    edge.1 = rest;
+                }
+            }
+        }
+        l
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.last(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -486,11 +517,18 @@ impl Module {
         self.extract(block, r, 0)
     }
 
+    /// Sets `phi`'s edges, each from the block its predecessor's code ends in now.
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.last(b))).collect();
+        self.set_phi_at(phi, incoming);
+    }
+    /// [`Module::set_phi`] with edges from exactly the blocks given.
+    pub fn set_phi_at(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.last(block);
         self.blocks[block].term = Some(t);
     }
 

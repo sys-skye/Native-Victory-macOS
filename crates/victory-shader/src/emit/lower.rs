@@ -392,6 +392,10 @@ struct Lower<'a> {
     /// cross-lane operations: lanes are `flat & 63`, and what reaches across
     /// the halves goes through group-shared memory (`lower/halves.rs`).
     halves: bool,
+    /// Lockstep in a group of several console waves (`lockstep.rs`): the two host waves of one
+    /// console wave meet each other at its exchanges and LDS writes, not the whole group
+    /// ([`Lower::pair_sync`]); the others are elsewhere in the program.
+    pair_sync: bool,
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
@@ -1018,6 +1022,7 @@ impl<'a> Lower<'a> {
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut pair_sync = false;
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1073,7 +1078,11 @@ impl<'a> Lower<'a> {
             // passes between its lanes without a barrier.
             let mut synced = false;
             host32 = x.wave32_host && x.native.wave64;
-            if (x.narrow_waves || host32) && one_wave && lanes > 32 && s.lds_dwords > 0 {
+            if (x.narrow_waves || host32)
+                && (one_wave || x.st.lockstep && host32)
+                && lanes > 32
+                && s.lds_dwords > 0
+            {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -1108,6 +1117,12 @@ impl<'a> Lower<'a> {
                         *o |= at_barrier;
                     }
                     s.xchg_dwords = lanes.next_multiple_of(64);
+                    // Lockstep, several console waves: the pair syncs' counters, one per host
+                    // wave, after the exchange slots.
+                    if x.st.lockstep && !one_wave {
+                        pair_sync = true;
+                        s.xchg_dwords += lanes.div_ceil(32);
+                    }
                 }
             } else if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
                 s.wave_size = Some(wave);
@@ -1225,6 +1240,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             host32,
             halves,
+            pair_sync,
             once,
             mesh_lds,
             mesh_phases,
@@ -1995,6 +2011,9 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         self.cur = self.s.entry;
+        if self.pair_sync {
+            self.pair_sync_start();
+        }
         self.find_sections();
         if let Some(vid_val) = self.rect_corners() {
             self.run_rect_by_id(&order, vid_val)?;
@@ -2164,7 +2183,7 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 if self.split_barriers.contains(&(b, i)) {
-                    self.group_barrier();
+                    self.split_barrier();
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -2178,7 +2197,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
-                self.group_barrier();
+                self.split_barrier();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -5649,6 +5668,15 @@ impl<'a> Lower<'a> {
     /// Thread-group sync with a shared-memory fence, and a UAV fence when
     /// the program writes UAVs (the waits before an s_barrier make those
     /// writes visible on the console).
+    /// A barrier between the host waves of a console wave around LDS (`split_barriers`).
+    fn split_barrier(&mut self) {
+        if self.pair_sync {
+            self.pair_sync(self.cur);
+        } else {
+            self.group_barrier();
+        }
+    }
+
     fn group_barrier(&mut self) {
         let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
         let mode = self.s.m.i32(mode);
