@@ -2197,7 +2197,13 @@ fn trace_failure(cb: &ProtocolObject<dyn MTLCommandBuffer>, e: &objc2_foundation
                 MTLCommandEncoderErrorState::Affected => "Affected",
                 _ => "Unknown",
             };
-            encoders.push_str(&format!(" | [{st}] {}", i.label()));
+            // Metal leaves an unlabelled encoder's label nil, which the binding's `label()`
+            // declares never is (it panicked here after a failed command buffer).
+            // SAFETY: `label` is an `MTLCommandBufferEncoderInfo` property returning an NSString.
+            let label: Option<Retained<objc2_foundation::NSString>> =
+                unsafe { objc2::msg_send![&*i, label] };
+            let label = label.map(|l| l.to_string()).unwrap_or_default();
+            encoders.push_str(&format!(" | [{st}] {label}"));
         }
     }
     tracing::warn!(
