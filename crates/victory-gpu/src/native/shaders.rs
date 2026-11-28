@@ -243,10 +243,27 @@ impl<B: GraphicsBackend> Default for Libraries<B> {
     }
 }
 
+/// `VICTORY_DROP_COMPUTE=<hash>[,<hash>...]`: compute programs whose name holds one of these
+/// shader hashes are refused, so their dispatches are dropped as a refused program's are. To find
+/// which of the programs that translate breaks a frame without a new shader cache (the switch is
+/// not a translation setting).
+fn dropped_compute(name: &str) -> bool {
+    static DROP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let drop = DROP.get_or_init(|| {
+        let v = std::env::var("VICTORY_DROP_COMPUTE").unwrap_or_default();
+        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect()
+    });
+    drop.iter().any(|h| name.contains(h.as_str()))
+}
+
 impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
+        if dropped_compute(name) {
+            self.shaders.refuse(name, "dropped by VICTORY_DROP_COMPUTE".into());
+            return Pipe::Refused;
+        }
         // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
         // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
         if let Some(why) = unsupported(shader, true) {
