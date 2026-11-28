@@ -12,7 +12,8 @@
 //! leaves on, and the translation has always read the first lane that runs,
 //! so a value that is not the same in both halves is where it differs; mesh
 //! programs read lane 0 of the console wave through `xchg` where EXEC is whole
-//! and every thread arrives, `Lower::mesh_first_lane`).
+//! and every thread arrives, and an LDS word any lane may read again by
+//! reading it, `Lower::mesh_first_lane_kind`).
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot

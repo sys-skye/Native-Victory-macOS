@@ -365,6 +365,12 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// Mesh programs whose console waves are two host waves: the `ds_read_b32` words any lane
+    /// may read again ([`lds_words`]), and each block's barrier phases ([`barrier_phases`]).
+    mesh_lds: Map<Value, (u32, u64, Option<Bool>)>,
+    mesh_phases: Vec<Option<u64>>,
+    /// The IR block and instruction of the VALU being lowered.
+    valu_at: (usize, usize),
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -567,7 +573,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
 /// piece, as the `disasm` example takes it), so a target dump tells which program drew a pixel.
 /// Whether `VICTORY_DEBUG_MESH` names the mesh program of `code` by its debug id colour
-/// ([`debug_id_colour`]): its position and primitive exports are captured
+/// ([`debug_id_colour`]), or is `all`: its position and primitive exports are captured
 /// ([`super::MESH_CAPTURE`]).
 pub(crate) fn mesh_captured(code: &[u8]) -> bool {
     let Ok(v) = std::env::var("VICTORY_DEBUG_MESH") else {
@@ -575,7 +581,7 @@ pub(crate) fn mesh_captured(code: &[u8]) -> bool {
     };
     let [r, g, b] = debug_id_colour(code);
     let id = format!("{r:02x}{g:02x}{b:02x}");
-    v.split(',').any(|w| w.trim().eq_ignore_ascii_case(&id))
+    v.split(',').any(|w| w.trim().eq_ignore_ascii_case(&id) || w.trim() == "all")
 }
 
 pub(crate) fn debug_id_colour(code: &[u8]) -> [u8; 3] {
@@ -1052,6 +1058,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = Set::default();
+        let (mut mesh_lds, mut mesh_phases) = (Map::default(), Vec::new());
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -1067,6 +1074,8 @@ impl<'a> Lower<'a> {
             if x.wave32_host && x.native.wave64 && ms.threads > 32 {
                 once = once_blocks(p);
                 s.xchg_dwords = ms.threads.next_multiple_of(64);
+                mesh_lds = lds_words(p, x.st, true);
+                mesh_phases = barrier_phases(p);
             }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
@@ -1158,6 +1167,9 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            mesh_lds,
+            mesh_phases,
+            valu_at: (0, 0),
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -4864,6 +4876,31 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// Mesh, with each console wave two host waves: how `v_readfirstlane_b32` `inst` reads the
+    /// console wave's first lane, where a host wave's own first lane may not hold its value.
+    /// [`FirstLane::Lds`]: its operand is a word of LDS ([`lds_words`]) read in this barrier
+    /// phase by lanes this read's EXEC keeps (or all), so each lane reads the word itself (GTA
+    /// VI's G-buffer mesh programs pass the second console wave its vertex and primitive counts
+    /// so, read by lane 0 alone). [`FirstLane::Exchange`]: EXEC is whole and every thread of the
+    /// group runs the block once ([`Self::mesh_first_lane`]). None: the host wave's first lane.
+    fn mesh_first_lane_kind(&self, inst: &Inst) -> Option<FirstLane> {
+        let (b, i) = self.valu_at;
+        let guard = self.x.st.guards[b][i];
+        let Fields::Valu(v) = &inst.fields else { return None };
+        let src = match v.src.first() {
+            Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+            _ => None,
+        };
+        if let Some(&(word, phase, read)) = src.and_then(|x| self.mesh_lds.get(&x)) {
+            let before = self.x.p.blocks[b].insts[..i].iter().filter(|x| x.name() == "s_barrier").count() as u32;
+            let here = self.mesh_phases.get(b).copied().flatten().and_then(|m| shift_phases(m, before));
+            if here == Some(phase) && (read.is_none() || read == guard) {
+                return Some(FirstLane::Lds(word));
+            }
+        }
+        (guard.is_none() && self.once.get(b) == Some(&true)).then_some(FirstLane::Exchange)
     }
 
     /// Mesh, with every lane of the console wave on and every thread of the group here once:
@@ -8628,6 +8665,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        self.valu_at = (b, i);
         let name = inst.name();
         if self.waterfall_compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
@@ -9720,9 +9758,17 @@ impl<'a> Lower<'a> {
                 let r = self.wide_read_lane(a, lane)?;
                 int(self, r)
             }
-            "v_readfirstlane_b32" if self.s.mesh.is_some() && guard.is_none() && self.once.get(self.cur_ir) == Some(&true) => {
+            "v_readfirstlane_b32" if self.s.mesh.is_some() && self.s.xchg_dwords > 0 && self.mesh_first_lane_kind(inst).is_some() => {
                 let a = s(self, 0)?;
-                let r = self.mesh_first_lane(a);
+                let r = match self.mesh_first_lane_kind(inst) {
+                    Some(FirstLane::Lds(word)) => {
+                        let c = self.cur;
+                        let (lds, index) = (self.s.lds(), self.s.m.i32(word / 4));
+                        let p = self.s.m.element(c, lds, index);
+                        self.s.m.load(c, p)
+                    }
+                    _ => self.mesh_first_lane(a),
+                };
                 int(self, r)
             }
             "v_readfirstlane_b32" => {
@@ -15660,6 +15706,16 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// How a mesh program's `v_readfirstlane_b32` reads the console wave's first lane
+/// ([`Lower::mesh_first_lane_kind`]).
+#[derive(Clone, Copy)]
+enum FirstLane {
+    /// The LDS byte its operand was read from, read again.
+    Lds(u32),
+    /// Through group-shared memory ([`Lower::mesh_first_lane`]).
+    Exchange,
+}
+
 /// The refusal of LDS a split console wave shares in divergent code.
 pub(crate) const SPLIT_LDS: &str = "LDS shared in a wave the host splits, in divergent code";
 /// The refusal of a cross-lane operation between host waves in divergent code.
@@ -15743,6 +15799,15 @@ pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
 /// and a write of another phase is ordered by the barriers around it, so nothing changes the
 /// word while any thread may read it in phase n (the G-buffer cullers' group flag, #182).
 fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
+    lds_words(p, st, false).into_keys().collect()
+}
+
+/// [`barrier_reads`]'s `ds_read_b32`s, with those under a lane guard too (`guarded`): per value,
+/// the LDS byte it reads, its barrier phase (one bit) and its guard. Every lane that reads such a
+/// word in that phase reads the same value, so a lane that did not run the read can read it again
+/// there (a mesh program's `v_readfirstlane_b32` of a word only lane 0 read,
+/// `Lower::mesh_first_lane_kind`).
+pub(crate) fn lds_words(p: &Program, st: &Structured, guarded: bool) -> Map<Value, (u32, u64, Option<Bool>)> {
     let phases = barrier_phases(p);
     let barriers = |b: usize, i: usize| {
         p.blocks[b].insts[..i].iter().filter(|x| x.name() == "s_barrier").count() as u32
@@ -15755,8 +15820,8 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
             defs.extend(inst.writes.iter().map(|w| (w.1, (b, i))));
         }
     }
-    // A VGPR value moved from a constant in every lane that holds it.
-    let constant = |mut v: Value| {
+    // A VGPR value moved from a constant in every lane that holds it, or under guard `g`.
+    let constant = |mut v: Value, g: Option<Bool>| {
         for _ in 0..8 {
             let &(b, i) = defs.get(&v)?;
             let inst = &p.blocks[b].insts[i];
@@ -15764,7 +15829,7 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
             if inst.name() != "v_mov_b32" || f.dpp.is_some() || f.sdwa.is_some() {
                 return None;
             }
-            if st.guards[b][i].is_some() {
+            if st.guards[b][i].is_some() && st.guards[b][i] != g {
                 return None;
             }
             match *f.src.first()? {
@@ -15777,7 +15842,7 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
         None
     };
     // The LDS bytes an access of one constant address covers.
-    let bytes = |inst: &Inst| -> Option<(u32, u32)> {
+    let bytes = |inst: &Inst, g: Option<Bool>| -> Option<(u32, u32)> {
         let Fields::Ds {
             addr: Some(Operand::Vector { reg, .. }),
             offset0,
@@ -15797,7 +15862,7 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
             .zip([1, 2, 4, 8, 12, 16])
             .find(|(k, _)| ["b", "u", "i", "f"].iter().any(|t| name.ends_with(&format!("_{t}{k}"))))
             .map(|(_, n)| n)?;
-        let at = constant(inst.read(Reg::V(reg))?)?
+        let at = constant(inst.read(Reg::V(reg))?, g)?
             .checked_add(u32::from(offset0) | u32::from(offset1) << 8)?;
         Some((at, size))
     };
@@ -15807,13 +15872,13 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
                 .iter()
                 .any(|k| inst.name().starts_with(k))
     };
-    let mut out = Set::default();
+    let mut out = Map::default();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
-            if inst.name() != "ds_read_b32" || st.guards[b][i].is_some() {
+            if inst.name() != "ds_read_b32" || !guarded && st.guards[b][i].is_some() {
                 continue;
             }
-            let Some((word, _)) = bytes(inst) else { continue };
+            let Some((word, _)) = bytes(inst, st.guards[b][i]) else { continue };
             // One phase, after at least one barrier.
             let Some(n) = phase(b, i).filter(|m| m.count_ones() == 1 && m & 1 == 0) else {
                 continue;
@@ -15823,11 +15888,11 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
                 other.insts.iter().enumerate().all(|(j, w)| {
                     !writes_lds(w)
                         || phase(q, j).is_some_and(|m| m & n == 0)
-                        || bytes(w).is_some_and(|(at, size)| at + size <= word || word + 4 <= at)
+                        || bytes(w, st.guards[q][j]).is_some_and(|(at, size)| at + size <= word || word + 4 <= at)
                 })
             });
             if ok {
-                out.extend(inst.writes.iter().map(|w| w.1));
+                out.extend(inst.writes.iter().map(|w| (w.1, (word, n, st.guards[b][i]))));
             }
         }
     }

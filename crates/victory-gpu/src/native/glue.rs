@@ -836,6 +836,11 @@ fn mesh_capture_present() {
     let claimed = count.load(Ordering::SeqCst);
     // Armed until the records are full, or some are claimed and four presents have gone by.
     let armed = n > c.at && !c.written;
+    // A count still held: the GPU's atomics in flight overwrote the clearing store. Clear again.
+    if armed && claimed >= HELD / 2 {
+        count.store(0, Ordering::SeqCst);
+        return;
+    }
     if !armed || claimed < MESH_CAPTURE_RECORDS && (claimed == 0 || n < c.at + 4) {
         if !armed {
             count.store(HELD, Ordering::Relaxed);

@@ -418,7 +418,7 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
-/// `VICTORY_DEBUG_MESH=<rrggbb>[,...]` (docs/native-host.md): the title address of the capture
+/// `VICTORY_DEBUG_MESH=<rrggbb>[,...]` or `all` (docs/native-host.md): the title address of the capture
 /// the mesh programs it names by their debug id colour write their position and primitive
 /// exports to, which the native host maps for them ([`MESH_CAPTURE_BYTES`] long). Dword 0 counts
 /// the records lanes have claimed; records of [`MESH_CAPTURE_RECORD`] bytes start at
@@ -426,13 +426,13 @@ pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// the group from bit 8, dword 1 the group, dword 2 a hash of the user data the program reads (one
 /// value per draw), dword 3 the program's id (its code's FNV-1a hash), dwords 4-7 the exported
 /// dwords (a primitive's in dword 4).
-pub const MESH_CAPTURE: u64 = 0xFF_F000_0000;
+pub const MESH_CAPTURE: u64 = 0xFF_0000_0000;
 /// Bytes before the first record of [`MESH_CAPTURE`].
 pub const MESH_CAPTURE_HEADER: u32 = 64;
 /// Bytes of one record of [`MESH_CAPTURE`].
 pub const MESH_CAPTURE_RECORD: u32 = 32;
 /// Records [`MESH_CAPTURE`] holds; lanes claiming one past them write nothing.
-pub const MESH_CAPTURE_RECORDS: u32 = 1 << 20;
+pub const MESH_CAPTURE_RECORDS: u32 = 1 << 23;
 /// Bytes the host maps at [`MESH_CAPTURE`]: the header and records, in whole 64 KiB pages.
 pub const MESH_CAPTURE_BYTES: u64 =
     (MESH_CAPTURE_HEADER as u64 + MESH_CAPTURE_RECORD as u64 * MESH_CAPTURE_RECORDS as u64).next_multiple_of(1 << 16);
