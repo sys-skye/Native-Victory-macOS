@@ -355,7 +355,6 @@ pub fn build_bounded(
     })
 }
 
-/// Placeholder before renaming.
 /// `VICTORY_DEBUG_PS=nanpc:<rrggbb>[:<from>-<to>]`: a trap temporary, which pixel programs never
 /// use, carries per lane the last place a value stopped being finite: each float VALU result and
 /// image or buffer load (at byte offsets `from..to`, hex, if given), and each export, reads and

@@ -272,6 +272,49 @@ fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
     }
 }
 
+/// A value only lane 0 sets (under `s_mov_b64 exec, 1`, as GTA VI's G-buffer mesh programs take
+/// their meshlet) reaches every lane through `v_readfirstlane_b32` once EXEC is whole again: the
+/// console's first lane is lane 0 of the 64-lane wave, which for lanes 32-63 is in the other host
+/// wave. The triangle here is lanes 32-34's, its corners scaled by what they read: read on the
+/// host wave's own first lane (lane 32, which keeps 0) it has no area and the target stays black.
+#[test]
+fn a_mesh_program_reads_the_console_first_lane_from_the_upper_host_wave() {
+    let mut words = TRIANGLE.to_vec();
+    words.splice(0..0, [
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E18_0280, // v_mov_b32 v12, 0
+    ]);
+    let at = words.iter().position(|&w| w == 0x2C0A_0A87).unwrap() + 1; // after v_lshrrev_b32
+    words.splice(at..at, [
+        0x7E18_02F2, // v_mov_b32 v12, 1.0 (lane 0 alone)
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E28_050C, // v_readfirstlane_b32 s20, v12
+    ]);
+    for (old, new) in [
+        (0x7D84_0281, 0x7D84_02A1), // v_cmp_eq_u32 vcc, 33, v1
+        (0x7D84_0282, 0x7D84_02A2), // v_cmp_eq_u32 vcc, 34, v1
+        (0x0020_0400, 0x0220_8420), // corners 32, 33, 34
+    ] {
+        let i = words.iter().position(|&w| w == old).unwrap();
+        words[i] = new;
+    }
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x1004_0414, // v_mul_f32 v2, s20, v2
+        0x1006_0614, // v_mul_f32 v3, s20, v3
+    ]);
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
+}
+
 /// As above, but SCC is that of EXEC without the compare ANDed with an `s_cselect` by bit 29 of
 /// s8 (`s_andn2_b64 sN, exec, mask`, as the NGG vertex programs ahead of the G-buffer test it):
 /// set, so the triangle drawn, unless s8 is at least 0 with bit 29 set. 1.0 leaves the target

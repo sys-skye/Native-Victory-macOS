@@ -10,7 +10,9 @@
 //! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
 //! `v_readfirstlane` (read per half: the console reads the first lane EXEC
 //! leaves on, and the translation has always read the first lane that runs,
-//! so a value that is not the same in both halves is where it differs).
+//! so a value that is not the same in both halves is where it differs; mesh
+//! programs read lane 0 of the console wave through `xchg` where EXEC is whole
+//! and every thread arrives, `Lower::mesh_first_lane`).
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
@@ -51,7 +53,7 @@ use crate::emit::wave::Op;
 
 impl Lower<'_> {
     /// A group barrier with a shared-memory fence in DXIL block `at`.
-    fn xchg_barrier(&mut self, at: usize) {
+    pub(super) fn xchg_barrier(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
@@ -69,7 +71,7 @@ impl Lower<'_> {
     }
 
     /// The group-shared slot `index`.
-    fn xchg_slot(&mut self, at: usize, index: V) -> V {
+    pub(super) fn xchg_slot(&mut self, at: usize, index: V) -> V {
         let g = self.s.xchg();
         self.s.m.element(at, g, index)
     }

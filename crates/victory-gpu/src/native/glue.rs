@@ -763,6 +763,7 @@ pub(crate) fn present(queue: This, planes: &[This]) {
         trace_present(resource);
     }
     pass_present(resource);
+    mesh_capture_present();
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
         let keys: Vec<usize> = planes.iter().map(|&p| p as usize).collect();
@@ -774,6 +775,83 @@ pub(crate) fn present(queue: This, planes: &[This]) {
             NO_TEXTURE.fetch_add(1, Ordering::Relaxed);
         }
         _ => {}
+    }
+}
+
+/// `VICTORY_DEBUG_MESH_AT=<present>[:<file>]`, with `VICTORY_DEBUG_MESH` naming mesh programs
+/// (docs/native-host.md): the capture those programs write ([`victory_shader::emit::MESH_CAPTURE`])
+/// as host memory mapped at its title address, its count held past the records (nothing is
+/// written) until present `<present>`, then cleared; once the records are full, or some are
+/// claimed and four presents have gone by, the count and the records claimed are written to
+/// `<file>` (default `mesh-capture.bin`) and the count is held again, for the rest of the run.
+fn mesh_capture_present() {
+    use victory_shader::emit::{MESH_CAPTURE, MESH_CAPTURE_BYTES, MESH_CAPTURE_HEADER, MESH_CAPTURE_RECORD, MESH_CAPTURE_RECORDS};
+    // Held: well past the records and far from wrapping in the adds of a few frames.
+    const HELD: u32 = 0x8000_0000;
+    struct Capture {
+        base: *mut u32,
+        at: u64,
+        file: String,
+        written: bool,
+    }
+    // SAFETY: the memory is leaked, never freed; only the present thread writes the count.
+    unsafe impl Send for Capture {}
+    static CAPTURE: OnceLock<Option<Mutex<Capture>>> = OnceLock::new();
+    static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(capture) = CAPTURE.get_or_init(|| {
+        std::env::var_os("VICTORY_DEBUG_MESH")?;
+        let v = std::env::var("VICTORY_DEBUG_MESH_AT").ok()?;
+        let (at, file) = v.split_once(':').unwrap_or((&v, "mesh-capture.bin"));
+        let at = at.parse().ok()?;
+        if pools().resolve(MESH_CAPTURE, 1).is_some() {
+            tracing::warn!(at = format!("{MESH_CAPTURE:#x}"), "the title maps the mesh capture's address: no capture");
+            return None;
+        }
+        let len = MESH_CAPTURE_BYTES as usize;
+        let layout = std::alloc::Layout::from_size_align(len, 1 << 16).ok()?;
+        // SAFETY: a non-zero size; the memory is never freed.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        let pool = super::memory::PoolInfo { id: usize::MAX >> 1, base: base as usize, len, memory_entry: None };
+        pools().pool_created(&pool);
+        pools().mapped(MESH_CAPTURE as usize, len, &pool, 0);
+        // SAFETY: the count is the allocation's first dword.
+        unsafe { base.cast::<u32>().write_volatile(HELD) };
+        tracing::info!(at, file, "mesh capture mapped at {MESH_CAPTURE:#x}");
+        Some(Mutex::new(Capture { base: base.cast(), at, file: file.to_string(), written: false }))
+    }) else {
+        return;
+    };
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut c = capture.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the count is the capture's first dword, alive for the process.
+    let count = unsafe { &*c.base.cast::<std::sync::atomic::AtomicU32>() };
+    if n == c.at {
+        count.store(0, Ordering::SeqCst);
+        tracing::info!(present = n, "mesh capture armed");
+        return;
+    }
+    let claimed = count.load(Ordering::SeqCst);
+    // Armed until the records are full, or some are claimed and four presents have gone by.
+    let armed = n > c.at && !c.written;
+    if !armed || claimed < MESH_CAPTURE_RECORDS && (claimed == 0 || n < c.at + 4) {
+        if !armed {
+            count.store(HELD, Ordering::Relaxed);
+        }
+        return;
+    }
+    count.store(HELD, Ordering::SeqCst);
+    c.written = true;
+    let records = claimed.min(MESH_CAPTURE_RECORDS) as usize;
+    let bytes = MESH_CAPTURE_HEADER as usize + records * MESH_CAPTURE_RECORD as usize;
+    // SAFETY: within the mapping of MESH_CAPTURE_BYTES.
+    let mut out = unsafe { std::slice::from_raw_parts(c.base.cast::<u8>(), bytes) }.to_vec();
+    out[..4].copy_from_slice(&claimed.to_le_bytes());
+    match std::fs::write(&c.file, &out) {
+        Ok(()) => tracing::info!(present = n, claimed, records, file = c.file, "mesh capture written"),
+        Err(e) => tracing::warn!(error = %e, file = c.file, "mesh capture not written"),
     }
 }
 

@@ -566,6 +566,18 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// `VICTORY_DEBUG_PS=id`: the colour every float export of a pixel program writes, the low three
 /// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
 /// piece, as the `disasm` example takes it), so a target dump tells which program drew a pixel.
+/// Whether `VICTORY_DEBUG_MESH` names the mesh program of `code` by its debug id colour
+/// ([`debug_id_colour`]): its position and primitive exports are captured
+/// ([`super::MESH_CAPTURE`]).
+pub(crate) fn mesh_captured(code: &[u8]) -> bool {
+    let Ok(v) = std::env::var("VICTORY_DEBUG_MESH") else {
+        return false;
+    };
+    let [r, g, b] = debug_id_colour(code);
+    let id = format!("{r:02x}{g:02x}{b:02x}");
+    v.split(',').any(|w| w.trim().eq_ignore_ascii_case(&id))
+}
+
 pub(crate) fn debug_id_colour(code: &[u8]) -> [u8; 3] {
     let h = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
     let [r, g, b, _] = h.to_le_bytes();
@@ -1049,6 +1061,13 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // A console wave of 64 lanes is two host waves: `v_readfirstlane` reads the
+            // console's first lane through group-shared memory where every thread arrives
+            // (`mesh_first_lane`).
+            if x.wave32_host && x.native.wave64 && ms.threads > 32 {
+                once = once_blocks(p);
+                s.xchg_dwords = ms.threads.next_multiple_of(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -4845,6 +4864,27 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// Mesh, with every lane of the console wave on and every thread of the group here once:
+    /// `x` of the console wave's first lane (its thread index rounded down to 64). The host's
+    /// waves are 32 lanes, so the upper half of a console wave reads it through group-shared
+    /// memory: on its own first lane it would read another value wherever the lanes differ
+    /// (GTA VI's G-buffer mesh programs take the group's meshlet so, from a VGPR only lane 0
+    /// set under `s_mov_b64 exec, 1`: the upper halves drew other meshlets' vertices, the
+    /// world's shards).
+    fn mesh_first_lane(&mut self, x: V) -> V {
+        let c = self.cur;
+        let f = self.mesh_thread();
+        let slot = self.xchg_slot(c, f);
+        self.s.m.store(c, slot, x);
+        self.xchg_barrier(c);
+        let not63 = self.s.m.i32(!63);
+        let first = self.s.m.bin(c, Bin::And, f, not63);
+        let p = self.xchg_slot(c, first);
+        let r = self.s.m.load(c, p);
+        self.xchg_barrier(c);
+        r
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -9680,6 +9720,11 @@ impl<'a> Lower<'a> {
                 let r = self.wide_read_lane(a, lane)?;
                 int(self, r)
             }
+            "v_readfirstlane_b32" if self.s.mesh.is_some() && guard.is_none() && self.once.get(self.cur_ir) == Some(&true) => {
+                let a = s(self, 0)?;
+                let r = self.mesh_first_lane(a);
+                int(self, r)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
@@ -13699,6 +13744,9 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        if mesh && mesh_captured(&self.x.native.code) {
+            self.mesh_capture(e, guard)?;
+        }
         let c = self.cur;
         // A pixel export whose lanes outside its guard the `done` export
         // after it discards: what those lanes write is lost, so it stores in
@@ -14307,6 +14355,80 @@ impl<'a> Lower<'a> {
             let y = self.s.m.select(c, zeroed, zero, *x);
             *x = self.s.m.select(c, marked, k, y);
         }
+    }
+
+    /// `VICTORY_DEBUG_MESH`: a record of a position or primitive export at
+    /// [`super::MESH_CAPTURE`] in the lanes that export, each claimed by an atomic add on the
+    /// capture's count (none past [`super::MESH_CAPTURE_RECORDS`]).
+    fn mesh_capture(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+        use super::{MESH_CAPTURE, MESH_CAPTURE_HEADER, MESH_CAPTURE_RECORD, MESH_CAPTURE_RECORDS};
+        let kind = match e.target {
+            Target::Position(0) => 1,
+            Target::Primitive => 2,
+            _ => return Ok(()),
+        };
+        let mut vals = Vec::new();
+        for v in e.values {
+            vals.push(match v {
+                Some(v) => self.i32_of(v)?,
+                None => self.s.m.i32(0),
+            });
+        }
+        let thread = self.mesh_thread();
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        // One value per draw: the user data the program reads, hashed.
+        let reads: Vec<UserData> = self.user_reads.values().copied().collect();
+        let e0 = self.s.entry;
+        let mut key = self.s.m.i32(0x811c_9dc5);
+        let prime = self.s.m.i32(0x0100_0193);
+        for u in reads {
+            let d = self.user_at(u);
+            key = self.s.m.bin(e0, Bin::Xor, key, d);
+            key = self.s.m.bin(e0, Bin::Mul, key, prime);
+        }
+        let id = self.x.native.code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        let at = self.begin_guarded(guard);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (lo, hi) = (k(self, MESH_CAPTURE as u32), k(self, (MESH_CAPTURE >> 32) as u32));
+        let (h, off) = self.memory(lo, hi, 4, true, None);
+        let (iu, one, add) = (self.s.m.undef(self.s.t.i32), k(self, 1), k(self, 0));
+        let n = self.s.op(
+            self.cur,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            78,
+            &[h, add, off, iu, iu, one],
+        );
+        let cap = k(self, MESH_CAPTURE_RECORDS);
+        let room = self.s.m.cmp(self.cur, pred::IULT, n, cap);
+        let inner = self.begin_guarded(Some(room));
+        let c2 = self.cur;
+        let (shift, first) = (k(self, MESH_CAPTURE_RECORD.trailing_zeros()), k(self, MESH_CAPTURE as u32 + MESH_CAPTURE_HEADER));
+        let rec = self.s.m.bin(c2, Bin::Shl, n, shift);
+        let rec = self.s.m.bin(c2, Bin::Add, first, rec);
+        let (h, off) = self.memory(rec, hi, MESH_CAPTURE_RECORD, true, None);
+        let (k8, kind) = (k(self, 8), k(self, kind));
+        let c2 = self.cur;
+        let tag = self.s.m.bin(c2, Bin::Shl, thread, k8);
+        let tag = self.s.m.bin(c2, Bin::Or, tag, kind);
+        let id = k(self, id);
+        let (sixteen, mask) = (k(self, 16), self.s.m.i8(0xF));
+        let second = self.s.m.bin(c2, Bin::Add, off, sixteen);
+        let four = k(self, 4);
+        let void = self.s.t.void;
+        for (at, d) in [(off, [tag, group, key, id]), (second, [vals[0], vals[1], vals[2], vals[3]])] {
+            let mut args = vec![h, at, iu];
+            args.extend(d);
+            args.extend([mask, four]);
+            self.s
+                .op(c2, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+        }
+        self.end_guarded(inner, &[]);
+        self.end_guarded(at, &[]);
+        Ok(())
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
