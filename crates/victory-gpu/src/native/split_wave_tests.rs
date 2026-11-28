@@ -2026,3 +2026,84 @@ fn a_whole_wave_half_sum_reads_across_the_host_waves() {
     let want: Vec<u32> = (0..128).map(|i| if i < 40 { 0x0000_5380 } else { CANARY }).collect();
     assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
 }
+
+/// Floats at the edges (NaN, infinity, zero, f16 overflow) come out as RDNA2 gives them: the
+/// clamp modifier makes NaN 0, `v_max`/`v_min` of NaN take the number, `v_med3` with NaN takes the
+/// least number, 0 x infinity is NaN but 0 for the legacy multiply, and an f16 conversion
+/// overflows to infinity, or to the largest f16 toward zero (`v_cvt_pkrtz`). `s4` is a NaN the
+/// compiler cannot fold (each result is stored at `dst` + 4 x its index; a 16-bit result keeps the
+/// high half the register held before).
+#[test]
+fn float_edge_cases_come_out_as_the_hardware_gives_them() {
+    let w = [
+        0x7E14_0280, // v_mov_b32 v10, 0
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0xD51B_0004, 0x0200_08FF, 0x7F80_0000, // v_and_b32 v4, 0x7f800000, s4
+        0xD516_0005, 0x0200_089F, // v_lshrrev_b32 v5, 31, s4
+        0xD508_8002, 0x0201_E501, // v_mul_f32_e64 v2, v1, 1.0 clamp
+        0xDC70_8000, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:0
+        0xD510_0002, 0x0201_E101, // v_max_f32 v2, v1, 0.5
+        0xDC70_8004, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:4
+        0xD50F_0002, 0x0201_E101, // v_min_f32 v2, v1, 0.5
+        0xDC70_8008, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:8
+        0xD557_0002, 0x03C9_0101, // v_med3_f32 v2, v1, 0, 1.0
+        0xDC70_800C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:12
+        0x7E04_5505, // v_rcp_f32 v2, v5
+        0xDC70_8010, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:16
+        0x7E04_5D05, // v_rsq_f32 v2, v5
+        0xDC70_8014, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:20
+        0x7E04_66F3, // v_sqrt_f32 v2, -1.0
+        0xDC70_8018, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:24
+        0x7E04_4F05, // v_log_f32 v2, v5
+        0xDC70_801C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:28
+        0xD5A5_0002, 0x2201_0104, // v_exp_f32_e64 v2, -v4
+        0xDC70_8020, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:32
+        0xD508_8002, 0x0201_E504, // v_mul_f32_e64 v2, v4, 1.0 clamp
+        0xDC70_8024, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:36
+        0xD503_8002, 0x0201_0101, // v_add_f32_e64 v2, v1, 0 clamp
+        0xDC70_8028, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:40
+        0xD54B_8002, 0x0201_E501, // v_fma_f32 v2, v1, 1.0, 0 clamp
+        0xDC70_802C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:44
+        0xD510_8002, 0x0201_0101, // v_max_f32_e64 v2, v1, 0 clamp
+        0xDC70_8030, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:48
+        0xD5AA_8002, 0x0201_0101, // v_rcp_f32_e64 v2, v1 clamp
+        0xDC70_8034, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:52
+        0x5E04_0301, // v_cvt_pkrtz_f16_f32 v2, v1, v1
+        0xDC70_8038, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:56
+        0xCC21_8002, 0x0201_E501, // v_fma_mixlo_f16 v2, v1, 1.0, 0 clamp
+        0xDC70_803C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:60
+        0x100C_0AFF, 0x4974_2400, // v_mul_f32 v6, 0x49742400, v5
+        0x060C_0CFF, 0x4974_2400, // v_add_f32 v6, 0x49742400, v6
+        0x5E04_0906, // v_cvt_pkrtz_f16_f32 v2, v6, v4
+        0xDC70_8040, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:64
+        0x7E04_1506, // v_cvt_f16_f32 v2, v6
+        0xDC70_8044, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:68
+        0xCC21_0002, 0x0201_E506, // v_fma_mixlo_f16 v2, v6, 1.0, 0
+        0xDC70_8048, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:72
+        0x1004_0B04, // v_mul_f32 v2, v4, v5
+        0xDC70_804C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:76
+        0x0E04_0B04, // v_mul_legacy_f32 v2, v4, v5
+        0xDC70_8050, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:80
+        0x7E04_5504, // v_rcp_f32 v2, v4
+        0xDC70_8054, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:84
+        0x7E04_5CF3, // v_rsq_f32 v2, -1.0
+        0x1004_0D02, // v_mul_f32 v2, v2, v6
+        0xDC70_8058, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:88
+        0x7E04_6705, // v_sqrt_f32 v2, v5
+        0xDC70_805C, 0x0002_020A, // global_store_dword v10, v2, s[2:3] offset:92
+        S_ENDPGM,
+    ];
+    let got = run32(&w, 0x7FC0_0000);
+    if got.is_empty() {
+        return;
+    }
+    let want: [u32; 24] = [
+        0, 0x3F00_0000, 0x3F00_0000, 0, // clamp(NaN), max(NaN, .5), min(NaN, .5), med3(NaN, 0, 1)
+        0x7F80_0000, 0x7F80_0000, 0x7FC0_0000, 0xFF80_0000, // rcp 0, rsq 0, sqrt -1, log 0
+        0, 0x3F80_0000, 0, 0, // exp -inf, clamp(inf), clamp(NaN + 0), clamp(fma NaN)
+        0, 0, 0x7E00_7E00, 0x7E00_0000, // clamp(max NaN, 0), clamp(rcp NaN), pkrtz NaN, mixlo clamp NaN
+        0x7C00_7BFF, 0x7C00_7C00, 0x7C00_7C00, 0x7FC0_0000, // pkrtz 1e6 inf, cvt 1e6, mixlo 1e6, inf x 0
+        0, 0, 0x7FC0_0000, 0, // legacy inf x 0, rcp inf, rsq -1 x 1e6, sqrt 0
+    ];
+    assert_eq!(got[..24], want, "{:x?}", &got[..24]);
+}

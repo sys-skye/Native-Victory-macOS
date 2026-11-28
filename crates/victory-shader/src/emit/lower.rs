@@ -441,6 +441,13 @@ struct Lower<'a> {
     loaded_inputs: Map<(usize, u8), Val>,
     /// Active corner evaluation pass for `SV_VertexID`-driven rectangle lists (`lower/rect.rs`).
     rect_pass: Option<rect::RectPass>,
+    /// Debug (`VICTORY_DEBUG_PS=nanin`): the bits of every float pixel input loaded, for
+    /// `nan_markers`.
+    nan_inputs: Vec<V>,
+    /// `VICTORY_DEBUG_PS=nanpc:`: this is the probed program, and its first colour export's
+    /// record of where a value stopped being finite ([`crate::ir::NAN_LAST`]).
+    nan_probe: bool,
+    nan_pc: Option<V>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -1179,6 +1186,9 @@ impl<'a> Lower<'a> {
             rect_corner: None,
             loaded_inputs: Map::default(),
             rect_pass: None,
+            nan_inputs: Vec::new(),
+            nan_probe: crate::ir::nan_probe(&x.native.code).is_some(),
+            nan_pc: None,
         }
     }
 
@@ -2145,6 +2155,11 @@ impl<'a> Lower<'a> {
         let prim_uses = std::cell::LazyCell::new(|| crate::io::PrimMaskUses::new(p));
         for &(reg, v) in &p.inputs {
             let val = match reg {
+                Reg::S(n)
+                    if self.nan_probe && n == crate::ir::NAN_LAST =>
+                {
+                    Val::I32(self.s.m.i32(0))
+                }
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
@@ -2431,7 +2446,11 @@ impl<'a> Lower<'a> {
         } else if int {
             Val::I32(v)
         } else {
-            Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
+            let bits = self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32);
+            if self.s.pixel && std::env::var("VICTORY_DEBUG_PS").is_ok_and(|m| m == "nanin") {
+                self.nan_inputs.push(bits);
+            }
+            Val::I32(bits)
         };
         self.loaded_inputs.insert((id, col), out);
         out
@@ -5433,6 +5452,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if self.nan_probe && inst.write(Reg::S(crate::ir::NAN_LAST)).is_some() {
+            self.nan_track(inst, b, i, r.is_ok());
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -13670,6 +13692,10 @@ impl<'a> Lower<'a> {
         if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
+        if self.nan_probe && e.target == Target::Color(0) && self.nan_pc.is_none() {
+            let inst = &self.x.p.blocks[b].insts[i];
+            self.nan_pc = inst.read(Reg::S(crate::ir::NAN_LAST)).and_then(|v| self.i32_data(v).ok());
+        }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
@@ -14005,6 +14031,12 @@ impl<'a> Lower<'a> {
             };
             ready.push((id, col, suffix, x));
         }
+        if self.s.pixel
+            && std::env::var("VICTORY_DEBUG_PS")
+                .is_ok_and(|v| v == "nanid" || v == "nanin" || v.starts_with("nanpc:"))
+        {
+            self.nan_markers(&mut ready);
+        }
         if self.rect_pass.is_some() {
             self.record_rect_export(ready, guard);
             self.end_guarded(at, &[]);
@@ -14031,6 +14063,172 @@ impl<'a> Lower<'a> {
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// Debug (`VICTORY_DEBUG_PS=nanid`): an export (one output's channels) with a channel that is
+    /// not finite writes its program's marker instead, red, green and blue `-(256 + byte)` of the
+    /// program's [`debug_id_colour`] and alpha -1024, which the pass trace's texture dumps count
+    /// by program (`nanids=`). Finite exports are left as they are.
+    /// With `VICTORY_DEBUG_PS=nanin` the marker goes down instead where an input the program
+    /// loaded is not finite (whatever it exports), to tell bad inputs from bad arithmetic.
+    /// `VICTORY_DEBUG_PS=nanpc:`: after `inst`, the lane's record of where a value last
+    /// stopped being finite: `tag << 16 | offset`, tag 1 a float result of finite
+    /// operands, 2 a load, 3 a float result whose vector operands are finite but a scalar one
+    /// is not (a constant).
+    fn nan_track(&mut self, inst: &Inst, b: usize, i: usize, lowered: bool) {
+        use crate::ir::NAN_LAST;
+        let c = self.cur;
+        let old = |l: &mut Self, r: u8| match inst.read(Reg::S(r)).map(|v| l.i32_data(v)) {
+            Some(Ok(x)) => x,
+            _ => l.s.m.i32(0),
+        };
+        let last = old(self, NAN_LAST);
+        let exp = self.s.m.i32(0x7f80_0000);
+        let bad = |l: &mut Self, x: V| {
+            let e = l.s.m.bin(c, Bin::And, x, exp);
+            l.s.m.cmp(c, pred::EQ, e, exp)
+        };
+        let or = |l: &mut Self, a: Option<V>, b: V| match a {
+            Some(a) => l.s.m.bin(c, Bin::Or, a, b),
+            None => b,
+        };
+        let mut res = None;
+        for &(_, v) in inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))) {
+            if lowered && let Ok(x) = self.i32_data(v) {
+                let b = bad(self, x);
+                res = Some(or(self, res, b));
+            }
+        }
+        let event = match (res, &inst.fields) {
+            (None, _) => None,
+            (Some(r), Fields::Valu(v)) => {
+                let mut regs: Vec<Reg> = v
+                    .src
+                    .iter()
+                    .filter_map(|o| match *o {
+                        Operand::Vector { reg, .. } => Some(Reg::V(reg)),
+                        Operand::Scalar { code, .. } if code <= 105 => Some(Reg::S(code)),
+                        _ => None,
+                    })
+                    .collect();
+                if inst.name().contains("mac_")
+                    && let Some(Operand::Vector { reg, .. }) = v.dst
+                {
+                    regs.push(Reg::V(reg));
+                }
+                let (mut vbad, mut sbad) = (None, None);
+                for reg in regs {
+                    let Some(Ok(x)) = inst.read(reg).map(|v| self.i32_data(v)) else { continue };
+                    let b = bad(self, x);
+                    if matches!(reg, Reg::V(_)) {
+                        vbad = Some(or(self, vbad, b));
+                    } else {
+                        sbad = Some(or(self, sbad, b));
+                    }
+                }
+                let t = self.s.m.bool(true);
+                let vfin = vbad.map_or(t, |x| self.s.m.bin(c, Bin::Xor, x, t));
+                let ev = self.s.m.bin(c, Bin::And, r, vfin);
+                let tag = match sbad {
+                    Some(sb) => {
+                        let (one, three) = (self.s.m.i32(1 << 16), self.s.m.i32(3 << 16));
+                        self.s.m.select(c, sb, three, one)
+                    }
+                    None => self.s.m.i32(1 << 16),
+                };
+                Some((ev, tag))
+            }
+            (Some(r), _) => Some((r, self.s.m.i32(2 << 16))),
+        };
+        let last = match event {
+            None => last,
+            Some((ev, tag)) => {
+                let ev = match self.guard(b, i) {
+                    Ok(Some(g)) => self.s.m.bin(c, Bin::And, ev, g),
+                    _ => ev,
+                };
+                let at = self.s.m.i32(inst.machine.offset as u32);
+                let code = self.s.m.bin(c, Bin::Or, tag, at);
+                self.s.m.select(c, ev, code, last)
+            }
+        };
+        if let Some(w) = inst.write(Reg::S(NAN_LAST)) {
+            self.vals.insert(w, Val::I32(last));
+        }
+    }
+
+    fn nan_markers(&mut self, ready: &mut [(usize, u8, &'static str, V)]) {
+        let rgb = debug_id_colour(&self.x.native.code);
+        let c = self.cur;
+        // `nanpc`: the record's three bytes in place of the id colour's.
+        let pc = self.nan_pc.map(|code| {
+            [16u32, 8, 0].map(|sh| {
+                let (k, m) = (self.s.m.i32(sh), self.s.m.i32(0xff));
+                let x = self.s.m.bin(c, Bin::LShr, code, k);
+                let x = self.s.m.bin(c, Bin::And, x, m);
+                let f = self.s.m.cast(c, Cast::UiToFp, x, self.s.t.f32);
+                let base = self.s.m.f32((-256.0f32).to_bits());
+                let neg = self.s.m.f32((-1.0f32).to_bits());
+                let f = self.s.m.bin(c, Bin::Mul, f, neg);
+                self.s.m.bin(c, Bin::Add, f, base)
+            })
+        });
+        let mut bad: HashMap<usize, V> = HashMap::new();
+        if std::env::var("VICTORY_DEBUG_PS").is_ok_and(|v| v == "nanin") {
+            let exp = self.s.m.i32(0x7f80_0000);
+            let mut any = None;
+            for bits in self.nan_inputs.clone() {
+                let e = self.s.m.bin(c, Bin::And, bits, exp);
+                let b = self.s.m.cmp(c, pred::EQ, e, exp);
+                any = Some(match any {
+                    Some(p) => self.s.m.bin(c, Bin::Or, p, b),
+                    None => b,
+                });
+            }
+            let Some(any) = any else { return };
+            for &(id, _, _, _) in ready.iter() {
+                bad.insert(id, any);
+            }
+        }
+        let inputs_only = !bad.is_empty();
+        for &(id, _, suffix, x) in ready.iter().filter(|_| !inputs_only) {
+            if suffix != ".f32" {
+                continue;
+            }
+            let bits = self.as_int(x);
+            let exp = self.s.m.i32(0x7f80_0000);
+            let e = self.s.m.bin(c, Bin::And, bits, exp);
+            let b = self.s.m.cmp(c, pred::EQ, e, exp);
+            let any = match bad.get(&id) {
+                Some(&p) => self.s.m.bin(c, Bin::Or, p, b),
+                None => b,
+            };
+            bad.insert(id, any);
+        }
+        // A lane marked at one output writes zeros to the others, so that a blend reading a second
+        // source (dual-source: colour + source 1 x target) leaves the marker as it is.
+        let mut any = None;
+        for &b in bad.values() {
+            any = Some(match any {
+                Some(a) => self.s.m.bin(c, Bin::Or, a, b),
+                None => b,
+            });
+        }
+        let zero = self.s.m.f32(0);
+        for (_, _, suffix, x) in ready.iter_mut() {
+            if let (Some(a), ".f32") = (any, *suffix) {
+                *x = self.s.m.select(c, a, zero, *x);
+            }
+        }
+        for (id, col, suffix, x) in ready.iter_mut() {
+            let Some(&b) = bad.get(id).filter(|_| *suffix == ".f32") else { continue };
+            let v = rgb.get(usize::from(*col)).map_or(-1024.0, |&byte| -(256.0 + f32::from(byte)));
+            let k = match pc.as_ref().and_then(|p| p.get(usize::from(*col))) {
+                Some(&x) => x,
+                None => self.s.m.f32(v.to_bits()),
+            };
+            *x = self.s.m.select(c, b, k, *x);
+        }
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten

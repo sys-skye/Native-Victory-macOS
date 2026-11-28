@@ -1356,6 +1356,23 @@ fn pass_present(resource: This) {
                         nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    // `VICTORY_DEBUG_PS=nanid`: texels holding a program's marker (red, green and
+                    // blue -(256 + byte)), counted by program colour; others too negative, mixed.
+                    let (mut ids, mut mixed) = (std::collections::BTreeMap::<String, usize>::new(), 0usize);
+                    for c in rgb.iter().filter(|c| c.iter().all(|&v| v < -255.5)) {
+                        let b = c.map(|v| (-v - 256.0).round());
+                        if b.iter().all(|&x| (0.0..=255.0).contains(&x)) && c.iter().zip(b).all(|(&v, x)| (-v - 256.0 - x).abs() < 0.25) {
+                            *ids.entry(format!("{:02x}{:02x}{:02x}", b[0] as u8, b[1] as u8, b[2] as u8)).or_default() += 1;
+                        } else {
+                            mixed += 1;
+                        }
+                    }
+                    if !ids.is_empty() || mixed > 0 {
+                        let mut top: Vec<_> = ids.into_iter().collect();
+                        top.sort_by(|a, b| b.1.cmp(&a.1));
+                        top.truncate(12);
+                        extra += &format!(" nanids={top:?} nanmixed={mixed}");
+                    }
                     // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
                     if info.format == 2 && w * h <= 16 {
                         let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();

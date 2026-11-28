@@ -186,6 +186,7 @@ pub fn build_bounded(
     m0_max: &HashMap<usize, u8>,
 ) -> Result<Program, ShaderError> {
     let list = gfx10::decode(code)?;
+    let probe = nan_probe(code);
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -257,7 +258,11 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+        if let Some((mut reads, mut writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+            if let Some(r) = &probe {
+                let inside = r.contains(&machine.offset);
+                nan_probe_effects(&fields, name, inside, &mut reads, &mut writes);
+            }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
@@ -344,6 +349,61 @@ pub fn build_bounded(
 }
 
 /// Placeholder before renaming.
+/// `VICTORY_DEBUG_PS=nanpc:<rrggbb>[:<from>-<to>]`: a trap temporary, which pixel programs never
+/// use, carries per lane the last place a value stopped being finite: each float VALU result and
+/// image or buffer load (at byte offsets `from..to`, hex, if given), and each export, reads and
+/// writes it (docs/native-host.md).
+pub const NAN_LAST: u8 = 120;
+
+/// The offsets `VICTORY_DEBUG_PS=nanpc:` tracks in `code`, if it is the program it names by its
+/// debug id colour.
+pub fn nan_probe(code: &[u8]) -> Option<std::ops::Range<usize>> {
+    let v = std::env::var("VICTORY_DEBUG_PS").ok()?;
+    let mut it = v.strip_prefix("nanpc:")?.split(':');
+    let want = it.next()?;
+    let h = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let [r, g, b, _] = h.to_le_bytes();
+    if format!("{r:02x}{g:02x}{b:02x}") != want {
+        return None;
+    }
+    let range = it.next().and_then(|r| {
+        let (a, b) = r.split_once('-')?;
+        Some(usize::from_str_radix(a, 16).ok()?..usize::from_str_radix(b, 16).ok()?)
+    });
+    Some(range.unwrap_or(0..usize::MAX))
+}
+
+/// Whether a VALU's result is an f32 (`v_cvt_<dst>_<src>`: the first type named).
+pub fn f32_result(name: &str) -> bool {
+    name.split('_')
+        .skip(1)
+        .find(|t| t.len() >= 2 && t.as_bytes()[0].is_ascii_alphabetic() && t[1..].bytes().all(|b| b.is_ascii_digit()) && matches!(t.as_bytes()[0], b'f' | b'i' | b'u' | b'b'))
+        == Some("f32")
+}
+
+fn nan_probe_effects(
+    fields: &Fields,
+    name: &str,
+    inside: bool,
+    reads: &mut Vec<Reg>,
+    writes: &mut Vec<Reg>,
+) {
+    let vgpr = writes.iter().any(|r| matches!(r, Reg::V(_)));
+    let tracked = match fields {
+        Fields::Valu(_) => vgpr && f32_result(name) && !name.starts_with("v_cmp"),
+        Fields::Image { .. } | Fields::Buffer { .. } => vgpr,
+        Fields::Exp { .. } => {
+            reads.push(Reg::S(NAN_LAST));
+            return;
+        }
+        _ => false,
+    };
+    if tracked && inside {
+        reads.push(Reg::S(NAN_LAST));
+        writes.push(Reg::S(NAN_LAST));
+    }
+}
+
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-127, SCC, VGPRs 0-255.
 const REGS: usize = 128 + 1 + 256;
