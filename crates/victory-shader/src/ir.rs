@@ -187,6 +187,12 @@ pub fn build_bounded(
 ) -> Result<Program, ShaderError> {
     let list = gfx10::decode(code)?;
     let probe = nan_probe(code);
+    // `nanborn` watches loads only (a program's every float result is too much to watch).
+    let born = std::env::var("VICTORY_DEBUG_PS").is_ok_and(|v| v == "nanborn");
+    // `nanpc:<id>:math` watches loads and the operations that make NaNs and infinities of
+    // finite operands (reciprocals, roots, logarithms, ...), not every float result.
+    let math = std::env::var("VICTORY_DEBUG_PS")
+        .is_ok_and(|v| v.starts_with("nanpc:") && v.ends_with(":math"));
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -261,7 +267,8 @@ pub fn build_bounded(
         if let Some((mut reads, mut writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
             if let Some(r) = &probe {
                 let inside = r.contains(&machine.offset);
-                nan_probe_effects(&fields, name, inside, &mut reads, &mut writes);
+                let loads_only = born || math && !nan_maker(name);
+                nan_probe_effects(&fields, name, inside, loads_only, &mut reads, &mut writes);
             }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
@@ -359,6 +366,9 @@ pub const NAN_LAST: u8 = 120;
 /// debug id colour.
 pub fn nan_probe(code: &[u8]) -> Option<std::ops::Range<usize>> {
     let v = std::env::var("VICTORY_DEBUG_PS").ok()?;
+    if v == "nanborn" {
+        return Some(0..usize::MAX);
+    }
     let mut it = v.strip_prefix("nanpc:")?.split(':');
     let want = it.next()?;
     let h = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
@@ -381,17 +391,32 @@ pub fn f32_result(name: &str) -> bool {
         == Some("f32")
 }
 
+/// Whether a VALU can make a NaN or infinity of finite operands other than by overflow.
+fn nan_maker(name: &str) -> bool {
+    ["rcp", "rsq", "sqrt", "log", "exp_f", "sin", "cos", "div_", "interp", "ldexp", "frexp"]
+        .iter()
+        .any(|k| name.contains(k))
+}
+
 fn nan_probe_effects(
     fields: &Fields,
     name: &str,
     inside: bool,
+    loads_only: bool,
     reads: &mut Vec<Reg>,
     writes: &mut Vec<Reg>,
 ) {
     let vgpr = writes.iter().any(|r| matches!(r, Reg::V(_)));
     let tracked = match fields {
-        Fields::Valu(_) => vgpr && f32_result(name) && !name.starts_with("v_cmp"),
-        Fields::Image { .. } | Fields::Buffer { .. } => vgpr,
+        Fields::Valu(_) => vgpr && f32_result(name) && !name.starts_with("v_cmp") && !loads_only,
+        // `nanborn`: an image store marks what it stores by the record.
+        Fields::Image { .. } if name.starts_with("image_store") => {
+            reads.push(Reg::S(NAN_LAST));
+            return;
+        }
+        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Ds { .. } | Fields::Flat { .. } => {
+            vgpr
+        }
         Fields::Exp { .. } => {
             reads.push(Reg::S(NAN_LAST));
             return;

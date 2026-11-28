@@ -12078,6 +12078,7 @@ impl<'a> Lower<'a> {
                 });
                 k += 1;
             }
+            self.nan_store_markers(inst, &mut vals);
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -14033,7 +14034,13 @@ impl<'a> Lower<'a> {
         }
         if self.s.pixel
             && std::env::var("VICTORY_DEBUG_PS")
-                .is_ok_and(|v| v == "nanid" || v == "nanin" || v.starts_with("nanpc:"))
+                .is_ok_and(|v| {
+                    v == "nanid"
+                        || v == "nanin"
+                        || v == "nanborn"
+                        || v == "nanzero"
+                        || v.starts_with("nanpc:")
+                })
         {
             self.nan_markers(&mut ready);
         }
@@ -14160,8 +14167,16 @@ impl<'a> Lower<'a> {
     fn nan_markers(&mut self, ready: &mut [(usize, u8, &'static str, V)]) {
         let rgb = debug_id_colour(&self.x.native.code);
         let c = self.cur;
+        let born = std::env::var("VICTORY_DEBUG_PS").is_ok_and(|v| v == "nanborn");
+        // `nanborn`: whether the lane's last value to stop being finite was loaded (passed on).
+        let zero_all = std::env::var("VICTORY_DEBUG_PS").is_ok_and(|v| v == "nanzero");
+        let passed = match (born, self.nan_pc) {
+            _ if zero_all => Some(self.s.m.bool(true)),
+            (true, Some(code)) => Some(self.nan_passed(code)),
+            _ => None,
+        };
         // `nanpc`: the record's three bytes in place of the id colour's.
-        let pc = self.nan_pc.map(|code| {
+        let pc = self.nan_pc.filter(|_| !born).map(|code| {
             [16u32, 8, 0].map(|sh| {
                 let (k, m) = (self.s.m.i32(sh), self.s.m.i32(0xff));
                 let x = self.s.m.bin(c, Bin::LShr, code, k);
@@ -14205,6 +14220,16 @@ impl<'a> Lower<'a> {
             };
             bad.insert(id, any);
         }
+        // `nanborn`: what the lane passed on is zeroed, not marked.
+        let mut zeroed: HashMap<usize, V> = HashMap::new();
+        if let Some(p) = passed {
+            let t = self.s.m.bool(true);
+            let kept = self.s.m.bin(c, Bin::Xor, p, t);
+            for (&id, b) in bad.iter_mut() {
+                zeroed.insert(id, self.s.m.bin(c, Bin::And, *b, p));
+                *b = self.s.m.bin(c, Bin::And, *b, kept);
+            }
+        }
         // A lane marked at one output writes zeros to the others, so that a blend reading a second
         // source (dual-source: colour + source 1 x target) leaves the marker as it is.
         let mut any = None;
@@ -14220,6 +14245,11 @@ impl<'a> Lower<'a> {
                 *x = self.s.m.select(c, a, zero, *x);
             }
         }
+        for (id, _, suffix, x) in ready.iter_mut() {
+            if let (Some(&z), ".f32") = (zeroed.get(id), *suffix) {
+                *x = self.s.m.select(c, z, zero, *x);
+            }
+        }
         for (id, col, suffix, x) in ready.iter_mut() {
             let Some(&b) = bad.get(id).filter(|_| *suffix == ".f32") else { continue };
             let v = rgb.get(usize::from(*col)).map_or(-1024.0, |&byte| -(256.0 + f32::from(byte)));
@@ -14228,6 +14258,54 @@ impl<'a> Lower<'a> {
                 None => self.s.m.f32(v.to_bits()),
             };
             *x = self.s.m.select(c, b, k, *x);
+        }
+    }
+
+    /// `VICTORY_DEBUG_PS=nanborn`: whether a `nan_track` record's last event was a load.
+    fn nan_passed(&mut self, code: V) -> V {
+        let c = self.cur;
+        let (k16, two) = (self.s.m.i32(16), self.s.m.i32(2));
+        let tag = self.s.m.bin(c, Bin::LShr, code, k16);
+        self.s.m.cmp(c, pred::EQ, tag, two)
+    }
+
+    /// `VICTORY_DEBUG_PS=nanborn`: an image store's texel with a channel that is not finite stores
+    /// its program's marker (as `nan_markers` exports it) where the program made the value, and
+    /// zeros where it loaded it, so the pass trace's dumps name the programs that make them.
+    /// `VICTORY_DEBUG_PS=nanzero`: zeros wherever (as exports do).
+    fn nan_store_markers(&mut self, inst: &Inst, vals: &mut [V]) {
+        let mode = std::env::var("VICTORY_DEBUG_PS").unwrap_or_default();
+        let passed = match mode.as_str() {
+            "nanzero" => self.s.m.bool(true),
+            "nanborn" if self.nan_probe => {
+                let code = match inst.read(Reg::S(crate::ir::NAN_LAST)).map(|v| self.i32_data(v)) {
+                    Some(Ok(x)) => x,
+                    _ => self.s.m.i32(0),
+                };
+                self.nan_passed(code)
+            }
+            _ => return,
+        };
+        let c = self.cur;
+        let exp = self.s.m.i32(0x7f80_0000);
+        let mut bad = self.s.m.bool(false);
+        for &x in vals.iter() {
+            let bits = self.as_int(x);
+            let e = self.s.m.bin(c, Bin::And, bits, exp);
+            let b = self.s.m.cmp(c, pred::EQ, e, exp);
+            bad = self.s.m.bin(c, Bin::Or, bad, b);
+        }
+        let t = self.s.m.bool(true);
+        let kept = self.s.m.bin(c, Bin::Xor, passed, t);
+        let zeroed = self.s.m.bin(c, Bin::And, bad, passed);
+        let marked = self.s.m.bin(c, Bin::And, bad, kept);
+        let rgb = debug_id_colour(&self.x.native.code);
+        let zero = self.s.m.f32(0);
+        for (ch, x) in vals.iter_mut().enumerate() {
+            let v = rgb.get(ch).map_or(-1024.0, |&byte| -(256.0 + f32::from(byte)));
+            let k = self.s.m.f32(v.to_bits());
+            let y = self.s.m.select(c, zeroed, zero, *x);
+            *x = self.s.m.select(c, marked, k, y);
         }
     }
 
