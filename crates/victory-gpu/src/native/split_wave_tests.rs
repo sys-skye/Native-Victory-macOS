@@ -2178,3 +2178,35 @@ fn a_mask_copied_back_in_a_lockstep_loop_holds_its_lanes_on_every_pass() {
         assert_eq!(got[20..], [0; 12]);
     }
 }
+
+#[test]
+fn a_mask_xored_into_a_pairs_high_register_by_a_64_bit_xor_reads_as_its_number() {
+    // A wave32 program XORs register pairs as 64-bit values (the deferred-light programs swap
+    // and chain masks so): the lanes below 8 in `s9` XORed with the lanes below 24 in `s1`, behind
+    // a branch on the lanes below 20, read there as data. The result holds lanes outside that
+    // EXEC, so its number comes from the XOR's high dwords (was refused, "written by a scalar
+    // instruction of the other width").
+    let w = [
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xD4C4_0001, 0x0002_0098, // v_cmp_gt_u32 s1, 24, v0
+        0xBE80_0380, // s_mov_b32 s0, 0
+        0xBE88_0380, // s_mov_b32 s8, 0
+        0xD4C4_0009, 0x0002_0088, // v_cmp_gt_u32 s9, 8, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        skip_execz(2),
+        0x8988_0008, // s_xor_b64 s[8:9], s[8:9], s[0:1]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0xBEFE_0304, // join: s_mov_b32 exec_lo, s4
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal32(&w), None);
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..20], [0x00FF_FF00; 20]);
+    assert_eq!(got[20..], [0; 12]);
+}

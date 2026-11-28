@@ -740,7 +740,24 @@ dead and joined 0: a loop copying another mask into VCC on one arm (`s_mov_b64 v
 lost every lane after its first pass, in wave64 lockstep as well. `live_edges` now starts from
 the data phis mask joins take too. Test:
 `split_wave_tests::a_mask_copied_back_in_a_lockstep_loop_holds_its_lanes_on_every_pass` (wave64
-and wave32, on the GPU).
+and wave32, on the GPU). Only joins that read the data as a number count (every lane enters
+along one edge, which is not one whose value goes unread anyway).
+
+Three more rules from the same programs (all of them in `Lower`):
+
+- A lane-mask join read as data in lockstep (`mask_number`, which had no rule for joins and
+  refused "a lane mask holding lanes elsewhere read as data: a program input") is the join of
+  the numbers its edges bring: every thread takes the same edge. The joins are filled after
+  the masks' own (`next_pending_mask`); an edge whose number cannot be made retries the
+  lowering with the join marked, so what reads it falls back as before.
+- A wave32 program's 64-bit bitwise operation on masks (the console compiler swaps and chains
+  register pairs by `s_xor_b64`, the mask in either register of the pair) gives dword `h` of its
+  result from dword `h` of its operands (was "written by a scalar instruction of the other
+  width"). Test: `split_wave_tests::a_mask_xored_into_a_pairs_high_register_by_a_64_bit_xor_reads_as_its_number`
+  checks the shape on the GPU; only the world's lockstep programs reach the rule itself so far
+  (their operands' numbers are joins).
+- VCC read before any write holds what the last wave left, as SGPRs above the initialised ones
+  do, and reads 0 (`inputs`; a wave32 program's VCC_HI joined into a lane mask).
 
 ### If-conversion for groups of several console waves (#376, design note)
 

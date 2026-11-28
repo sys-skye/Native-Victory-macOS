@@ -300,6 +300,9 @@ struct Lower<'a> {
     phi_at: Map<Value, (usize, usize)>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
+    /// Lockstep: the numbers (low and high dwords) of lane-mask joins read as data, whose
+    /// incoming values are still to fill (block, phi index); see [`Lower::mask_number`].
+    number_phis: Vec<(V, V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     /// [`Lower::load_use`], made at the first descriptor load read as data.
@@ -1143,6 +1146,7 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
+            number_phis: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
             load_uses: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
@@ -2221,8 +2225,12 @@ impl<'a> Lower<'a> {
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
                     // past the write, taken only with one past the read)
-                    // reads zero, as VGPRs do.
-                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
+                    // reads zero, as VGPRs do. So does VCC, which the hardware does not set
+                    // (a wave32 program's VCC_HI joined into a lane mask, the deferred lights).
+                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k)
+                        || n == crate::ir::VCC
+                        || n == crate::ir::VCC + 1 =>
+                    {
                         Val::I32(self.s.m.i32(0))
                     }
                     // The primitive mask (pixel), which console code only
@@ -2903,6 +2911,25 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             return Ok((z, z));
         }
+        // Lockstep: every thread takes the same edge into a join (`lockstep.rs`), so a joined
+        // mask's number is the number of the mask its edge brings (`fill_phis`).
+        if self.x.st.lockstep
+            && let Some(&(b, i)) = self.phi_at.get(&lo)
+        {
+            // An edge's number the translation could not make (a pass before this one).
+            if let Some(&why) = self.bad.get(&lo) {
+                return Err(why);
+            }
+            let blk = self.block[b].ok_or("an unreachable join")?;
+            let x = self.s.m.phi(blk, self.s.t.i32);
+            let y = if self.x.native.wave64 {
+                self.s.m.phi(blk, self.s.t.i32)
+            } else {
+                self.s.m.i32(0)
+            };
+            self.number_phis.push((x, y, b, i));
+            return Ok((x, y));
+        }
         let &b = self.def_block.get(&lo).ok_or(INPUT)?;
         let inst = p.blocks[b]
             .insts
@@ -2919,17 +2946,32 @@ impl<'a> Lower<'a> {
         };
         let wave64 = self.x.native.wave64;
         let width = if wave64 { "_b64" } else { "_b32" };
-        let op = inst
-            .name()
-            .strip_prefix("s_")
-            .and_then(|n| n.strip_suffix(width))
-            .ok_or(WIDTH)?;
+        let name = inst.name().strip_prefix("s_").unwrap_or_default();
+        let op = match name.strip_suffix(width) {
+            Some(op) => op,
+            // A wave32 program's 64-bit bitwise operation (the console compiler swaps register
+            // pairs by XORs): its low dword is the operation on the operands' low dwords.
+            None if !wave64 => name
+                .strip_suffix("_b64")
+                .filter(|n| {
+                    matches!(
+                        *n,
+                        "mov" | "not" | "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor"
+                            | "xnor"
+                    )
+                })
+                .ok_or(WIDTH)?,
+            None => return Err(WIDTH),
+        };
         let (save, f_op) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
             (Some(f), _) => (Some(true), f),
             (_, Some(f)) => (Some(false), f),
             _ => (None, op),
         };
-        let writes_dst = inst.write(Reg::S(*code)) == Some(lo);
+        // The wave32 64-bit operation above, with the mask in the pair's high register.
+        let narrow = !wave64 && !name.ends_with(width);
+        let pair_high = narrow && inst.write(Reg::S(*code + 1)) == Some(lo);
+        let writes_dst = inst.write(Reg::S(*code)) == Some(lo) || pair_high;
         let writes_exec = inst.write(Reg::S(EXEC)) == Some(lo);
         // (EXEC written besides the destination: a saveexec's new mask, modelled on console lanes.)
         if !writes_dst && !writes_exec
@@ -2977,6 +3019,32 @@ impl<'a> Lower<'a> {
                 };
                 Ok(l.s.m.i32(x))
             };
+            if narrow {
+                let h = u8::from(pair_high);
+                let a = word(self, 0, h)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let r = if op == "mov" {
+                    a
+                } else if op == "not" {
+                    self.s.m.bin(at, Bin::Xor, a, ones)
+                } else {
+                    let b = word(self, 1, h)?;
+                    let (f, not_b, not_r) = match op {
+                        "and" => (Bin::And, false, false),
+                        "or" => (Bin::Or, false, false),
+                        "xor" => (Bin::Xor, false, false),
+                        "andn2" => (Bin::And, true, false),
+                        "orn2" => (Bin::Or, true, false),
+                        "nand" => (Bin::And, false, true),
+                        "nor" => (Bin::Or, false, true),
+                        _ => (Bin::Xor, false, true),
+                    };
+                    let b = if not_b { self.s.m.bin(at, Bin::Xor, b, ones) } else { b };
+                    let r = self.s.m.bin(at, f, a, b);
+                    if not_r { self.s.m.bin(at, Bin::Xor, r, ones) } else { r }
+                };
+                return Ok((r, self.s.m.i32(0)));
+            }
             if save == Some(true) && !writes_exec {
                 // `s_*_saveexec` writes the incoming `EXEC` into `sdst`.
                 let lo_e = self.i32_of(inst.read(Reg::S(EXEC)).ok_or(OPERAND)?)?;
@@ -15298,11 +15366,19 @@ impl<'a> Lower<'a> {
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         // A lane-mask join reads data joined into it as the mask's number with console lanes
         // (`fill_phis`: a lockstep loop's mask copied back from another register on one arm).
+        // Only where it does: a join every lane enters along one edge, on an edge whose value
+        // is not left unread anyway (the arms before that one in `fill_phis`).
         if self.console_lanes {
-            for block in &p.blocks {
+            for (b, block) in p.blocks.iter().enumerate() {
                 for phi in block.phis.iter().filter(|f| st.masks.contains_key(&f.value)) {
-                    for &a in &phi.args {
-                        if self.phi_at.contains_key(&a) && !st.masks.contains_key(&a) {
+                    if !self.uniform_join(b, |_| true) {
+                        continue;
+                    }
+                    for (n, &a) in phi.args.iter().enumerate() {
+                        if self.phi_at.contains_key(&a)
+                            && !st.masks.contains_key(&a)
+                            && !self.unneeded_edges().contains(&(phi.value, n))
+                        {
                             work.push((a, Vec::new()));
                         }
                     }
@@ -15625,7 +15701,7 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(phi, incoming);
         }
         let mut mesh_split = None;
-        while let Some((v, b, i)) = self.pending_masks.pop() {
+        while let Some((v, b, i)) = self.next_pending_mask()? {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
             // The high dword's join, in a wave64 program.
@@ -15760,6 +15836,36 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+
+    /// The next lane-mask join to fill; when none is left, the lockstep joins' numbers are
+    /// filled first ([`Lower::mask_number`]: each edge's mask's number), which may make more.
+    fn next_pending_mask(&mut self) -> Result<Option<(V, usize, usize)>, Stop> {
+        let p = self.x.p;
+        while self.pending_masks.is_empty() {
+            let Some((x, y, b, i)) = self.number_phis.pop() else { return Ok(None) };
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let arg = p.blocks[b].phis[i].args[n];
+                // One that cannot be made: the join is not a number either, in the next pass
+                // (where what reads it may do without).
+                let made =
+                    self.mask_dword(arg).and_then(|_| self.ballots.get(&arg).ok_or(LANE_MASK));
+                let &(ax, ay) = match made {
+                    Ok(xy) => xy,
+                    Err(why) => return Err(Stop::Retry(vec![(p.blocks[b].phis[i].value, why)])),
+                };
+                xs.push((ax, qb));
+                ys.push((ay, qb));
+            }
+            self.s.m.set_phi(x, xs);
+            if self.x.native.wave64 {
+                self.s.m.set_phi(y, ys);
+            }
+        }
+        Ok(self.pending_masks.pop())
     }
 }
 
