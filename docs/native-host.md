@@ -809,18 +809,27 @@ lighting (8x16 and 16x16).
   console, the barrier waits only for waves that have not ended. So a barrier must sit in a
   block every lane runs exactly once (`once_blocks`), or the program is refused with "a barrier in
   lockstep in a block one console wave may skip".
+- A program with a loop (a block with a predecessor at or after it) is refused with "a loop in
+  lockstep in a group of several console waves". Lockstep runs every instruction for every
+  thread of the group, so each trip of a loop costs a whole group's work. In runs 57 and 58, the
+  light-tile loops of `fa229615e5c05580` (about 12,000 groups of 8x16 threads, up to about 500
+  trips a tile) held the GPU for more than 6 s, and the run's GPU guard stopped the game. The
+  pair syncs themselves are cheap: a test dispatch of 14,400 groups of 256 threads, with lane
+  reads in per-lane loops and the title's barrier, took 5 to 8 ms. Loop-free programs such as
+  `eee76bf6265f33bb` still translate.
 
 Tests (`victory-gpu`, Metal), in `split_wave_tests`:
 
-- `a_lane_read_in_per_lane_loops_of_two_console_waves_meets_its_own_halves`
-- `lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves`
+- `a_lane_read_in_per_lane_loops_of_two_console_waves_is_refused`
+- `lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves_is_refused`
 
-In both, wave 1 makes more trips (and so more syncs) than wave 0. Both are refused without the
-change. The fast path's refusal tests now use groups of five console waves, more than lockstep
+In both, wave 1 makes more trips (and so more syncs) than wave 0. Both passed in lockstep (each
+half meeting its own other half) before the loop rule; they now check the refusal. The loop-free
+`ds_append` test below runs multi-wave lockstep on the GPU. The fast path's refusal tests now use groups of five console waves, more than lockstep
 takes.
 
-Of the 12 programs, 9 translate. Two keep a barrier in a block a console wave may skip, and one is
-refused for its `ds_append`.
+Of the 12 programs, 6 translate with the loop rule (9 did before it). Two keep a barrier in a
+block a console wave may skip, and four have loops.
 
 `ds_append` and `ds_consume` in lockstep where the host splits the console wave
 (`Lower::split_append`) were refused with "ds_append or ds_consume in a console wave the host

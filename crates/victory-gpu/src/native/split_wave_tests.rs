@@ -1108,17 +1108,11 @@ fn a_per_lane_loop_shares_lds_across_the_halves_in_lockstep() {
     assert_eq!(got, acc);
 }
 
-/// Trips of thread `i` of a group of two wave64 waves in the tests below: the upper console
-/// wave loops two more times than the lower.
-fn trips(i: usize) -> usize {
-    2 * (i >> 6) + (i & 1) + 1
-}
-
 #[test]
-fn a_lane_read_in_per_lane_loops_of_two_console_waves_meets_its_own_halves() {
-    // A group of two console waves. Lane i of wave w loops `trips(i)` times, adding lane 35's
-    // `v3` (1000 + 64w + 35) each trip: refused on the fast path (the halves split), run in
-    // lockstep, where wave 1 makes two more lane reads than wave 0, so no group barrier fits.
+fn a_lane_read_in_per_lane_loops_of_two_console_waves_is_refused() {
+    // A group of two console waves. Lane i of wave w loops 2w + (i & 1) + 1 times, adding lane
+    // 35's `v3` each trip: refused on the fast path (the halves split), and lockstep takes no
+    // loop in a group of several console waves.
     let w = [
         V_LSHLREV_V1_2_V0,
         0x4A06_00FF,
@@ -1143,20 +1137,18 @@ fn a_lane_read_in_per_lane_loops_of_two_console_waves_meets_its_own_halves() {
         0x0002_0501, // global_store_dword v1, v5, s[2:3]
         S_ENDPGM,
     ];
-    let got = run_io(&w, 0, 128, 0);
-    if got.is_empty() {
-        return;
-    }
-    let want: Vec<u32> = (0..128).map(|i| (trips(i) * (1035 + 64 * (i >> 6))) as u32).collect();
-    assert_eq!(got, want);
+    // Every trip would be the whole group's work in lockstep: refused (see `lockstep.rs`).
+    let e = try_translate_wave(&w, 5, 0, 128, true, shaders::options()).err();
+    let e = e.map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("a loop in lockstep in a group of several console waves"), "{e}");
 }
 
 #[test]
-fn lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves() {
+fn lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves_is_refused() {
     // `a_per_lane_loop_shares_lds_across_the_halves_in_lockstep` in a group of two console
     // waves, lane i looping `i & 3` times and wave 1 two more, also adding lane 35's sum each
-    // trip (a lane read: refused on the fast path): each wave's halves meet around their LDS
-    // writes and lane reads, a different number of times in each wave.
+    // trip (a lane read: refused on the fast path): lockstep takes no loop in a group of several
+    // console waves.
     let w = [
         V_LSHLREV_V1_2_V0,
         0x3A06_02FF,
@@ -1188,26 +1180,10 @@ fn lds_shared_across_the_halves_in_per_lane_loops_of_two_console_waves() {
         0x0002_0501, // global_store_dword v1, v5, s[2:3]
         S_ENDPGM,
     ];
-    let got = run_io(&w, 1 << 15, 128, 0);
-    if got.is_empty() {
-        return;
-    }
-    // The console, each wave on its own: each trip, the wave reads lane 35's sum, every lane
-    // still looping reads LDS, then each writes.
-    let (mut acc, mut lds): (Vec<u32>, Vec<u32>) = ((0..128).collect(), (0..128).collect());
-    let n = |i: usize| (i & 3) + 2 * (i >> 6);
-    for trip in 0..5 {
-        for wave in 0..2 {
-            let on: Vec<usize> = (64 * wave..64 * wave + 64).filter(|&i| n(i) > trip).collect();
-            let lane35 = acc[64 * wave + 35];
-            let read: Vec<u32> = on.iter().map(|&i| lds[i ^ 32]).collect();
-            for (&i, r) in on.iter().zip(read) {
-                acc[i] += r + lane35;
-                lds[i] = acc[i];
-            }
-        }
-    }
-    assert_eq!(got, acc);
+    // Every trip would be the whole group's work in lockstep: refused (see `lockstep.rs`).
+    let e = try_translate_wave(&w, 5, 1 << 15, 128, true, shaders::options()).err();
+    let e = e.map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("a loop in lockstep in a group of several console waves"), "{e}");
 }
 
 #[test]

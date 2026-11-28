@@ -40,6 +40,9 @@ use crate::resource::Resources;
 /// "If-conversion for groups of several console waves": a bound to measure before raising).
 pub(crate) const MAX_WAVES: u32 = 4;
 
+/// Lockstep refuses a loop in a group of several console waves (`retry`).
+pub(crate) const WAVES_LOOP: &str = "a loop in lockstep in a group of several console waves";
+
 /// A title barrier in a lockstep group of several console waves, in a block not every console wave
 /// reaches as often as the others.
 pub(crate) const WAVE_SKIPS_BARRIER: &str =
@@ -87,6 +90,13 @@ pub(super) fn retry(
         });
         if let Some(offset) = barrier {
             return Err(ShaderError::Unsupported { offset, what: WAVE_SKIPS_BARRIER });
+        }
+        // A loop: every trip is the whole group's work in lockstep. GTA VI's light-tile loops
+        // (`fa229615e5c05580`, 12,000 groups of two console waves) held the GPU for seconds.
+        let back = (0..q.blocks.len()).find(|&b| q.blocks[b].preds.iter().any(|&f| f >= b));
+        if let Some(b) = back {
+            let offset = q.blocks[b].insts.first().map_or(0, |i| i.machine.offset);
+            return Err(ShaderError::Unsupported { offset, what: WAVES_LOOP });
         }
     }
     let st = structure::lockstep(&q)?;
