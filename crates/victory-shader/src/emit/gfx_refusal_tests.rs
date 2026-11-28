@@ -1094,8 +1094,9 @@ fn absdiff_translates() {
 }
 
 /// The DS instructions whose LDS address is M0's (and the lane's) translate (values:
-/// `victory-gpu` `addr_tests`), except an append or consume where the host splits the console's
-/// wave (wave64 on 32-lane host waves), which needs one atomic for both halves.
+/// `victory-gpu` `addr_tests`). An append or consume where the host splits the console's wave
+/// (wave64 on 32-lane host waves) needs one atomic for both halves: it runs in lockstep, and is
+/// refused in a group of more console waves than lockstep takes.
 #[test]
 fn lds_instructions_addressed_by_m0_translate() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -1128,7 +1129,11 @@ fn lds_instructions_addressed_by_m0_translate() {
     }
     let host32 = Options { wave32_host: true, ..Options::default() };
     translate_with(&program(append, false, 32), host32).unwrap();
-    let err = translate_with(&program(append, false, 64), host32).err();
+    for threads in [64, 128] {
+        translate_with(&program(append, false, threads), host32).unwrap();
+    }
+    let more = 64 * (super::lockstep::MAX_WAVES as u16 + 1);
+    let err = translate_with(&program(append, false, more), host32).err();
     assert!(
         matches!(err, Some(ShaderError::Unsupported { what, .. })
             if what == "ds_append or ds_consume in a console wave the host splits"),

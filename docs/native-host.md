@@ -822,6 +822,24 @@ takes.
 Of the 12 programs, 9 translate. Two keep a barrier in a block a console wave may skip, and one is
 refused for its `ds_append`.
 
+`ds_append` and `ds_consume` in lockstep where the host splits the console wave
+(`Lower::split_append`) were refused with "ds_append or ds_consume in a console wave the host
+splits". The console makes one atomic for the wave and gives its old value to every lane on. Now:
+
+- the wave's count is the popcount of its ballot of the lanes on (`wide_ballot`, through the
+  exchange);
+- console lane 0's thread adds or takes that count once at M0 + offset (not at all when no lane is
+  on);
+- every lane on reads the old value from lane 0 (`wide_read_lane`), and the others keep their
+  register.
+
+LDS writes are synced as any other (`lds_barriers`). Test (`victory-gpu`, Metal):
+`addr_tests::lds_append_and_consume_of_a_console_wave_split_in_two_add_its_lanes_once`. It uses
+two console waves whose lanes 0..39 (both halves) append twice, then every lane consumes past a
+barrier. Each wave adds 40 once per append, and its lanes on share the old value. The test is
+refused without lockstep. In a group of more console waves than lockstep takes, the refusal
+stands. 4 frame compute programs translate.
+
 ### If-conversion for groups of several console waves (#376, design note)
 
 Lockstep makes control flow uniform across the group because the group is one console wave: the wave's ballot is the same number in every thread, so a branch on it is taken by all or none. A group of W console waves has W different ballots, so one program counter cannot follow them; making the group's control flow uniform means removing the branches, not testing them differently. Proposed shape (a predication pass, not an extension of `structure::lockstep` — the single-wave ballot trick is what lockstep *is*, and multi-wave branches have no group-wide scalar to branch on):

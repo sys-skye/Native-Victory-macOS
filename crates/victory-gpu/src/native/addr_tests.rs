@@ -998,6 +998,64 @@ const ADDTID_WAVE64: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// [`LDS_BY_M0`]'s appends in a wave64 group of two console waves (four host waves on Metal): lanes
+/// 0..39 of each wave (both halves) `ds_append` twice to the dword at M0 = 8, one atomic add of 40
+/// each with the old value to the wave's lanes on, then every lane `ds_consume`s it past a
+/// barrier. Stored to `s[0:1]` + 0, 512 and 1024.
+const APPEND_WAVE64: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x7E04_0280, // v_mov_b32_e32 v2, 0
+    0x7E06_02C1, // v_mov_b32_e32 v3, -1
+    0x7E0C_02C1, // v_mov_b32_e32 v6, -1
+    0xD834_0008, 0x0000_0202, // ds_write_b32 v2, v2 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x3610_00BF, // v_and_b32_e32 v8, 63, v0
+    0x7D88_10A8, // v_cmp_gt_u32_e32 vcc, 40, v8
+    0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+    0xBEFC_0388, // s_mov_b32 m0, 8
+    0xD8F8_0000, 0x0300_0000, // ds_append v3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8F8_0000, 0x0600_0000, // ds_append v6
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+    0xBF8A_0000, // s_barrier
+    0xD8F4_0000, 0x0900_0000, // ds_consume v9
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xDC70_8000, 0x0000_0301, // global_store_dword v1, v3, s[0:1]
+    0xDC70_8200, 0x0000_0601, // global_store_dword v1, v6, s[0:1] offset:512
+    0xDC70_8400, 0x0000_0901, // global_store_dword v1, v9, s[0:1] offset:1024
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn lds_append_and_consume_of_a_console_wave_split_in_two_add_its_lanes_once() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    run_with_lds(&mut t, APPEND_WAVE64, true, 128);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let (first, second, taken) =
+        (f.get(0x2_0000, 128), f.get(0x2_0000 + 512, 128), f.get(0x2_0000 + 1024, 128));
+    // Each wave's lanes on share one old value per append; the waves' appends interleave.
+    let mut olds = Vec::new();
+    for w in 0..2 {
+        let wave = 64 * w..64 * w + 64;
+        let (x, y) = (first[64 * w], second[64 * w]);
+        assert!(x < y, "wave {w}: {x} then {y}");
+        olds.extend([x, y]);
+        for i in wave.clone() {
+            let (want_x, want_y) = if i % 64 < 40 { (x, y) } else { (u32::MAX, u32::MAX) };
+            assert_eq!((first[i], second[i]), (want_x, want_y), "lane {i}");
+        }
+        assert!(taken[wave.clone()].iter().all(|&z| z == taken[64 * w]), "wave {w}");
+    }
+    olds.sort_unstable();
+    assert_eq!(olds, [0, 40, 80, 120]);
+    let mut consumed = [taken[0], taken[64]];
+    consumed.sort_unstable();
+    assert_eq!(consumed, [96, 160], "each wave takes 64 once");
+}
+
 /// `words` as one compute group of `threads` with 512 bytes of LDS and `s[0:1]` a root constant
 /// pair, translated with the host's options, run once with `s[0:1]` = `VA_A`.
 fn run_with_lds(t: &mut Title<Metal>, words: &[u32], wave64: bool, threads: u32) {

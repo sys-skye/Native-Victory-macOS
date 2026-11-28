@@ -5626,8 +5626,12 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // One atomic for the console's wave: a host wave must be all of it.
+        // One atomic for the console's wave: a host wave must be all of it, or (lockstep, both
+        // host waves here together) the wave's count comes through the exchange.
         let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.halves && self.x.st.lockstep {
+            return self.split_append(inst, dst_reg, guard, m0, offset);
+        }
         if self.halves || self.host32 && lanes > 32 {
             return Err("ds_append or ds_consume in a console wave the host splits");
         }
@@ -5665,9 +5669,57 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Thread-group sync with a shared-memory fence, and a UAV fence when
-    /// the program writes UAVs (the waits before an s_barrier make those
-    /// writes visible on the console).
+    /// `ds_append` or `ds_consume` in lockstep, a console wave being two host waves: the wave's
+    /// count of lanes on (`guard`) is its ballot's (`wide_ballot`), console lane 0's thread adds
+    /// or takes it at LDS byte `m0 + offset` once (none when no lane is on), and every lane on gets
+    /// the old value from lane 0 (`wide_read_lane`), as each console lane gets the wave's one.
+    fn split_append(
+        &mut self,
+        inst: &Inst,
+        dst_reg: Option<u8>,
+        guard: Option<V>,
+        m0: V,
+        offset: u32,
+    ) -> Result<(), Why> {
+        use super::bitcode::Rmw;
+        let reg = dst_reg.ok_or("an append result")?;
+        let outside = match inst.read(Reg::V(reg)) {
+            Some(v) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
+            None => self.s.m.i32(0),
+        };
+        let i32t = self.s.t.i32;
+        let on = guard.unwrap_or(self.s.m.bool(true));
+        let (x, y) = self.wide_ballot(self.cur, self.cur_ir, on)?;
+        let c = self.cur;
+        let nx = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[x]);
+        let ny = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[y]);
+        let n = self.s.m.bin(c, Bin::Add, nx, ny);
+        let f = self.console_flat();
+        let (k63, zero) = (self.s.m.i32(63), self.s.m.i32(0));
+        let lane = self.s.m.bin(c, Bin::And, f, k63);
+        let lane0 = self.s.m.cmp(c, pred::EQ, lane, zero);
+        let any = self.s.m.cmp(c, pred::NE, n, zero);
+        let lead = self.s.m.bin(c, Bin::And, lane0, any);
+        let o = self.s.m.i32(offset);
+        let at = self.s.m.bin(c, Bin::Add, m0, o);
+        let g = self.begin_guarded(Some(lead));
+        let c = self.cur;
+        let two = self.s.m.i32(2);
+        let index = self.s.m.bin(c, Bin::LShr, at, two);
+        let lds = self.s.lds();
+        let p = self.s.m.element(c, lds, index);
+        let op = if inst.name() == "ds_append" { Rmw::Add } else { Rmw::Sub };
+        let old = self.s.m.atomic(self.cur, op, p, n);
+        let old = self.end_guarded(g, &[(old, zero)])[0];
+        let r = self.wide_read_lane(old, zero)?;
+        let r = match guard {
+            Some(g) => self.s.m.select(self.cur, g, r, outside),
+            None => r,
+        };
+        self.write(inst, Reg::V(reg), r, None);
+        Ok(())
+    }
+
     /// A barrier between the host waves of a console wave around LDS (`split_barriers`).
     fn split_barrier(&mut self) {
         if self.pair_sync {
@@ -5677,6 +5729,9 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Thread-group sync with a shared-memory fence, and a UAV fence when
+    /// the program writes UAVs (the waits before an s_barrier make those
+    /// writes visible on the console).
     fn group_barrier(&mut self) {
         let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
         let mode = self.s.m.i32(mode);
